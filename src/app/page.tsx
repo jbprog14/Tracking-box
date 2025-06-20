@@ -1,150 +1,125 @@
 "use client";
 
 import {useState, useEffect} from "react";
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-} from "recharts";
-import {TooltipProps} from "recharts";
-import {
-  NameType,
-  ValueType,
-} from "recharts/types/component/DefaultTooltipContent";
 import {db} from "./firebase";
-import {ref, onValue, set} from "firebase/database";
+import {ref, onValue, update} from "firebase/database";
 import QRLinkPage from "./qr-link/page";
+import EditInfoModal from "@/components/EditInfoModal";
+import TrackingBoxModal from "@/components/TrackingBoxModal";
 
-interface Reading {
+interface TrackingBoxDetails {
   name: string;
+  setLocation: string;
+}
+
+interface SensorData {
   temp: number;
   humidity: number;
-  distance: number;
-  shock: number;
-  battery: number;
+  accelerometer: string;
+  currentLocation: string;
+  // Additional monitoring data
+  batteryVoltage?: number;
+  wakeReason?: string;
+  timestamp?: number;
+  bootCount?: number;
+  altitude?: number;
 }
 
 interface TrackingBox {
-  address: string;
-  owner: string;
-  description: string;
-  readings: Reading[];
+  details: TrackingBoxDetails;
+  sensorData: SensorData;
 }
 
 interface TrackingData {
   [key: string]: TrackingBox;
 }
 
-const CustomTooltip = ({
-  active,
-  payload,
-  label,
-}: TooltipProps<ValueType, NameType>) => {
-  if (active && payload && payload.length) {
-    return (
-      <div className="p-3 bg-white rounded-lg shadow-lg border border-gray-200 opacity-95">
-        <p className="text-sm font-bold text-gray-900">{`Time: ${label}`}</p>
-        <p style={{color: payload[0].color}} className="text-sm">
-          {`${payload[0].name}: ${payload[0].value}`}
-        </p>
-      </div>
-    );
-  }
-
-  return null;
-};
-
 export default function Home() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [selectedBoxId, setSelectedBoxId] = useState<string | null>(null);
   const [trackingData, setTrackingData] = useState<TrackingData>({});
-  const [chartData, setChartData] = useState<Reading[]>([]);
   const [currentDate, setCurrentDate] = useState(new Date());
   const [isOnline, setIsOnline] = useState(true);
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [selectedEditBoxId, setSelectedEditBoxId] = useState<string | null>(
+    null
+  );
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [selectedViewBoxId, setSelectedViewBoxId] = useState<string | null>(
+    null
+  );
+  const [isLoading, setIsLoading] = useState(true);
+  const [dataError, setDataError] = useState<string | null>(null);
 
   useEffect(() => {
-    const trackingBoxesRef = ref(db, "tracking_boxes");
-    onValue(trackingBoxesRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        setTrackingData(data);
-      } else {
-        const mockTrackingData: TrackingData = {
-          "box-001": {
-            address: "123 Mockingbird Lane, Faketown, FS 12345",
-            owner: "John Doe",
-            description: "Shipment of fragile electronics.",
-            readings: [
-              {
-                name: "10:00",
-                temp: 22,
-                humidity: 45,
-                distance: 0,
-                shock: 0,
-                battery: 98,
-              },
-              {
-                name: "10:05",
-                temp: 22.1,
-                humidity: 45,
-                distance: 5,
-                shock: 0,
-                battery: 98,
-              },
-              {
-                name: "10:10",
-                temp: 22.2,
-                humidity: 46,
-                distance: 10,
-                shock: 1,
-                battery: 97,
-              },
-              {
-                name: "10:15",
-                temp: 22.5,
-                humidity: 46,
-                distance: 15,
-                shock: 0,
-                battery: 97,
-              },
-              {
-                name: "10:20",
-                temp: 23,
-                humidity: 47,
-                distance: 20,
-                shock: 0,
-                battery: 96,
-              },
-              {
-                name: "10:25",
-                temp: 22.8,
-                humidity: 48,
-                distance: 25,
-                shock: 0,
-                battery: 96,
-              },
-              {
-                name: "10:30",
-                temp: 22.7,
-                humidity: 48,
-                distance: 30,
-                shock: 2,
-                battery: 95,
-              },
-            ],
-          },
-        };
-        set(trackingBoxesRef, mockTrackingData);
+    const trackingBoxRef = ref(db, "tracking_box");
+
+    const unsubscribe = onValue(
+      trackingBoxRef,
+      (snapshot) => {
+        try {
+          setIsLoading(false);
+          setDataError(null);
+          const data = snapshot.val();
+
+          // Debug: Log raw Firebase data
+          console.log("🔥 Raw Firebase data:", data);
+          console.log("🔑 Data keys:", data ? Object.keys(data) : "No data");
+
+          if (data) {
+            // Validate data structure for new format
+            const validatedData: TrackingData = {};
+            Object.keys(data).forEach((boxId) => {
+              const box = data[boxId];
+              console.log(`📦 Processing box ${boxId}:`, box);
+
+              if (box && typeof box === "object") {
+                validatedData[boxId] = {
+                  details: {
+                    name: box.details?.name || "",
+                    setLocation: box.details?.setLocation || "",
+                  },
+                  sensorData: {
+                    temp: box.sensorData?.temp || 0,
+                    humidity: box.sensorData?.humidity || 0,
+                    accelerometer: box.sensorData?.accelerometer || "NORMAL",
+                    currentLocation:
+                      box.sensorData?.currentLocation || "No GPS Fix",
+                    batteryVoltage: box.sensorData?.batteryVoltage || 0,
+                    wakeReason: box.sensorData?.wakeReason || "",
+                    timestamp: box.sensorData?.timestamp || 0,
+                    bootCount: box.sensorData?.bootCount || 0,
+                    altitude: box.sensorData?.altitude || 0,
+                  },
+                };
+                console.log(`✅ Validated box ${boxId}:`, validatedData[boxId]);
+              }
+            });
+            console.log("🎯 Final validated data:", validatedData);
+            setTrackingData(validatedData);
+          } else {
+            // No data available - set empty state
+            console.log("❌ No data received from Firebase");
+            setTrackingData({});
+          }
+        } catch (error) {
+          console.error("Error processing Firebase data:", error);
+          setDataError("Failed to load tracking data");
+          setIsLoading(false);
+        }
+      },
+      (error) => {
+        console.error("Firebase connection error:", error);
+        setDataError(
+          "Connection error. Please check your internet connection."
+        );
+        setIsLoading(false);
       }
-    });
+    );
+
+    return () => unsubscribe();
   }, []);
 
   useEffect(() => {
@@ -195,12 +170,6 @@ export default function Home() {
     };
   }, []);
 
-  useEffect(() => {
-    if (selectedBoxId && trackingData[selectedBoxId]) {
-      setChartData(trackingData[selectedBoxId].readings || []);
-    }
-  }, [selectedBoxId, trackingData]);
-
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     if (username === "Admin123" && password === "123123123a") {
@@ -217,12 +186,53 @@ export default function Home() {
     setPassword("");
   };
 
-  const handleViewClick = (boxId: string) => {
-    setSelectedBoxId(boxId);
+  const handleEditClick = (boxId: string) => {
+    setSelectedEditBoxId(boxId);
+    setIsEditModalOpen(true);
   };
 
-  const handleBack = () => {
-    setSelectedBoxId(null);
+  const handleCloseEditModal = () => {
+    setIsEditModalOpen(false);
+    setSelectedEditBoxId(null);
+  };
+
+  const handleViewClick = (boxId: string) => {
+    setSelectedViewBoxId(boxId);
+    setIsViewModalOpen(true);
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setSelectedViewBoxId(null);
+  };
+
+  const handleSaveInfo = async (
+    boxId: string,
+    setLocation: string,
+    name: string
+  ) => {
+    try {
+      const boxRef = ref(db, `tracking_box/${boxId}/details`);
+      await update(boxRef, {
+        setLocation: setLocation,
+        name: name,
+      });
+
+      // Update local state as well
+      setTrackingData((prev) => ({
+        ...prev,
+        [boxId]: {
+          ...prev[boxId],
+          details: {
+            ...prev[boxId]?.details,
+            setLocation: setLocation,
+            name: name,
+          },
+        },
+      }));
+    } catch (error) {
+      console.error("Error updating tracking box info:", error);
+    }
   };
 
   if (!isOnline) {
@@ -230,286 +240,6 @@ export default function Home() {
   }
 
   if (isLoggedIn) {
-    if (selectedBoxId) {
-      return (
-        <main className="flex min-h-screen flex-col items-center justify-start bg-gray-100 p-10">
-          <div className="w-full max-w-6xl bg-white rounded-md shadow-md p-8">
-            <div className="flex justify-between items-center w-full mb-8">
-              <h1 className="text-3xl font-bold text-gray-600">
-                Tracking Box Details:
-                <span className="ml-2 text-gray-900">
-                  {selectedBoxId.toUpperCase()}
-                </span>
-              </h1>
-              <button
-                onClick={handleBack}
-                className="bg-gray-600 hover:bg-gray-700 text-white cursor-pointer font-bold py-2 px-4 rounded-md transition duration-300"
-              >
-                Back to Dashboard
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 gap-8">
-              <div className="bg-gray-50 p-4 rounded-lg shadow-inner">
-                <h3 className="text-lg font-semibold mb-4 text-center text-gray-800">
-                  Battery Level (%)
-                </h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient
-                        id="colorBattery"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#00C49F"
-                          stopOpacity={0.8}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#00C49F"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis dataKey="name" stroke="#666" />
-                    <YAxis stroke="#666" />
-                    <Tooltip
-                      content={<CustomTooltip />}
-                      cursor={{
-                        stroke: "#00C49F",
-                        strokeWidth: 1,
-                        strokeDasharray: "3 3",
-                      }}
-                    />
-                    <Legend wrapperStyle={{paddingTop: "20px"}} />
-                    <Area
-                      type="monotone"
-                      dataKey="battery"
-                      stroke="#00C49F"
-                      strokeWidth={2}
-                      fillOpacity={1}
-                      fill="url(#colorBattery)"
-                      name="Battery"
-                      activeDot={{r: 6, stroke: "#fff", strokeWidth: 2}}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="bg-gray-50 p-4 rounded-lg shadow-inner">
-                <h3 className="text-lg font-semibold mb-4 text-center text-gray-800">
-                  Temperature (°C)
-                </h3>
-                <ResponsiveContainer width="100%" height={400}>
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient
-                        id="colorTemp"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#8884d8"
-                          stopOpacity={0.8}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#8884d8"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis dataKey="name" stroke="#666" />
-                    <YAxis stroke="#666" />
-                    <Tooltip
-                      content={<CustomTooltip />}
-                      cursor={{
-                        stroke: "#8884d8",
-                        strokeWidth: 1,
-                        strokeDasharray: "3 3",
-                      }}
-                    />
-                    <Legend wrapperStyle={{paddingTop: "20px"}} />
-                    <Area
-                      type="monotone"
-                      dataKey="temp"
-                      stroke="#8884d8"
-                      strokeWidth={2}
-                      fillOpacity={1}
-                      fill="url(#colorTemp)"
-                      name="Temperature"
-                      activeDot={{r: 6, stroke: "#fff", strokeWidth: 2}}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="bg-gray-50 p-4 rounded-lg shadow-inner">
-                <h3 className="text-lg font-semibold mb-4 text-center text-gray-800">
-                  Humidity (%)
-                </h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient
-                        id="colorHumidity"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#82ca9d"
-                          stopOpacity={0.8}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#82ca9d"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis dataKey="name" stroke="#666" />
-                    <YAxis stroke="#666" />
-                    <Tooltip
-                      content={<CustomTooltip />}
-                      cursor={{
-                        stroke: "#82ca9d",
-                        strokeWidth: 1,
-                        strokeDasharray: "3 3",
-                      }}
-                    />
-                    <Legend wrapperStyle={{paddingTop: "20px"}} />
-                    <Area
-                      type="monotone"
-                      dataKey="humidity"
-                      stroke="#82ca9d"
-                      strokeWidth={2}
-                      fillOpacity={1}
-                      fill="url(#colorHumidity)"
-                      name="Humidity"
-                      activeDot={{r: 6, stroke: "#fff", strokeWidth: 2}}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="bg-gray-50 p-4 rounded-lg shadow-inner">
-                <h3 className="text-lg font-semibold mb-4 text-center text-gray-800">
-                  Distance (km)
-                </h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient
-                        id="colorDistance"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#ffc658"
-                          stopOpacity={0.8}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#ffc658"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis dataKey="name" stroke="#666" />
-                    <YAxis stroke="#666" />
-                    <Tooltip
-                      content={<CustomTooltip />}
-                      cursor={{
-                        stroke: "#ffc658",
-                        strokeWidth: 1,
-                        strokeDasharray: "3 3",
-                      }}
-                    />
-                    <Legend wrapperStyle={{paddingTop: "20px"}} />
-                    <Area
-                      type="monotone"
-                      dataKey="distance"
-                      stroke="#ffc658"
-                      strokeWidth={2}
-                      fillOpacity={1}
-                      fill="url(#colorDistance)"
-                      name="Distance"
-                      activeDot={{r: 6, stroke: "#fff", strokeWidth: 2}}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="bg-gray-50 p-4 rounded-lg shadow-inner">
-                <h3 className="text-lg font-semibold mb-4 text-center text-gray-800">
-                  Shock (G)
-                </h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient
-                        id="colorShock"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#ff7300"
-                          stopOpacity={0.8}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#ff7300"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis dataKey="name" stroke="#666" />
-                    <YAxis stroke="#666" />
-                    <Tooltip
-                      content={<CustomTooltip />}
-                      cursor={{
-                        stroke: "#ff7300",
-                        strokeWidth: 1,
-                        strokeDasharray: "3 3",
-                      }}
-                    />
-                    <Legend wrapperStyle={{paddingTop: "20px"}} />
-                    <Area
-                      type="monotone"
-                      dataKey="shock"
-                      stroke="#ff7300"
-                      strokeWidth={2}
-                      fillOpacity={1}
-                      fill="url(#colorShock)"
-                      name="Shock"
-                      activeDot={{r: 6, stroke: "#fff", strokeWidth: 2}}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-        </main>
-      );
-    }
     return (
       <main className="flex min-h-screen flex-col items-center justify-start bg-gray-100 p-10">
         <div className="w-full max-w-6xl bg-white rounded-md shadow-md p-8">
@@ -575,16 +305,81 @@ export default function Home() {
                   >
                     Full Description
                   </th>
+                  <th
+                    scope="col"
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border border-gray-300"
+                  ></th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
-                {Object.keys(trackingData).length === 0 ? (
+                {isLoading ? (
                   <tr>
                     <td
-                      colSpan={4}
-                      className="px-6 py-10 text-center text-xs text-gray-400"
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-gray-500"
                     >
-                      No Box to Trace
+                      <div className="flex items-center justify-center gap-2">
+                        <div className="animate-spin h-5 w-5 border-2 border-blue-600 border-t-transparent rounded-full"></div>
+                        Loading tracking data...
+                      </div>
+                    </td>
+                  </tr>
+                ) : dataError ? (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-red-600"
+                    >
+                      <div className="flex flex-col items-center gap-2">
+                        <svg
+                          className="h-8 w-8 text-red-500"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.854-.833-2.598 0L3.268 19c-.77.833.192 2.5 1.732 2.5z"
+                          />
+                        </svg>
+                        <p className="font-medium">{dataError}</p>
+                        <button
+                          onClick={() => window.location.reload()}
+                          className="mt-2 px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ) : Object.keys(trackingData).length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-gray-500"
+                    >
+                      <div className="flex flex-col items-center gap-2">
+                        <svg
+                          className="h-8 w-8 text-gray-400"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2M4 13h2m13-4h.01M6 9h.01"
+                          />
+                        </svg>
+                        <p className="font-medium">No tracking boxes found</p>
+                        <p className="text-xs text-gray-400">
+                          Devices will appear here once they start transmitting
+                          data
+                        </p>
+                      </div>
                     </td>
                   </tr>
                 ) : (
@@ -596,17 +391,25 @@ export default function Home() {
                           {boxId.toUpperCase()}
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-500">
-                          {item.address}
+                          {item.details.setLocation || "Location not set"}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {item.owner}
+                          {item.details.name || "Name not set"}
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-500">
                           <button
                             onClick={() => handleViewClick(boxId)}
-                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded-md transition duration-300 text-sm"
+                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded-md border-2 border-blue-700 transition duration-300 text-sm"
                           >
                             View
+                          </button>
+                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-500">
+                          <button
+                            onClick={() => handleEditClick(boxId)}
+                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
+                          >
+                            Edit Info
                           </button>
                         </td>
                       </tr>
@@ -616,6 +419,34 @@ export default function Home() {
               </tbody>
             </table>
           </div>
+
+          {/* Modal for detailed tracking box view */}
+          <TrackingBoxModal
+            isOpen={isViewModalOpen}
+            onClose={handleCloseViewModal}
+            boxId={selectedViewBoxId}
+            trackingData={
+              selectedViewBoxId ? trackingData[selectedViewBoxId] : null
+            }
+          />
+
+          {/* Modal for editing tracking box info */}
+          <EditInfoModal
+            isOpen={isEditModalOpen}
+            onClose={handleCloseEditModal}
+            boxId={selectedEditBoxId}
+            currentAddress={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.setLocation || ""
+                : ""
+            }
+            currentOwner={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.name || ""
+                : ""
+            }
+            onSave={handleSaveInfo}
+          />
         </div>
       </main>
     );

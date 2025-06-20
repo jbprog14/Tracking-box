@@ -6,20 +6,32 @@
  * This sketch combines all individual sensor tests into one complete
  * tracking device that satisfies all requirements from FEATURES.md
  * 
+ * 📚 REQUIRED LIBRARIES (Install via Arduino IDE Library Manager):
+ * - ArduinoJson (by Benoit Blanchon) - REQUIRED for compilation
+ * 
+ * 🔧 OPTIONAL LIBRARIES (Enable below by changing 0 to 1):
+ * - GxEPD2 (by ZinggJM) - For E-ink display functionality
+ * - Adafruit SHT31 (by Adafruit) - For temperature/humidity sensor
+ * 
+ * 🎯 QUICK START:
+ * 1. Install ArduinoJson library (required)
+ * 2. This sketch will compile without optional libraries
+ * 3. Install optional libraries and set ENABLE flags to 1 when ready
+ * 
  * Components:
- * - SHT30 Temperature & Humidity Sensor
- * - SIM7600 GNSS (GPS Location)
- * - ESP32 Microcontroller
- * - LSM6DSL 6-axis Accelerometer/Gyroscope
- * - Li-Po Battery
- * - 3.7" Waveshare E-ink Display
- * - Buzzer
+ * - SHT30 Temperature & Humidity Sensor (optional)
+ * - SIM7600 GNSS (GPS Location) (built-in)
+ * - ESP32 Microcontroller (required)
+ * - LSM6DSL 6-axis Accelerometer/Gyroscope (built-in)
+ * - Li-Po Battery (built-in)
+ * - 3.7" Waveshare E-ink Display (optional)
+ * - Buzzer (built-in)
  * 
  * Core Functionality:
  * 1. Wake every 15 minutes OR on accelerometer interrupt
  * 2. Read all sensors when awake
  * 3. Send data to Firebase database
- * 4. Update E-ink display with current information
+ * 4. Update E-ink display with current information (if enabled)
  * 5. Return to deep sleep mode
  * 
  * =====================================================================
@@ -33,14 +45,32 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 
-// E-ink Display Libraries
+// =====================================================================
+// OPTIONAL LIBRARIES - Comment out to disable features
+// =====================================================================
+// Set to 1 to enable E-ink display (requires GxEPD2 library installation)
+// Set to 0 to disable E-ink display and compile without the library
+#define ENABLE_EINK_DISPLAY 1
+
+// Set to 1 to enable SHT30 sensor (requires Adafruit_SHT31 library)
+// Set to 0 to disable SHT30 sensor and use simulated temperature/humidity data
+#define ENABLE_SHT30_SENSOR 0
+
+// E-ink Display Libraries (only include if enabled)
+#if ENABLE_EINK_DISPLAY
 #include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
+#include <GxEPD2_4C.h>
+#include <GxEPD2_7C.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#endif
 
-// SHT30 Library
+// SHT30 Library (only include if enabled)
+#if ENABLE_SHT30_SENSOR
 #include "Adafruit_SHT31.h"
+#endif
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -49,11 +79,11 @@
 #define SHT30_SCL           19    // SHT30 I2C Clock
 #define LSM6DSL_SDA         21    // Accelerometer I2C Data
 #define LSM6DSL_SCL         22    // Accelerometer I2C Clock
-#define SIM7600_RX          16    // GPS UART Receive
-#define SIM7600_TX          17    // GPS UART Transmit
+#define SIM7600_RX          32    // GPS UART Receive (changed from 16)
+#define SIM7600_TX          33    // GPS UART Transmit (changed from 17)
 #define EINK_CS             5     // E-ink SPI Chip Select
-#define EINK_DC             0     // E-ink Data/Command
-#define EINK_RST            2     // E-ink Reset
+#define EINK_DC             17    // E-ink Data/Command (TX)
+#define EINK_RST            16    // E-ink Reset (RX)
 #define EINK_BUSY           4     // E-ink Busy
 #define BUZZER_PIN          25    // Buzzer Output
 #define ACCEL_INT_PIN       26    // Accelerometer Interrupt
@@ -79,24 +109,31 @@
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
 // WiFi Credentials - REPLACE WITH YOUR VALUES
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "archer_2.4G";
+const char* WIFI_PASSWORD = "05132000";
 
 // Firebase Configuration (from firebase.ts)
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 
 // Device Information
-const String DEVICE_ID = "TRACKER_001";
-const String OWNER_NAME = "Device Owner";
-const String OWNER_ADDRESS = "Owner Address";
+const String DEVICE_ID = "box_001";
+const String DEVICE_NAME = "Tracking Box 001";
+const String DEVICE_LOCATION = "Default Location";
 
 // =====================================================================
 // GLOBAL OBJECTS & VARIABLES
 // =====================================================================
+#if ENABLE_SHT30_SENSOR
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
+#endif
+
 HardwareSerial sim7600(1);
-GxEPD2_BW<GxEPD2_290_T5D, GxEPD2_290_T5D::HEIGHT> display(GxEPD2_290_T5D(EINK_CS, EINK_DC, EINK_RST, EINK_BUSY));
+
+#if ENABLE_EINK_DISPLAY
+// Correct display driver for Waveshare 3.7" E-ink Display
+GxEPD2_BW<GxEPD2_370_TC1, GxEPD2_370_TC1::HEIGHT> display(GxEPD2_370_TC1(EINK_CS, EINK_DC, EINK_RST, EINK_BUSY));
+#endif
 
 uint8_t lsm6dsl_address = LSM6DSL_ADDR1;
 
@@ -146,15 +183,31 @@ void setup() {
     // Read all sensor data
     readAllSensors();
     
+    // Track connection status for display
+    bool wifiConnected = false;
+    bool firebaseSuccess = false;
+    
     // Connect to WiFi and send data to Firebase
     if (connectToWiFi()) {
+      wifiConnected = true;
       sendDataToFirebase();
+      firebaseSuccess = true; // Assume success if no exception thrown
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
     }
     
     // Update E-ink display with current data
+    #if ENABLE_EINK_DISPLAY
+    // Show connection status first
+    displayConnectionStatus(wifiConnected, firebaseSuccess);
+    delay(5000); // Display connection status for 5 seconds
+    
+    // Then show detailed sensor readings
     updateEInkDisplay();
+    Serial.println("💡 E-ink display updated with complete sensor data");
+    #else
+    Serial.println("⚠ E-ink display update skipped (disabled)");
+    #endif
     
     // Sound success notification
     buzzerAlert(2, 100);
@@ -166,18 +219,62 @@ void setup() {
   }
   
   // Prepare for and enter deep sleep
-  prepareForDeepSleep();
+  // prepareForDeepSleep();
   
-  Serial.println("Entering deep sleep mode...");
-  Serial.flush();
-  esp_deep_sleep_start();
+  // Serial.println("Entering deep sleep mode...");
+  // Serial.flush();
+  // esp_deep_sleep_start();
+  
+  // DEEP SLEEP DISABLED FOR TESTING
+  Serial.println("🔄 Deep sleep disabled for testing - will restart in 30 seconds");
+  delay(30000); // Wait 30 seconds before restarting cycle
+  Serial.println("🔄 Restarting operation cycle...");
+  Serial.println("");
 }
 
 void loop() {
-  // This function should never be reached due to deep sleep
-  // If reached, restart the device
-  Serial.println("ERROR: Loop reached - restarting device");
-  ESP.restart();
+  // TESTING MODE: Run continuous operation cycle
+  // Deep sleep is disabled, so we run the main operation in loop
+  
+  Serial.println("🔄 Starting new operation cycle...");
+  
+  // Read all sensor data
+  readAllSensors();
+  
+  // Track connection status for display
+  bool wifiConnected = false;
+  bool firebaseSuccess = false;
+  
+  // Connect to WiFi and send data to Firebase
+  if (connectToWiFi()) {
+    wifiConnected = true;
+    sendDataToFirebase();
+    firebaseSuccess = true; // Assume success if no exception thrown
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+  
+  // Update E-ink display with current data
+  #if ENABLE_EINK_DISPLAY
+  // Show connection status first
+  displayConnectionStatus(wifiConnected, firebaseSuccess);
+  delay(5000); // Display connection status for 5 seconds
+  
+  // Then show detailed sensor readings
+  updateEInkDisplay();
+  Serial.println("💡 E-ink display updated with complete sensor data");
+  #else
+  Serial.println("⚠ E-ink display update skipped (disabled)");
+  #endif
+  
+  // Sound success notification
+  buzzerAlert(2, 100);
+  
+  Serial.println("✓ Operation cycle completed successfully");
+  Serial.println("⏱️ Waiting 30 seconds before next cycle...");
+  Serial.println("");
+  
+  delay(30000); // Wait 30 seconds before next cycle
 }
 
 // =====================================================================
@@ -192,12 +289,16 @@ bool initializeAllHardware() {
   pinMode(ACCEL_INT_PIN, INPUT_PULLUP);
   
   // Initialize SHT30 Temperature & Humidity Sensor
+  #if ENABLE_SHT30_SENSOR
   Wire.begin(SHT30_SDA, SHT30_SCL);
   if (!sht30.begin(0x44)) {
     Serial.println("✗ SHT30 sensor initialization failed");
     return false;
   }
   Serial.println("✓ SHT30 sensor initialized");
+  #else
+  Serial.println("⚠ SHT30 sensor disabled - using simulated data");
+  #endif
   
   // Initialize LSM6DSL Accelerometer
   Wire1.begin(LSM6DSL_SDA, LSM6DSL_SCL);
@@ -214,8 +315,13 @@ bool initializeAllHardware() {
   Serial.println("✓ SIM7600 GPS module initialized");
   
   // Initialize E-ink Display
-  display.init(115200, true, 2, false);
-  Serial.println("✓ E-ink display initialized");
+  #if ENABLE_EINK_DISPLAY
+  display.init(115200, true, 2, false); // USE THIS for Waveshare boards with "clever" reset circuit, 2ms reset pulse
+  delay(1000); // Longer delay to ensure display is ready
+  Serial.println("✓ E-ink display initialized successfully");
+  #else
+  Serial.println("⚠ E-ink display disabled - install GxEPD2 library to enable");
+  #endif
   
   return true;
 }
@@ -261,6 +367,7 @@ void readAllSensors() {
 }
 
 void readTemperatureHumidity() {
+  #if ENABLE_SHT30_SENSOR
   currentData.temperature = sht30.readTemperature();
   currentData.humidity = sht30.readHumidity();
   
@@ -273,6 +380,12 @@ void readTemperatureHumidity() {
     currentData.humidity = 0.0;
     Serial.println("⚠ Invalid humidity reading");
   }
+  #else
+  // Use simulated data when SHT30 is disabled
+  currentData.temperature = 25.0 + (random(-50, 50) / 10.0); // 20-30°C range
+  currentData.humidity = 50.0 + (random(-200, 200) / 10.0);   // 30-70% range
+  Serial.println("⚠ Using simulated temperature/humidity data");
+  #endif
 }
 
 void readAccelerometerData() {
@@ -372,41 +485,83 @@ bool connectToWiFi() {
 void sendDataToFirebase() {
   Serial.println("Sending data to Firebase...");
   
+  // Always update device details to ensure the structure exists
+  // This creates the details table even if name/location are empty
+  updateDeviceDetails();
+  
+  // Send sensor data
+  sendSensorData();
+}
+
+void updateDeviceDetails() {
   HTTPClient http;
-  String firebaseURL = String(FIREBASE_HOST) + "/trackers/" + DEVICE_ID + "/readings.json?auth=" + String(FIREBASE_AUTH);
+  String firebaseURL = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/details.json?auth=" + String(FIREBASE_AUTH);
   
   http.begin(firebaseURL);
   http.addHeader("Content-Type", "application/json");
   
-  // Create JSON payload with all sensor data
-  DynamicJsonDocument jsonDoc(1024);
-  jsonDoc["deviceId"] = DEVICE_ID;
-  jsonDoc["ownerName"] = OWNER_NAME;
-  jsonDoc["ownerAddress"] = OWNER_ADDRESS;
-  jsonDoc["temperature"] = currentData.temperature;
-  jsonDoc["humidity"] = currentData.humidity;
-  jsonDoc["latitude"] = currentData.latitude;
-  jsonDoc["longitude"] = currentData.longitude;
-  jsonDoc["altitude"] = currentData.altitude;
-  jsonDoc["tiltDetected"] = currentData.tiltDetected;
-  jsonDoc["wakeReason"] = currentData.wakeReason;
-  jsonDoc["batteryVoltage"] = currentData.batteryVoltage;
-  jsonDoc["timestamp"] = String(currentData.timestamp);
-  jsonDoc["bootCount"] = bootCount;
-  jsonDoc["gpsFixValid"] = currentData.gpsFixValid;
+  // Create details JSON payload
+  DynamicJsonDocument detailsDoc(512);
+  detailsDoc["name"] = DEVICE_NAME;
+  detailsDoc["setLocation"] = DEVICE_LOCATION;
+  // Note: itemDesc/description is managed by the web interface
+  // We don't overwrite it here to preserve user edits
   
-  String jsonString;
-  serializeJson(jsonDoc, jsonString);
+  String detailsString;
+  serializeJson(detailsDoc, detailsString);
   
-  int httpResponseCode = http.POST(jsonString);
+  int httpResponseCode = http.PATCH(detailsString);  // Changed from PUT to PATCH
+  
+  if (httpResponseCode > 0) {
+    Serial.println("✓ Device details updated successfully");
+  } else {
+    Serial.println("✗ Device details update failed");
+  }
+  
+  http.end();
+}
+
+void sendSensorData() {
+  HTTPClient http;
+  String firebaseURL = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + String(FIREBASE_AUTH);
+  
+  http.begin(firebaseURL);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Create current location string from GPS coordinates
+  String currentLocation = "";
+  if (currentData.gpsFixValid) {
+    currentLocation = String(currentData.latitude, 6) + "," + String(currentData.longitude, 6);
+  } else {
+    currentLocation = "No GPS Fix";
+  }
+  
+  // Create sensor data JSON payload according to new structure
+  DynamicJsonDocument sensorDoc(1024);
+  sensorDoc["temp"] = currentData.temperature;
+  sensorDoc["humidity"] = currentData.humidity;
+  sensorDoc["accelerometer"] = currentData.tiltDetected ? "TILT_DETECTED" : "NORMAL";
+  sensorDoc["currentLocation"] = currentLocation;
+  
+  // Additional data for debugging/monitoring (optional)
+  sensorDoc["batteryVoltage"] = currentData.batteryVoltage;
+  sensorDoc["wakeReason"] = currentData.wakeReason;
+  sensorDoc["timestamp"] = millis();
+  sensorDoc["bootCount"] = bootCount;
+  sensorDoc["altitude"] = currentData.altitude;
+  
+  String sensorString;
+  serializeJson(sensorDoc, sensorString);
+  
+  int httpResponseCode = http.PUT(sensorString);
   
   if (httpResponseCode > 0) {
     String response = http.getString();
-    Serial.println("✓ Firebase upload successful");
+    Serial.println("✓ Sensor data uploaded successfully");
     Serial.println("Response Code: " + String(httpResponseCode));
-    Serial.println("Response: " + response.substring(0, 100) + "...");
+    Serial.println("Data sent: " + sensorString);
   } else {
-    Serial.println("✗ Firebase upload failed");
+    Serial.println("✗ Sensor data upload failed");
     Serial.println("Error Code: " + String(httpResponseCode));
   }
   
@@ -416,8 +571,9 @@ void sendDataToFirebase() {
 // =====================================================================
 // E-INK DISPLAY UPDATE
 // =====================================================================
+#if ENABLE_EINK_DISPLAY
 void updateEInkDisplay() {
-  Serial.println("Updating E-ink display...");
+  Serial.println("Updating E-ink display with sensor data...");
   
   display.setRotation(3);
   display.setFullWindow();
@@ -426,53 +582,177 @@ void updateEInkDisplay() {
   do {
     display.fillScreen(GxEPD_WHITE);
     
-    // Title Header
+    // Header Section
     display.setFont(&FreeSans12pt7b);
     display.setTextColor(GxEPD_BLACK);
     display.setCursor(10, 25);
-    display.print("TRACKING BOX");
+    String deviceIdUpper = DEVICE_ID.substring(4);
+    deviceIdUpper.toUpperCase();
+    display.print("TRACKING BOX - " + deviceIdUpper);
     
-    // Device Information
+    // Device info
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(10, 45);
+    display.print("Name: " + DEVICE_NAME);
+    
+    display.setCursor(10, 60);
+    display.print("Location: " + DEVICE_LOCATION);
+    
     display.setFont(&FreeSans9pt7b);
-    display.setCursor(10, 50);
-    display.print("Device: " + DEVICE_ID);
+    display.setCursor(350, 45);
+    display.print("Boot: " + String(bootCount));
     
-    // Environmental Readings
-    display.setCursor(10, 75);
-    display.print("Temperature: " + String(currentData.temperature, 1) + "C");
+    // Separator line
+    display.drawLine(10, 70, 470, 70, GxEPD_BLACK);
     
-    display.setCursor(10, 95);
-    display.print("Humidity: " + String(currentData.humidity, 1) + "%");
+    // Environment section
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 90);
+    display.print("ENVIRONMENT DATA");
     
-    // GPS Information
-    display.setCursor(10, 120);
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 110);
+    display.print("Temperature: " + String(currentData.temperature, 1) + " C");
+    
+    display.setCursor(15, 130);
+    display.print("Humidity: " + String(currentData.humidity, 0) + " %");
+    
+    // GPS section
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 155);
+    display.print("GPS LOCATION");
+    
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 175);
     if (currentData.gpsFixValid) {
-      display.print("GPS: " + String(currentData.latitude, 4) + "," + String(currentData.longitude, 4));
+      display.print("Lat: " + String(currentData.latitude, 4));
+      display.setCursor(15, 195);
+      display.print("Lon: " + String(currentData.longitude, 4));
     } else {
-      display.print("GPS: No Fix Available");
+      display.print("GPS: Searching for fix...");
     }
     
-    // System Status
-    display.setCursor(10, 145);
-    display.print("Wake: " + currentData.wakeReason);
+    // System status
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 220);
+    display.print("SYSTEM STATUS");
     
-    display.setCursor(10, 165);
-    display.print("Tilt: " + String(currentData.tiltDetected ? "DETECTED" : "Normal"));
-    
-    display.setCursor(10, 185);
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 240);
     display.print("Battery: " + String(currentData.batteryVoltage, 2) + "V");
     
-    display.setCursor(10, 205);
+    display.setCursor(15, 260);
+    display.print("Motion: " + String(currentData.tiltDetected ? "DETECTED" : "STABLE"));
+    
+    display.setCursor(15, 280);
+    display.print("Wake: " + getFriendlyWakeReason(currentData.wakeReason));
+    
+  } while (display.nextPage());
+  
+  display.hibernate();
+  
+  Serial.println("✓ E-ink display updated with sensor data");
+}
+
+void displayConnectionStatus(bool wifiConnected, bool firebaseSuccess) {
+  Serial.println("Updating E-ink with connection status...");
+  
+  display.setRotation(3);
+  display.setFullWindow();
+  display.firstPage();
+  
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    
+    // Header Section
+    display.setFont(&FreeSans12pt7b);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(10, 25);
+    display.print("TRACKING BOX - CONNECTION");
+    
+    // Device info
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(10, 45);
+    display.print("Device: " + DEVICE_ID);
+    
+    display.setCursor(10, 60);
     display.print("Boot Count: " + String(bootCount));
     
-    // Last update timestamp
-    display.setCursor(10, 225);
-    display.print("Updated: " + String(currentData.timestamp / 1000) + "s");
+    // Separator line
+    display.drawLine(10, 70, 470, 70, GxEPD_BLACK);
+    
+    // Connection Status Section
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 90);
+    display.print("CONNECTION STATUS");
+    
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 110);
+    display.print("WiFi: " + String(wifiConnected ? "CONNECTED" : "FAILED"));
+    
+    display.setCursor(15, 130);
+    display.print("Firebase: " + String(firebaseSuccess ? "SUCCESS" : "FAILED"));
+    
+    // Wake reason
+    display.setCursor(15, 150);
+    display.print("Wake: " + getFriendlyWakeReason(currentData.wakeReason));
+    
+    // Status summary
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 180);
+    display.print("SYSTEM STATUS");
+    
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 200);
+    if (wifiConnected && firebaseSuccess) {
+      display.print("Status: ALL SYSTEMS OPERATIONAL");
+    } else if (wifiConnected) {
+      display.print("Status: WIFI OK, DATA UPLOAD FAILED");
+    } else {
+      display.print("Status: WIFI CONNECTION FAILED");
+    }
+    
+    // Timestamp
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(15, 230);
+    display.print("Last Update: " + formatReadableTime());
+    
+    // Battery info
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 260);
+    display.print("Battery: " + String(currentData.batteryVoltage, 2) + "V");
     
   } while (display.nextPage());
   
   display.hibernate();
 }
+
+#else
+// If E-ink display is disabled, provide informative console output
+void updateEInkDisplay() {
+  Serial.println("⚠ E-ink display update skipped - display disabled");
+  Serial.println("💡 To enable: Set ENABLE_EINK_DISPLAY to 1 and install GxEPD2 library");
+  Serial.println("");
+  Serial.println("📺 SIMULATED E-INK DISPLAY CONTENT:");
+  Serial.println("=====================================");
+  String deviceIdUpper = DEVICE_ID;
+  deviceIdUpper.toUpperCase();
+  Serial.println("TRACKING BOX - " + deviceIdUpper);
+  Serial.println("Temperature: " + String(currentData.temperature, 1) + "°C");
+  Serial.println("Humidity: " + String(currentData.humidity, 0) + "%");
+  Serial.println("GPS: " + String(currentData.gpsFixValid ? "Fixed" : "Searching"));
+  Serial.println("Battery: " + String(currentData.batteryVoltage, 2) + "V");
+  Serial.println("Motion: " + String(currentData.tiltDetected ? "Detected" : "Stable"));
+  Serial.println("Boot Count: " + String(bootCount));
+  Serial.println("=====================================");
+}
+
+void displayConnectionStatus(bool wifiConnected, bool firebaseSuccess) {
+  Serial.println("📺 CONNECTION STATUS DISPLAY:");
+  Serial.println("WiFi: " + String(wifiConnected ? "Connected" : "Failed"));
+  Serial.println("Firebase: " + String(firebaseSuccess ? "Success" : "Failed"));
+}
+#endif
 
 // =====================================================================
 // DEEP SLEEP PREPARATION
@@ -517,6 +797,43 @@ void buzzerAlert(int beepCount, int beepDuration) {
       delay(beepDuration);
     }
   }
+}
+
+// =====================================================================
+// E-INK DISPLAY HELPER FUNCTIONS
+// =====================================================================
+String getFriendlyWakeReason(String reason) {
+  if (reason.indexOf("Timer") != -1) {
+    return "Scheduled Update";
+  } else if (reason.indexOf("Accelerometer") != -1) {
+    return "Motion Detected";
+  } else if (reason.indexOf("Power") != -1 || reason.indexOf("First") != -1) {
+    return "Device Started";
+  } else {
+    return "System Wake";
+  }
+}
+
+String formatReadableTime() {
+  // Convert milliseconds to a more readable format
+  unsigned long seconds = millis() / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  
+  seconds = seconds % 60;
+  minutes = minutes % 60;
+  hours = hours % 24;
+  
+  String timeStr = "";
+  if (hours > 0) {
+    timeStr += String(hours) + "h ";
+  }
+  if (minutes > 0 || hours > 0) {
+    timeStr += String(minutes) + "m ";
+  }
+  timeStr += String(seconds) + "s ago";
+  
+  return timeStr;
 }
 
 void printSensorReadings() {

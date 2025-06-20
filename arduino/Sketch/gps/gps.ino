@@ -51,8 +51,6 @@ void loop() {
         Serial.print(lat_decimal, 6); Serial.print(", "); Serial.println(lon_decimal, 6);
         
         Serial.println("🌐 Google Maps Link:");
- 
- 
         Serial.print("https://www.google.com/maps?q=");
         Serial.print(lat_decimal, 6); Serial.print(","); Serial.println(lon_decimal, 6);
         Serial.println();
