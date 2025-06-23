@@ -26,6 +26,9 @@ import {
   Save,
   X,
   FileText,
+  Shield,
+  Power,
+  AlertTriangle,
 } from "lucide-react";
 import {
   LineChart,
@@ -54,6 +57,8 @@ interface SensorData {
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
+  limitSwitchPressed?: boolean;
+  locationBreach?: boolean;
 }
 
 interface TrackingBoxData {
@@ -79,21 +84,19 @@ export default function TrackingBoxModal({
   const [originalDescription, setOriginalDescription] = useState("");
 
   useEffect(() => {
-    if (trackingData?.details?.description) {
-      setDescription(trackingData.details.description);
-      setOriginalDescription(trackingData.details.description);
-    } else {
-      setDescription("");
-      setOriginalDescription("");
+    if (isOpen && trackingData?.details) {
+      const desc = trackingData.details.description || "";
+      setDescription(desc);
+      setOriginalDescription(desc);
     }
-  }, [trackingData]);
+  }, [trackingData, isOpen]);
 
   const handleSaveDescription = async () => {
     if (!boxId) return;
 
     try {
       const updates = {
-        [`trackingBoxes/${boxId}/details/description`]: description,
+        [`tracking_box/${boxId}/details/description`]: description,
       };
       await update(ref(db), updates);
       setOriginalDescription(description);
@@ -268,6 +271,107 @@ export default function TrackingBoxModal({
                   </div>
                 </div>
               </div>
+            </div>
+
+            {/* Security Status Section */}
+            <div className="bg-gradient-to-r from-red-50 to-orange-50 rounded-xl p-6 border border-red-200">
+              <h3 className="text-lg font-semibold text-red-900 mb-4 flex items-center gap-2">
+                <Shield className="h-5 w-5 text-red-600" />
+                Security Status
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div
+                  className={`p-4 rounded-lg border-2 ${
+                    currentSensorData.limitSwitchPressed
+                      ? "bg-yellow-50 border-yellow-300"
+                      : "bg-green-50 border-green-300"
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`p-2 rounded-full ${
+                        currentSensorData.limitSwitchPressed
+                          ? "bg-yellow-500"
+                          : "bg-green-500"
+                      }`}
+                    >
+                      <Power className="h-4 w-4 text-white" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-700">
+                        Limit Switch
+                      </p>
+                      <p
+                        className={`text-lg font-bold ${
+                          currentSensorData.limitSwitchPressed
+                            ? "text-yellow-700"
+                            : "text-green-700"
+                        }`}
+                      >
+                        {currentSensorData.limitSwitchPressed
+                          ? "PRESSED"
+                          : "NORMAL"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  className={`p-4 rounded-lg border-2 ${
+                    currentSensorData.locationBreach
+                      ? "bg-red-50 border-red-300"
+                      : "bg-green-50 border-green-300"
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`p-2 rounded-full ${
+                        currentSensorData.locationBreach
+                          ? "bg-red-500"
+                          : "bg-green-500"
+                      }`}
+                    >
+                      <AlertTriangle className="h-4 w-4 text-white" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-700">
+                        Location Security
+                      </p>
+                      <p
+                        className={`text-lg font-bold ${
+                          currentSensorData.locationBreach
+                            ? "text-red-700"
+                            : "text-green-700"
+                        }`}
+                      >
+                        {currentSensorData.locationBreach
+                          ? "BREACH DETECTED"
+                          : "SECURE"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {(currentSensorData.limitSwitchPressed ||
+                currentSensorData.locationBreach) && (
+                <div className="mt-4 p-4 bg-red-100 border border-red-300 rounded-lg">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="h-5 w-5 text-red-600" />
+                    <p className="text-red-800 font-semibold">
+                      Security Alert Active
+                    </p>
+                  </div>
+                  <p className="text-red-700 text-sm mt-1">
+                    {currentSensorData.limitSwitchPressed &&
+                    currentSensorData.locationBreach
+                      ? "Both limit switch activation and location breach detected!"
+                      : currentSensorData.limitSwitchPressed
+                      ? "Limit switch has been activated - device may have been accessed."
+                      : "Location breach detected - device has moved beyond safe zone."}
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Current Sensor Data Summary */}

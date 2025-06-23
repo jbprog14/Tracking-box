@@ -75,19 +75,33 @@
 // =====================================================================
 // PIN DEFINITIONS
 // =====================================================================
-#define SHT30_SDA           18    // SHT30 I2C Data
-#define SHT30_SCL           19    // SHT30 I2C Clock
-#define LSM6DSL_SDA         21    // Accelerometer I2C Data
-#define LSM6DSL_SCL         22    // Accelerometer I2C Clock
-#define SIM7600_RX          32    // GPS UART Receive (changed from 16)
-#define SIM7600_TX          33    // GPS UART Transmit (changed from 17)
-#define EINK_CS             5     // E-ink SPI Chip Select
-#define EINK_DC             17    // E-ink Data/Command (TX)
-#define EINK_RST            16    // E-ink Reset (RX)
-#define EINK_BUSY           4     // E-ink Busy
-#define BUZZER_PIN          25    // Buzzer Output
-#define ACCEL_INT_PIN       26    // Accelerometer Interrupt
-#define BATTERY_ADC_PIN     35    // Battery Voltage Monitor
+// Power & Analog
+#define BATTERY_ADC_PIN     36    // ADC1_CH0 - Safe with WiFi
+
+// SHT30 Temperature/Humidity - I2C Bus 0 (Default)
+#define SHT30_SDA_PIN       21    // I2C0 SDA (default)
+#define SHT30_SCL_PIN       22    // I2C0 SCL (default)
+
+// LSM6DSL Accelerometer - I2C Bus 1 (Secondary)
+#define LSM6DSL_SDA_PIN     18    // I2C1 SDA (custom)
+#define LSM6DSL_SCL_PIN     19    // I2C1 SCL (custom)
+#define LSM6DSL_INT1_PIN    25    // Interrupt pin
+
+// SIM7600 GPS Module - UART2
+#define SIM7600_TX_PIN      32    // Safe UART
+#define SIM7600_RX_PIN      33    // Safe UART
+
+// E-ink Display - SPI
+#define EINK_CS_PIN         5     // Chip Select
+#define EINK_DC_PIN         17    // Data/Command
+#define EINK_RST_PIN        16    // Reset
+#define EINK_BUSY_PIN       4     // Busy status
+#define EINK_CLK_PIN        23    // SPI Clock
+#define EINK_DIN_PIN        27    // SPI Data
+
+// Digital I/O
+#define LIMIT_SWITCH_PIN    34    // ADC1_CH6 - Input-only, better for EXT1 wakeup
+#define BUZZER_PIN          26    // PWM capable
 
 // =====================================================================
 // SYSTEM CONFIGURATION
@@ -132,7 +146,7 @@ HardwareSerial sim7600(1);
 
 #if ENABLE_EINK_DISPLAY
 // Correct display driver for Waveshare 3.7" E-ink Display
-GxEPD2_BW<GxEPD2_370_TC1, GxEPD2_370_TC1::HEIGHT> display(GxEPD2_370_TC1(EINK_CS, EINK_DC, EINK_RST, EINK_BUSY));
+GxEPD2_BW<GxEPD2_370_TC1, GxEPD2_370_TC1::HEIGHT> display(GxEPD2_370_TC1(EINK_CS_PIN, EINK_DC_PIN, EINK_RST_PIN, EINK_BUSY_PIN));
 #endif
 
 uint8_t lsm6dsl_address = LSM6DSL_ADDR1;
@@ -149,6 +163,11 @@ struct TrackerData {
   float batteryVoltage = 0.0;
   unsigned long timestamp = 0;
   bool gpsFixValid = false;
+  bool limitSwitchPressed = false;
+  bool locationBreach = false;
+  String deviceSetLocation = "";
+  String deviceDescription = "";
+  String deviceName = "";
 };
 
 TrackerData currentData;
@@ -168,6 +187,10 @@ void setup() {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   currentData.wakeReason = getWakeupReasonString(wakeup_reason);
   currentData.timestamp = millis();
+  
+  // Check limit switch status (critical security feature)
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  currentData.limitSwitchPressed = !digitalRead(LIMIT_SWITCH_PIN); // LOW when pressed (pullup)
   
   Serial.println("=====================================================");
   Serial.println("        TRACKING BOX DEVICE - STARTUP");
@@ -190,10 +213,22 @@ void setup() {
     // Connect to WiFi and send data to Firebase
     if (connectToWiFi()) {
       wifiConnected = true;
+      
+      // Fetch device details from Firebase first (for security check)
+      fetchDeviceDetailsFromFirebase();
+      
+      // Perform security check if limit switch was pressed
+      if (currentData.limitSwitchPressed) {
+        performSecurityCheck();
+      }
+      
       sendDataToFirebase();
       firebaseSuccess = true; // Assume success if no exception thrown
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
+    } else {
+      // No WiFi connection - show QR code for offline access
+      displayOfflineQRCode();
     }
     
     // Update E-ink display with current data
@@ -248,6 +283,10 @@ void loop() {
   // Connect to WiFi and send data to Firebase
   if (connectToWiFi()) {
     wifiConnected = true;
+    
+    // Always fetch device details from Firebase for display
+    fetchDeviceDetailsFromFirebase();
+    
     sendDataToFirebase();
     firebaseSuccess = true; // Assume success if no exception thrown
     WiFi.disconnect(true);
@@ -286,11 +325,11 @@ bool initializeAllHardware() {
   // Initialize GPIO pins
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
-  pinMode(ACCEL_INT_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   
   // Initialize SHT30 Temperature & Humidity Sensor
   #if ENABLE_SHT30_SENSOR
-  Wire.begin(SHT30_SDA, SHT30_SCL);
+  Wire.begin(SHT30_SDA_PIN, SHT30_SCL_PIN);
   if (!sht30.begin(0x44)) {
     Serial.println("✗ SHT30 sensor initialization failed");
     return false;
@@ -301,7 +340,7 @@ bool initializeAllHardware() {
   #endif
   
   // Initialize LSM6DSL Accelerometer
-  Wire1.begin(LSM6DSL_SDA, LSM6DSL_SCL);
+  Wire1.begin(LSM6DSL_SDA_PIN, LSM6DSL_SCL_PIN);
   if (!initializeAccelerometer()) {
     Serial.println("✗ LSM6DSL accelerometer initialization failed");
     return false;
@@ -309,15 +348,25 @@ bool initializeAllHardware() {
   Serial.println("✓ LSM6DSL accelerometer initialized");
   
   // Initialize SIM7600 GPS Module
-  sim7600.begin(115200, SERIAL_8N1, SIM7600_RX, SIM7600_TX);
+  sim7600.begin(115200, SERIAL_8N1, SIM7600_RX_PIN, SIM7600_TX_PIN);
   delay(2000);
   flushSIM7600Buffer();
   Serial.println("✓ SIM7600 GPS module initialized");
   
   // Initialize E-ink Display
   #if ENABLE_EINK_DISPLAY
-  display.init(115200, true, 2, false); // USE THIS for Waveshare boards with "clever" reset circuit, 2ms reset pulse
-  delay(1000); // Longer delay to ensure display is ready
+  // Manual hardware reset first for reliable initialization
+  pinMode(EINK_RST_PIN, OUTPUT);
+  digitalWrite(EINK_RST_PIN, HIGH);
+  delay(200);
+  digitalWrite(EINK_RST_PIN, LOW);
+  delay(20);
+  digitalWrite(EINK_RST_PIN, HIGH);
+  delay(200);
+  
+  // Initialize with extended reset pulse for first-time reliability
+  display.init(115200, true, 20, false); // Extended 20ms reset pulse for reliable startup
+  delay(1000); // Extended delay to ensure display is ready
   Serial.println("✓ E-ink display initialized successfully");
   #else
   Serial.println("⚠ E-ink display disabled - install GxEPD2 library to enable");
@@ -482,6 +531,179 @@ bool connectToWiFi() {
   }
 }
 
+// Fetch device details from Firebase for security comparison
+void fetchDeviceDetailsFromFirebase() {
+  Serial.println("📥 Fetching device details from Firebase...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("✗ WiFi not connected for Firebase fetch");
+    return;
+  }
+  
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/details.json";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    Serial.println("✓ Firebase details fetched successfully");
+    Serial.println("📄 Raw Firebase response: " + response);
+    
+    // Parse JSON response
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (!error) {
+      currentData.deviceSetLocation = doc["setLocation"] | "";
+      currentData.deviceDescription = doc["description"] | "";
+      currentData.deviceName = doc["name"] | "";
+      
+      Serial.println("📍 Set Location: " + currentData.deviceSetLocation);
+      Serial.println("📝 Description: " + currentData.deviceDescription);
+      Serial.println("🏷️ Name: " + currentData.deviceName);
+    } else {
+      Serial.println("✗ Failed to parse Firebase details JSON");
+    }
+  } else {
+    Serial.println("✗ Firebase details fetch failed: " + String(httpResponseCode));
+  }
+  
+  http.end();
+}
+
+// Perform security check comparing GPS location with set location
+void performSecurityCheck() {
+  Serial.println("🔒 Performing security check...");
+  
+  if (!currentData.gpsFixValid) {
+    Serial.println("⚠️ Security check skipped - No GPS fix available");
+    buzzerAlert(3, 300); // Warning beeps for no GPS
+    return;
+  }
+  
+  if (currentData.deviceSetLocation.length() == 0) {
+    Serial.println("⚠️ Security check skipped - No set location in database");
+    buzzerAlert(3, 300); // Warning beeps for no set location
+    return;
+  }
+  
+  // Parse set location coordinates
+  int commaIndex = currentData.deviceSetLocation.indexOf(',');
+  if (commaIndex == -1) {
+    Serial.println("✗ Invalid set location format in database");
+    buzzerAlert(3, 300);
+    return;
+  }
+  
+  double setLat = currentData.deviceSetLocation.substring(0, commaIndex).toDouble();
+  double setLon = currentData.deviceSetLocation.substring(commaIndex + 1).toDouble();
+  
+  // Calculate distance between current GPS and set location
+  double distance = calculateDistance(currentData.latitude, currentData.longitude, setLat, setLon);
+  
+  Serial.println("📍 Current GPS: " + String(currentData.latitude, 6) + "," + String(currentData.longitude, 6));
+  Serial.println("📍 Set Location: " + String(setLat, 6) + "," + String(setLon, 6));
+  Serial.println("📏 Distance: " + String(distance, 2) + " meters");
+  
+  // Security threshold: 100 meters (adjust as needed)
+  const double SECURITY_THRESHOLD_METERS = 100.0;
+  
+  if (distance > SECURITY_THRESHOLD_METERS) {
+    Serial.println("🚨 SECURITY BREACH DETECTED! Device moved beyond safe zone!");
+    currentData.locationBreach = true;
+    
+    // Sound security alarm
+    for (int i = 0; i < 10; i++) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+  } else {
+    Serial.println("✅ Security check passed - Device within safe zone");
+    currentData.locationBreach = false;
+    buzzerAlert(2, 100); // Success beeps
+  }
+}
+
+// Calculate distance between two GPS coordinates using Haversine formula
+double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000; // Earth's radius in meters
+  double dLat = (lat2 - lat1) * PI / 180.0;
+  double dLon = (lon2 - lon1) * PI / 180.0;
+  
+  double a = sin(dLat/2) * sin(dLat/2) + cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) * sin(dLon/2) * sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  
+  return R * c;
+}
+
+// Display QR code for offline access
+void displayOfflineQRCode() {
+  Serial.println("📱 Displaying offline QR code...");
+  
+  #if ENABLE_EINK_DISPLAY
+  display.setRotation(3);
+  display.setFont(&FreeSans12pt7b);
+  display.setTextColor(GxEPD_BLACK);
+  display.setFullWindow();
+  
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    
+    // Title
+    display.setCursor(20, 30);
+    display.print("OFFLINE MODE");
+    
+    // Instructions
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(20, 60);
+    display.print("No WiFi Connection");
+    display.setCursor(20, 85);
+    display.print("Scan QR Code for Details:");
+    
+    // QR Code placeholder (simplified representation)
+    display.fillRect(50, 100, 200, 200, GxEPD_BLACK);
+    display.fillRect(60, 110, 180, 180, GxEPD_WHITE);
+    
+    // Draw QR-like pattern
+    for (int i = 0; i < 18; i++) {
+      for (int j = 0; j < 18; j++) {
+        if ((i + j) % 3 == 0) {
+          display.fillRect(60 + i*10, 110 + j*10, 8, 8, GxEPD_BLACK);
+        }
+      }
+    }
+    
+    // URL text
+    display.setCursor(20, 330);
+    display.print("URL: tracking-box.local/qr/");
+    display.setCursor(20, 355);
+    display.print(DEVICE_ID);
+    
+    // Device info
+    display.setCursor(20, 390);
+    display.print("Device: " + DEVICE_ID.substring(0, 10));
+    display.setCursor(20, 415);
+    display.print("Battery: " + String(currentData.batteryVoltage, 1) + "V");
+    
+  } while (display.nextPage());
+  
+  Serial.println("💡 Offline QR code displayed on E-ink");
+  #else
+  Serial.println("⚠ E-ink display disabled - QR code not shown");
+  Serial.println("📱 QR Code URL: tracking-box.local/qr/" + DEVICE_ID);
+  #endif
+  
+  // Sound offline notification
+  buzzerAlert(4, 150);
+}
+
 void sendDataToFirebase() {
   Serial.println("Sending data to Firebase...");
   
@@ -550,6 +772,10 @@ void sendSensorData() {
   sensorDoc["bootCount"] = bootCount;
   sensorDoc["altitude"] = currentData.altitude;
   
+  // Security and limit switch data
+  sensorDoc["limitSwitchPressed"] = currentData.limitSwitchPressed;
+  sensorDoc["locationBreach"] = currentData.locationBreach;
+  
   String sensorString;
   serializeJson(sensorDoc, sensorString);
   
@@ -575,6 +801,12 @@ void sendSensorData() {
 void updateEInkDisplay() {
   Serial.println("Updating E-ink display with sensor data...");
   
+  // Debug: Show what Firebase data we have
+  Serial.println("🔍 Firebase data for display:");
+  Serial.println("  Device Name: '" + currentData.deviceName + "'");
+  Serial.println("  Set Location: '" + currentData.deviceSetLocation + "'");
+  Serial.println("  Description: '" + currentData.deviceDescription + "'");
+  
   display.setRotation(3);
   display.setFullWindow();
   display.firstPage();
@@ -590,13 +822,15 @@ void updateEInkDisplay() {
     deviceIdUpper.toUpperCase();
     display.print("TRACKING BOX - " + deviceIdUpper);
     
-    // Device info
+    // Device info (use Firebase data if available)
     display.setFont(&FreeMonoBold9pt7b);
     display.setCursor(10, 45);
-    display.print("Name: " + DEVICE_NAME);
+    String displayName = currentData.deviceName.length() > 0 ? currentData.deviceName : DEVICE_NAME;
+    display.print("Name: " + displayName);
     
     display.setCursor(10, 60);
-    display.print("Location: " + DEVICE_LOCATION);
+    String displayLocation = currentData.deviceSetLocation.length() > 0 ? currentData.deviceSetLocation : DEVICE_LOCATION;
+    display.print("Set Location: " + displayLocation.substring(0, 25)); // Truncate for display
     
     display.setFont(&FreeSans9pt7b);
     display.setCursor(350, 45);
@@ -646,6 +880,38 @@ void updateEInkDisplay() {
     
     display.setCursor(15, 280);
     display.print("Wake: " + getFriendlyWakeReason(currentData.wakeReason));
+    
+    // Security status
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 305);
+    display.print("SECURITY STATUS");
+    
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(15, 325);
+    if (currentData.limitSwitchPressed) {
+      display.print("Switch: PRESSED");
+    } else {
+      display.print("Switch: NORMAL");
+    }
+    
+    display.setCursor(15, 345);
+    if (currentData.locationBreach) {
+      display.print("Location: BREACH!");
+    } else {
+      display.print("Location: SECURE");
+    }
+    
+    // Description (if available)
+    if (currentData.deviceDescription.length() > 0) {
+      display.setFont(&FreeSans9pt7b);
+      display.setCursor(10, 370);
+      display.print("DESCRIPTION");
+      
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(15, 390);
+      String desc = currentData.deviceDescription.substring(0, 40); // Truncate for display
+      display.print(desc);
+    }
     
   } while (display.nextPage());
   
@@ -758,15 +1024,20 @@ void displayConnectionStatus(bool wifiConnected, bool firebaseSuccess) {
 // DEEP SLEEP PREPARATION
 // =====================================================================
 void prepareForDeepSleep() {
-  Serial.println("Preparing for deep sleep mode...");
+  Serial.println("🛏️ Preparing for deep sleep mode...");
   
   // Configure wake-up sources
   esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);                    // Timer wake (15 minutes)
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_26, 0);                    // Accelerometer interrupt wake
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_25, 0);                    // Accelerometer interrupt wake
+  esp_sleep_enable_ext1_wakeup(1ULL << LIMIT_SWITCH_PIN, ESP_EXT1_WAKEUP_ANY_HIGH); // Limit switch wake
+  
+  Serial.println("⏰ Timer wake-up: " + String(SLEEP_MINUTES) + " minutes");
+  Serial.println("📳 Accelerometer wake-up: Enabled (GPIO25)");
+  Serial.println("🔘 Limit switch wake-up: Enabled (GPIO34)");
   
   // Configure GPIO to maintain state during sleep
-  rtc_gpio_pullup_en(GPIO_NUM_26);
-  rtc_gpio_hold_en(GPIO_NUM_26);
+  rtc_gpio_pullup_en(GPIO_NUM_25);
+  rtc_gpio_hold_en(GPIO_NUM_25);
   
   // Ensure WiFi is disconnected
   WiFi.disconnect(true);
@@ -782,6 +1053,7 @@ void prepareForDeepSleep() {
 String getWakeupReasonString(esp_sleep_wakeup_cause_t wakeup_reason) {
   switch(wakeup_reason) {
     case ESP_SLEEP_WAKEUP_EXT0:       return "Accelerometer Interrupt";
+    case ESP_SLEEP_WAKEUP_EXT1:       return "Limit Switch Pressed";
     case ESP_SLEEP_WAKEUP_TIMER:      return "Timer (15 minutes)";
     case ESP_SLEEP_WAKEUP_UNDEFINED:  return "Power On / First Boot";
     default:                          return "Unknown Wake Source";
@@ -807,6 +1079,8 @@ String getFriendlyWakeReason(String reason) {
     return "Scheduled Update";
   } else if (reason.indexOf("Accelerometer") != -1) {
     return "Motion Detected";
+  } else if (reason.indexOf("Limit Switch") != -1) {
+    return "Switch Activated";
   } else if (reason.indexOf("Power") != -1 || reason.indexOf("First") != -1) {
     return "Device Started";
   } else {
@@ -850,6 +1124,14 @@ void printSensorReadings() {
   Serial.println("Battery:        " + String(currentData.batteryVoltage, 2) + " V");
   Serial.println("Wake Reason:    " + currentData.wakeReason);
   Serial.println("Boot Count:     " + String(bootCount));
+  Serial.println("Limit Switch:   " + String(currentData.limitSwitchPressed ? "PRESSED" : "NORMAL"));
+  Serial.println("Location Breach:" + String(currentData.locationBreach ? "YES" : "NO"));
+  if (currentData.deviceSetLocation.length() > 0) {
+    Serial.println("Set Location:   " + currentData.deviceSetLocation);
+  }
+  if (currentData.deviceDescription.length() > 0) {
+    Serial.println("Description:    " + currentData.deviceDescription);
+  }
   Serial.println("=====================================================");
 }
 

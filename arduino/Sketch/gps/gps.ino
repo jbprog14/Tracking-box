@@ -1,9 +1,9 @@
 #include <HardwareSerial.h>
-HardwareSerial sim7600(1); // UART1 on ESP32 (RX=16, TX=17)
+HardwareSerial sim7600(1); // UART1 on ESP32 (RX=26, TX=27)
 
 void setup() {
   Serial.begin(115200);
-  sim7600.begin(115200, SERIAL_8N1, 16, 17);
+  sim7600.begin(115200, SERIAL_8N1, 26, 27);
   delay(3000);
   Serial.println("==== SIM7600 GPS (CGNSS) Tracker ====");
   flushSIM();

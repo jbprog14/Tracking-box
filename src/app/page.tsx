@@ -10,6 +10,7 @@ import TrackingBoxModal from "@/components/TrackingBoxModal";
 interface TrackingBoxDetails {
   name: string;
   setLocation: string;
+  description?: string;
 }
 
 interface SensorData {
@@ -23,6 +24,9 @@ interface SensorData {
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
+  // Security data
+  limitSwitchPressed?: boolean;
+  locationBreach?: boolean;
 }
 
 interface TrackingBox {
@@ -52,6 +56,17 @@ export default function Home() {
   );
   const [isLoading, setIsLoading] = useState(true);
   const [dataError, setDataError] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<
+    Array<{
+      id: string;
+      boxId: string;
+      type: "tilt" | "security" | "switch";
+      message: string;
+      timestamp: number;
+      acknowledged: boolean;
+    }>
+  >([]);
+  const [showAlerts, setShowAlerts] = useState(false);
 
   useEffect(() => {
     const trackingBoxRef = ref(db, "tracking_box");
@@ -80,6 +95,7 @@ export default function Home() {
                   details: {
                     name: box.details?.name || "",
                     setLocation: box.details?.setLocation || "",
+                    description: box.details?.description || "",
                   },
                   sensorData: {
                     temp: box.sensorData?.temp || 0,
@@ -92,12 +108,19 @@ export default function Home() {
                     timestamp: box.sensorData?.timestamp || 0,
                     bootCount: box.sensorData?.bootCount || 0,
                     altitude: box.sensorData?.altitude || 0,
+                    limitSwitchPressed:
+                      box.sensorData?.limitSwitchPressed || false,
+                    locationBreach: box.sensorData?.locationBreach || false,
                   },
                 };
                 console.log(`✅ Validated box ${boxId}:`, validatedData[boxId]);
               }
             });
             console.log("🎯 Final validated data:", validatedData);
+
+            // Check for new alerts
+            checkForAlerts(validatedData);
+
             setTrackingData(validatedData);
           } else {
             // No data available - set empty state
@@ -169,6 +192,77 @@ export default function Home() {
       }
     };
   }, []);
+
+  // Alert detection and management
+  const checkForAlerts = (data: TrackingData) => {
+    const newAlerts: typeof alerts = [];
+
+    Object.keys(data).forEach((boxId) => {
+      const box = data[boxId];
+      const currentTime = Date.now();
+
+      // Check for tilt detection
+      if (box.sensorData.accelerometer === "TILT_DETECTED") {
+        newAlerts.push({
+          id: `tilt-${boxId}-${currentTime}`,
+          boxId,
+          type: "tilt",
+          message: `Motion detected on ${box.details.name || boxId}`,
+          timestamp: currentTime,
+          acknowledged: false,
+        });
+      }
+
+      // Check for security breach
+      if (box.sensorData.locationBreach) {
+        newAlerts.push({
+          id: `security-${boxId}-${currentTime}`,
+          boxId,
+          type: "security",
+          message: `Security breach detected on ${box.details.name || boxId}`,
+          timestamp: currentTime,
+          acknowledged: false,
+        });
+      }
+
+      // Check for limit switch activation
+      if (box.sensorData.limitSwitchPressed) {
+        newAlerts.push({
+          id: `switch-${boxId}-${currentTime}`,
+          boxId,
+          type: "switch",
+          message: `Limit switch activated on ${box.details.name || boxId}`,
+          timestamp: currentTime,
+          acknowledged: false,
+        });
+      }
+    });
+
+    // Add new alerts to existing ones (avoid duplicates)
+    if (newAlerts.length > 0) {
+      setAlerts((prev) => {
+        const existingIds = new Set(prev.map((alert) => alert.id));
+        const uniqueNewAlerts = newAlerts.filter(
+          (alert) => !existingIds.has(alert.id)
+        );
+        return [...prev, ...uniqueNewAlerts];
+      });
+    }
+  };
+
+  const acknowledgeAlert = (alertId: string) => {
+    setAlerts((prev) =>
+      prev.map((alert) =>
+        alert.id === alertId ? {...alert, acknowledged: true} : alert
+      )
+    );
+  };
+
+  const clearAllAlerts = () => {
+    setAlerts([]);
+  };
+
+  const unacknowledgedAlerts = alerts.filter((alert) => !alert.acknowledged);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -277,6 +371,84 @@ export default function Home() {
               Logout
             </button>
           </div>
+
+          {/* Alert Notification System */}
+          {unacknowledgedAlerts.length > 0 && (
+            <div className="mt-6 bg-red-50 border border-red-200 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <svg
+                    className="h-5 w-5 text-red-500"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.854-.833-2.598 0L3.268 19c-.77.833.192 2.5 1.732 2.5z"
+                    />
+                  </svg>
+                  <h3 className="text-lg font-semibold text-red-800">
+                    Active Alerts ({unacknowledgedAlerts.length})
+                  </h3>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowAlerts(!showAlerts)}
+                    className="px-3 py-1 text-sm bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
+                  >
+                    {showAlerts ? "Hide" : "Show"} Details
+                  </button>
+                  <button
+                    onClick={clearAllAlerts}
+                    className="px-3 py-1 text-sm bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+
+              {showAlerts && (
+                <div className="space-y-2">
+                  {unacknowledgedAlerts.map((alert) => (
+                    <div
+                      key={alert.id}
+                      className="flex items-center justify-between bg-white p-3 rounded-md border border-red-200"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={`w-3 h-3 rounded-full ${
+                            alert.type === "security"
+                              ? "bg-red-500"
+                              : alert.type === "tilt"
+                              ? "bg-orange-500"
+                              : "bg-yellow-500"
+                          }`}
+                        ></div>
+                        <div>
+                          <p className="font-medium text-gray-900">
+                            {alert.message}
+                          </p>
+                          <p className="text-sm text-gray-500">
+                            {new Date(alert.timestamp).toLocaleString()}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => acknowledgeAlert(alert.id)}
+                        className="px-3 py-1 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors"
+                      >
+                        Acknowledge
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="mt-8 overflow-x-auto">
             <table className="min-w-full divide-y divide-gray-200 border">
               <thead className="bg-gray-50">
