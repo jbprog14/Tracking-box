@@ -5,6 +5,8 @@ import { useState, useEffect } from "react";
 import { db } from "../../firebase";
 import { ref, onValue } from "firebase/database";
 
+export const runtime = "edge";
+
 interface DeviceDetails {
   name: string;
   setLocation: string;
