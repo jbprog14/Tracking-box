@@ -1,13 +1,11 @@
 import type {NextConfig} from "next";
 
 const nextConfig: NextConfig = {
-  // output: "export", // Removed to allow dynamic routes
+  // Removed output: "export" to allow SSR on Cloudflare Pages
   trailingSlash: true,
   images: {
     unoptimized: true,
   },
-  // Ensure we're not using static export for Cloudflare Pages
-  // which needs to handle dynamic routes
 };
 
 export default nextConfig;

@@ -1,6 +1,6 @@
 "use client";
 
-import {useState, useEffect} from "react";
+import {useState, useEffect, useCallback} from "react";
 import {db} from "./firebase";
 import {ref, onValue, update} from "firebase/database";
 import QRLinkPage from "./qr-link/page";
@@ -194,7 +194,7 @@ export default function Home() {
   }, []);
 
   // Alert detection and management
-  const checkForAlerts = (data: TrackingData) => {
+  const checkForAlerts = useCallback((data: TrackingData) => {
     const newAlerts: typeof alerts = [];
 
     Object.keys(data).forEach((boxId) => {
@@ -248,7 +248,7 @@ export default function Home() {
         return [...prev, ...uniqueNewAlerts];
       });
     }
-  };
+  }, []);
 
   const acknowledgeAlert = (alertId: string) => {
     setAlerts((prev) =>
