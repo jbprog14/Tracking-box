@@ -50,7 +50,8 @@ bool tiltDetected = false;
 // Timing
 unsigned long lastReading = 0;
 const unsigned long READING_INTERVAL = 1000; // 1 second
-const float TILT_THRESHOLD = 0.9; // 90 degree tilt threshold
+const float TILT_THRESHOLD = 0.0; // 0m/s2 on z axis if tilted 90deg
+const float FALL_THRESHOLD = 1.1; //acceleration of falling
 
 void setup() {
   Serial.begin(115200);
@@ -153,9 +154,7 @@ void checkTilt() {
   
   if (lsm6dsl_ok) {
     // Check if any axis exceeds tilt threshold
-    if (abs(accelX) > TILT_THRESHOLD || 
-        abs(accelY) > TILT_THRESHOLD || 
-        abs(accelZ) > TILT_THRESHOLD) {
+    if (accelZ < TILT_THRESHOLD) {
       newTiltState = true;
     }
   }

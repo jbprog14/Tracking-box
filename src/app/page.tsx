@@ -1,8 +1,9 @@
 "use client";
 
-import {useState, useEffect, useCallback} from "react";
-import {db} from "./firebase";
-import {ref, onValue, update} from "firebase/database";
+import { useState, useEffect, useRef } from "react";
+import { db } from "./firebase";
+import { ref, onValue, update, set } from "firebase/database";
+import { Toaster, toast } from "react-hot-toast";
 import QRLinkPage from "./qr-link/page";
 import EditInfoModal from "@/components/EditInfoModal";
 import TrackingBoxModal from "@/components/TrackingBoxModal";
@@ -16,7 +17,14 @@ interface TrackingBoxDetails {
 interface SensorData {
   temp: number;
   humidity: number;
-  accelerometer: string;
+  accelerometer:
+    | {
+        x: number;
+        y: number;
+        z: number;
+        tiltDetected: boolean;
+      }
+    | string; // Support both new object format and old string format for backwards compatibility
   currentLocation: string;
   // Additional monitoring data
   batteryVoltage?: number;
@@ -27,6 +35,9 @@ interface SensorData {
   // Security data
   limitSwitchPressed?: boolean;
   locationBreach?: boolean;
+  securityBreachActive?: boolean;
+  buzzerIsActive?: boolean;
+  buzzerDismissed?: boolean;
 }
 
 interface TrackingBox {
@@ -56,17 +67,79 @@ export default function Home() {
   );
   const [isLoading, setIsLoading] = useState(true);
   const [dataError, setDataError] = useState<string | null>(null);
-  const [alerts, setAlerts] = useState<
-    Array<{
-      id: string;
-      boxId: string;
-      type: "tilt" | "security" | "switch";
-      message: string;
-      timestamp: number;
-      acknowledged: boolean;
-    }>
-  >([]);
-  const [showAlerts, setShowAlerts] = useState(false);
+  const [isDismissing, setIsDismissing] = useState<string | null>(null);
+  const prevTrackingDataRef = useRef<TrackingData>({});
+
+  // ------------------------------------------------------------------
+  // Reverse-geocoding (lat,lon → human readable)
+  // ------------------------------------------------------------------
+  const geocodeCache = useRef<Record<string, string>>({});
+  const [prettyLocations, setPrettyLocations] = useState<
+    Record<string, string>
+  >({});
+
+  // Whenever trackingData changes, resolve any new coordinate strings
+  useEffect(() => {
+    const fetchReverseGeocode = async (lat: number, lon: number) => {
+      const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+      if (geocodeCache.current[key]) return geocodeCache.current[key];
+
+      try {
+        const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=14&addressdetails=1`;
+        const res = await fetch(url, {
+          headers: { "User-Agent": "tracking-box-dashboard" },
+        });
+        const json = await res.json();
+        // Build a concise address using returned address fields when possible
+        let human = json.display_name || key;
+        if (json.address) {
+          const a = json.address;
+          human = [
+            a.road,
+            a.suburb || a.village || a.town,
+            a.city || a.municipality,
+            a.state,
+            a.country,
+          ]
+            .filter(Boolean)
+            .join(", ");
+        }
+        geocodeCache.current[key] = human;
+        return human;
+      } catch (e) {
+        console.warn("Reverse-geocode failed", e);
+        return key;
+      }
+    };
+
+    (async () => {
+      const updates: Record<string, string> = {};
+      await Promise.all(
+        Object.entries(trackingData).map(async ([boxId, box]) => {
+          const rawLoc = box.details.setLocation;
+          // Extract numbers (handles "14.6° N, 121.0° E" and "14.6, 121.0")
+          const nums = rawLoc.match(/-?\d+(?:\.\d+)?/g);
+          if (!nums || nums.length < 2) return;
+
+          let lat = parseFloat(nums[0]);
+          let lon = parseFloat(nums[1]);
+          // Handle N/S/E/W
+          if (/S/i.test(rawLoc)) lat = -Math.abs(lat);
+          if (/W/i.test(rawLoc)) lon = -Math.abs(lon);
+
+          const human = await fetchReverseGeocode(lat, lon);
+          updates[boxId] = human;
+        })
+      );
+      if (Object.keys(updates).length) {
+        setPrettyLocations((prev) => ({ ...prev, ...updates }));
+      }
+    })();
+  }, [trackingData]);
+
+  useEffect(() => {
+    prevTrackingDataRef.current = trackingData;
+  });
 
   useEffect(() => {
     const trackingBoxRef = ref(db, "tracking_box");
@@ -77,19 +150,13 @@ export default function Home() {
         try {
           setIsLoading(false);
           setDataError(null);
-          const data = snapshot.val();
+          const rawData = snapshot.val();
 
-          // Debug: Log raw Firebase data
-          console.log("🔥 Raw Firebase data:", data);
-          console.log("🔑 Data keys:", data ? Object.keys(data) : "No data");
-
-          if (data) {
-            // Validate data structure for new format
+          if (rawData) {
+            // Validate data structure
             const validatedData: TrackingData = {};
-            Object.keys(data).forEach((boxId) => {
-              const box = data[boxId];
-              console.log(`📦 Processing box ${boxId}:`, box);
-
+            Object.keys(rawData).forEach((boxId) => {
+              const box = rawData[boxId];
               if (box && typeof box === "object") {
                 validatedData[boxId] = {
                   details: {
@@ -109,22 +176,98 @@ export default function Home() {
                     bootCount: box.sensorData?.bootCount || 0,
                     altitude: box.sensorData?.altitude || 0,
                     limitSwitchPressed:
-                      box.sensorData?.limitSwitchPressed || false,
+                      box.sensorData?.limitSwitchPressed ?? true, // Default to true (secure)
                     locationBreach: box.sensorData?.locationBreach || false,
+                    securityBreachActive:
+                      box.sensorData?.securityBreachActive || false,
+                    buzzerIsActive: box.sensorData?.buzzerIsActive || false,
+                    buzzerDismissed: box.sensorData?.buzzerDismissed || false,
                   },
                 };
-                console.log(`✅ Validated box ${boxId}:`, validatedData[boxId]);
               }
             });
-            console.log("🎯 Final validated data:", validatedData);
 
-            // Check for new alerts
-            checkForAlerts(validatedData);
+            // Compare with previous data (stored in ref) for real-time toasts
+            const prevData = prevTrackingDataRef.current;
 
+            Object.keys(validatedData).forEach((boxId) => {
+              const currentBox = validatedData[boxId];
+              const prevBox = prevData ? prevData[boxId] : null;
+
+              const isNowCritical =
+                currentBox &&
+                !currentBox.sensorData.limitSwitchPressed &&
+                currentBox.sensorData.currentLocation !==
+                  currentBox.details.setLocation &&
+                currentBox.sensorData.buzzerIsActive;
+
+              const wasPreviouslyCritical =
+                prevBox &&
+                !prevBox.sensorData.limitSwitchPressed &&
+                prevBox.sensorData.currentLocation !==
+                  prevBox.details.setLocation &&
+                prevBox.sensorData.buzzerIsActive;
+
+              if (isNowCritical && !wasPreviouslyCritical) {
+                toast.error(
+                  (t) => (
+                    <div className="flex flex-col gap-2">
+                      <span className="font-bold">
+                        CRITICAL SECURITY BREACH!
+                      </span>
+                      <span>
+                        {currentBox.details.name || boxId} has been moved
+                        outside the safe zone.
+                      </span>
+                      <div className="flex gap-2 mt-2">
+                        <button
+                          onClick={() => {
+                            dismissCriticalAlert(boxId);
+                            toast.dismiss(t.id);
+                          }}
+                          disabled={isDismissing === boxId}
+                          className={`flex-1 font-semibold py-1 px-2 rounded-md transition-colors ${
+                            isDismissing === boxId
+                              ? "bg-gray-400 cursor-not-allowed"
+                              : "bg-red-700 hover:bg-red-800"
+                          } text-white`}
+                        >
+                          {isDismissing === boxId
+                            ? "Dismissing..."
+                            : "DISMISS ALARM"}
+                        </button>
+                        <button
+                          onClick={() => toast.dismiss(t.id)}
+                          className="flex-1 bg-gray-500 text-white font-semibold py-1 px-2 rounded-md hover:bg-gray-600 transition-colors"
+                        >
+                          Close
+                        </button>
+                      </div>
+                    </div>
+                  ),
+                  {
+                    id: `critical-toast-${boxId}`, // Prevent duplicate toasts for the same box
+                    duration: Infinity, // Keep toast open until manually dismissed
+                    position: "top-right",
+                    style: {
+                      border: "2px solid #B91C1C",
+                      padding: "12px",
+                      color: "#B91C1C",
+                      backgroundColor: "#FEE2E2",
+                    },
+                    iconTheme: {
+                      primary: "#B91C1C",
+                      secondary: "#FFFFFF",
+                    },
+                  }
+                );
+              }
+            });
+
+            // Finally update React state with the new snapshot
             setTrackingData(validatedData);
           } else {
-            // No data available - set empty state
-            console.log("❌ No data received from Firebase");
+            // No data available
             setTrackingData({});
           }
         } catch (error) {
@@ -193,76 +336,60 @@ export default function Home() {
     };
   }, []);
 
-  // Alert detection and management
-  const checkForAlerts = useCallback((data: TrackingData) => {
-    const newAlerts: typeof alerts = [];
+  // Function to dismiss critical security breach alert
+  const dismissCriticalAlert = async (boxId: string) => {
+    setIsDismissing(boxId);
 
-    Object.keys(data).forEach((boxId) => {
-      const box = data[boxId];
-      const currentTime = Date.now();
+    try {
+      // 1. Send dismiss command to the device to stop the buzzer
+      const dismissRef = ref(db, `tracking_box/${boxId}/dismissAlert`);
+      await set(dismissRef, { dismissed: true, timestamp: Date.now() });
 
-      // Check for tilt detection
-      if (box.sensorData.accelerometer === "TILT_DETECTED") {
-        newAlerts.push({
-          id: `tilt-${boxId}-${currentTime}`,
-          boxId,
-          type: "tilt",
-          message: `Motion detected on ${box.details.name || boxId}`,
-          timestamp: currentTime,
-          acknowledged: false,
-        });
-      }
-
-      // Check for security breach
-      if (box.sensorData.locationBreach) {
-        newAlerts.push({
-          id: `security-${boxId}-${currentTime}`,
-          boxId,
-          type: "security",
-          message: `Security breach detected on ${box.details.name || boxId}`,
-          timestamp: currentTime,
-          acknowledged: false,
-        });
-      }
-
-      // Check for limit switch activation
-      if (box.sensorData.limitSwitchPressed) {
-        newAlerts.push({
-          id: `switch-${boxId}-${currentTime}`,
-          boxId,
-          type: "switch",
-          message: `Limit switch activated on ${box.details.name || boxId}`,
-          timestamp: currentTime,
-          acknowledged: false,
-        });
-      }
-    });
-
-    // Add new alerts to existing ones (avoid duplicates)
-    if (newAlerts.length > 0) {
-      setAlerts((prev) => {
-        const existingIds = new Set(prev.map((alert) => alert.id));
-        const uniqueNewAlerts = newAlerts.filter(
-          (alert) => !existingIds.has(alert.id)
-        );
-        return [...prev, ...uniqueNewAlerts];
+      // 2. Immediately reset the alert-related state in Firebase for a responsive UI.
+      // The device will pick up the dismiss command and stop its own alert cycle,
+      // preventing these flags from being immediately overwritten.
+      const sensorDataRef = ref(db, `tracking_box/${boxId}/sensorData`);
+      await update(sensorDataRef, {
+        buzzerIsActive: false,
+        buzzerDismissed: true, // Mark as dismissed to prevent re-alerts for the same event
       });
+
+      toast.success(`Alarm for ${boxId} dismissed successfully.`, {
+        position: "top-right",
+      });
+      console.log(`Critical alert dismissed for ${boxId}`);
+    } catch (error) {
+      console.error("Error dismissing alert:", error);
+      toast.error(`An error occurred while dismissing the alarm for ${boxId}.`);
+    } finally {
+      setIsDismissing(null);
     }
-  }, []);
-
-  const acknowledgeAlert = (alertId: string) => {
-    setAlerts((prev) =>
-      prev.map((alert) =>
-        alert.id === alertId ? {...alert, acknowledged: true} : alert
-      )
-    );
   };
 
-  const clearAllAlerts = () => {
-    setAlerts([]);
+  // Convert human address → "lat, lon" string using Nominatim search
+  const forwardGeocode = async (query: string): Promise<string | null> => {
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${encodeURIComponent(
+          query
+        )}`,
+        {
+          headers: {
+            "User-Agent": "tracking-box-dashboard",
+            "Accept-Language": "en",
+          },
+        }
+      );
+      const json = await res.json();
+      if (json && json.length > 0) {
+        const { lat, lon } = json[0];
+        return `${parseFloat(lat).toFixed(5)}, ${parseFloat(lon).toFixed(5)}`;
+      }
+    } catch (e) {
+      console.warn("forward geocode failed", e);
+    }
+    return null;
   };
-
-  const unacknowledgedAlerts = alerts.filter((alert) => !alert.acknowledged);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -306,9 +433,12 @@ export default function Home() {
     name: string
   ) => {
     try {
+      let coordString = await forwardGeocode(setLocation);
+      if (!coordString) coordString = setLocation; // fallback
+
       const boxRef = ref(db, `tracking_box/${boxId}/details`);
       await update(boxRef, {
-        setLocation: setLocation,
+        setLocation: coordString,
         name: name,
       });
 
@@ -319,11 +449,14 @@ export default function Home() {
           ...prev[boxId],
           details: {
             ...prev[boxId]?.details,
-            setLocation: setLocation,
+            setLocation: coordString,
             name: name,
           },
         },
       }));
+
+      // cache human-readable for immediate UI feedback
+      setPrettyLocations((prev) => ({ ...prev, [boxId]: setLocation }));
     } catch (error) {
       console.error("Error updating tracking box info:", error);
     }
@@ -336,6 +469,7 @@ export default function Home() {
   if (isLoggedIn) {
     return (
       <main className="flex min-h-screen flex-col items-center justify-start bg-gray-100 p-10">
+        <Toaster />
         <div className="w-full max-w-6xl bg-white rounded-md shadow-md p-8">
           <div className="flex justify-between items-center w-full mb-8">
             <h1 className="text-3xl font-bold text-gray-900">
@@ -371,83 +505,6 @@ export default function Home() {
               Logout
             </button>
           </div>
-
-          {/* Alert Notification System */}
-          {unacknowledgedAlerts.length > 0 && (
-            <div className="mt-6 bg-red-50 border border-red-200 rounded-lg p-4">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <svg
-                    className="h-5 w-5 text-red-500"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.854-.833-2.598 0L3.268 19c-.77.833.192 2.5 1.732 2.5z"
-                    />
-                  </svg>
-                  <h3 className="text-lg font-semibold text-red-800">
-                    Active Alerts ({unacknowledgedAlerts.length})
-                  </h3>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setShowAlerts(!showAlerts)}
-                    className="px-3 py-1 text-sm bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
-                  >
-                    {showAlerts ? "Hide" : "Show"} Details
-                  </button>
-                  <button
-                    onClick={clearAllAlerts}
-                    className="px-3 py-1 text-sm bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors"
-                  >
-                    Clear All
-                  </button>
-                </div>
-              </div>
-
-              {showAlerts && (
-                <div className="space-y-2">
-                  {unacknowledgedAlerts.map((alert) => (
-                    <div
-                      key={alert.id}
-                      className="flex items-center justify-between bg-white p-3 rounded-md border border-red-200"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={`w-3 h-3 rounded-full ${
-                            alert.type === "security"
-                              ? "bg-red-500"
-                              : alert.type === "tilt"
-                              ? "bg-orange-500"
-                              : "bg-yellow-500"
-                          }`}
-                        ></div>
-                        <div>
-                          <p className="font-medium text-gray-900">
-                            {alert.message}
-                          </p>
-                          <p className="text-sm text-gray-500">
-                            {new Date(alert.timestamp).toLocaleString()}
-                          </p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => acknowledgeAlert(alert.id)}
-                        className="px-3 py-1 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors"
-                      >
-                        Acknowledge
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
 
           <div className="mt-8 overflow-x-auto">
             <table className="min-w-full divide-y divide-gray-200 border">
@@ -562,8 +619,13 @@ export default function Home() {
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                           {boxId.toUpperCase()}
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-500">
-                          {item.details.setLocation || "Location not set"}
+                        <td className="px-6 py-4 text-sm text-gray-500 max-w-xs">
+                          {/* Scroll container with hidden scrollbar but scrollable */}
+                          <div className="overflow-x-scroll">
+                            {prettyLocations[boxId] ||
+                              item.details.setLocation ||
+                              "Location not set"}
+                          </div>
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                           {item.details.name || "Name not set"}
