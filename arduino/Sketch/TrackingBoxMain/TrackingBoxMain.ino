@@ -28,16 +28,16 @@
 #include <HardwareSerial.h>
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
-// E-ink support removed
-// #include "DEV_Config.h"
-// #include "EPD.h"
-// #include "GUI_Paint.h"
-// #include "fonts.h"
-// #include "qrcode.h"   // Tiny library for generating QR bitmaps
-// #include <esp_heap_caps.h>
+// E-ink support re-enabled
+#include "DEV_Config.h"
+#include "EPD.h"
+#include "GUI_Paint.h"
+#include "fonts.h"
+#include "qrcode.h"   // Tiny library for generating QR bitmaps
+#include <esp_heap_caps.h>
 
 // Display paging ---------------------------------------------------------
-// #define EPD_PAGE_ROWS  40   // E-ink paging disabled
+#define EPD_PAGE_ROWS  40   // E-ink paging enabled
 
 #define ENABLE_SHT30_SENSOR 1
 
@@ -46,7 +46,7 @@
 #endif
 
 // Frame buffer pointer for GUI_Paint
-// static UBYTE *gImageBuffer = nullptr;   // removed
+static UBYTE *gImageBuffer = nullptr;
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -87,7 +87,7 @@
 #define SLEEP_TIME_US       (SLEEP_MINUTES * 60 * uS_TO_S_FACTOR)
 // New tilt / free-fall thresholds using accel-gyro technique
 #define TILT_THRESHOLD_Z_AXIS       0.0  // g – if Z-axis accel < this → tilted 90°
-#define FALL_THRESHOLD_MAGNITUDE    0.2  // g – if total accel magnitude < this → free-fall/shock
+#define FALL_THRESHOLD_MAGNITUDE    1.1  // g – CHANGE in accel magnitude to trigger a shock event
 
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
@@ -106,6 +106,15 @@ Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 HardwareSerial sim7600(1);
 uint8_t lsm6dsl_address = 0x6A;
+// Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
+bool sht30_ok   = false;
+bool lsm6dsl_ok = false;
+// RTC memory to store last accelerometer reading across deep sleep cycles
+RTC_DATA_ATTR float rtcLastAccelX = 0.0;
+RTC_DATA_ATTR float rtcLastAccelY = 0.0;
+RTC_DATA_ATTR float rtcLastAccelZ = 0.0;
+RTC_DATA_ATTR bool rtcBaselineSet = false;
+RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
 
 // This structure holds all data, both from sensors and fetched from Firebase.
 struct TrackerData {
@@ -146,67 +155,47 @@ void setup() {
   delay(1000);
   Serial.println("\n================ WAKING UP ================");
   
-  // A. Determine why the device woke up
   determineWakeUpReason();
 
-  // 1. Initialize all hardware
-  if (!initializeAllHardware()) {
-    Serial.println("❌ Hardware initialization FAILED. Entering deep sleep.");
-    prepareForDeepSleep();
-    esp_deep_sleep_start();
-    return;
-  }
-  Serial.println("✅ Hardware Initialized.");
+  // Main operational cycle: Connect > Init > Read > Sync > Sleep
+  if (connectToWiFi()) {
+    Serial.println("✅ WiFi Connected.");
+    
+    initializeAllHardware();
+    Serial.println("✅ Hardware Initialized.");
+    
+    collectSensorReading();
+    Serial.println("✅ Sensor Readings Collected.");
+    
+    // Fetch details needed for lock breach check
+    fetchDeviceDetailsFromFirebase();
 
-  // 2. Gather all sensor readings
-  collectSensorReading();
-  Serial.println("✅ Sensor Readings Collected.");
+    // Evaluate lock breach condition based on sensors and Firebase data
+    evaluateLockBreach();
 
-  // 3. Connect to WiFi to send and receive data
-    if (connectToWiFi()) {
-    // 4. Send all sensor data to Firebase
+    // Send all sensor and state data to Firebase
     sendSensorDataToFirebase();
     Serial.println("✅ Sensor Data Sent to Firebase.");
 
-    // 5. Fetch the latest complete data back from Firebase for display
-    fetchDataForDisplay();
-    Serial.println("✅ Latest Data Fetched from Firebase.");
+    // Update the E-Ink display with all collected data
+    updateEInkDisplay();
+    Serial.println("✅ E-ink Display Updated.");
 
-    // 6. E-ink display removed
+    // If buzzer is active, enter monitoring loop until dismissed from the cloud
+    handleBuzzerMonitoring();
 
-    // Disconnect WiFi to save power
-      if (!currentData.buzzerIsActive) {
+    // Disconnect WiFi if not actively monitoring buzzer
+    if (!currentData.buzzerIsActive) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-      }
-    } else {
-    Serial.println("❌ WiFi connection failed.");
     }
+  } else {
+    Serial.println("❌ WiFi connection failed. Cannot sync with cloud.");
+  }
 
-  // 7. Go to deep sleep
+  // Always go to sleep at the end of the cycle to conserve power
   Serial.println("Cycle complete. Entering deep sleep.");
   Serial.println("========================================\n");
-
-  // If buzzer is sounding due to LOCK BREACH, monitor Firebase for dismissal
-  if (currentData.buzzerIsActive) {
-    Serial.println("🚨 LOCK BREACH active – monitoring Firebase for dismissal …");
-    unsigned long lastPoll = 0;
-    while (currentData.buzzerIsActive) {
-      if (millis() - lastPoll > 5000) { // poll every 5 s
-        lastPoll = millis();
-        if (checkDismissCommand()) {
-          Serial.println("🔕 Dismiss command received – stopping buzzer and entering deep-sleep.");
-          digitalWrite(BUZZER_PIN, LOW);
-          currentData.buzzerIsActive = false;
-          currentData.buzzerDismissed = true; // we will add field
-          updateBuzzerStateInFirebase(false, true);
-          break; // exit monitoring loop, continue to deep sleep
-        }
-      }
-      delay(100);
-    }
-  }
-  
   prepareForDeepSleep();
   esp_deep_sleep_start();
 }
@@ -219,9 +208,13 @@ void loop() {
 // =====================================================================
 // E-INK DISPLAY UPDATE
 // =====================================================================
-// ---------------------------------------------------------------------------
-#if 0   // E-INK CODE BLOCK DISABLED
+#if 1   // E-INK CODE BLOCK RE-ENABLED
 void updateEInkDisplay() {
+  if (!gImageBuffer) {
+    Serial.println("E-ink buffer not allocated. Cannot update display.");
+    return;
+  }
+  
   char buf[256];
 
   // Pre-compute all text lines and their absolute Y positions
@@ -259,7 +252,7 @@ void updateEInkDisplay() {
     EPD_7IN3F_DisplayPart(gImageBuffer, 0, pageY, EPD_7IN3F_WIDTH, EPD_PAGE_ROWS);
   }
 
-  // Latch full frame
+  // Latch full frame and put display to sleep
   EPD_7IN3F_Sleep();
 }
 #endif // end E-ink code block
@@ -323,84 +316,74 @@ void sendSensorDataToFirebase() {
   http.end();
 }
 
-void sendBreachUpdateToFirebase() {
-  if (WiFi.status() != WL_CONNECTED) return;
+void fetchDeviceDetailsFromFirebase() {
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  DynamicJsonDocument doc(256);
-  doc["buzzerIsActive"] = currentData.buzzerIsActive;
-  doc["wakeUpReason"]  = currentData.wakeUpReason;
-  doc["buzzerDismissed"] = false;
-  String payload; serializeJson(doc, payload);
-  http.PATCH(payload);
-  http.end();
-}
-
-void fetchDataForDisplay() {
-  HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + ".json";
+  // Fetch only the 'details' node to be efficient
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/details.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   
   int httpResponseCode = http.GET();
   if (httpResponseCode == HTTP_CODE_OK) {
     String response = http.getString();
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, response);
     
     if (!error) {
-      // Fetch details
-      currentData.deviceName = doc["details"]["name"] | "Unknown";
-      currentData.deviceSetLocation = doc["details"]["setLocation"] | "Unknown";
-      currentData.deviceDescription = doc["details"]["description"] | "No Description";
-
-      // Fetch latest sensor readings that were just sent
-      currentData.temperature = doc["sensorData"]["temp"] | 0.0;
-      currentData.humidity = doc["sensorData"]["humidity"] | 0.0;
-      currentData.batteryVoltage = doc["sensorData"]["batteryVoltage"] | 0.0;
-      currentData.currentLocation = doc["sensorData"]["currentLocation"] | "Unknown";
-      currentData.accelX = doc["sensorData"]["accelerometer"]["x"] | 0.0;
-      currentData.accelY = doc["sensorData"]["accelerometer"]["y"] | 0.0;
-      currentData.accelZ = doc["sensorData"]["accelerometer"]["z"] | 0.0;
-
-      // ------------------------------------------------------------------
-      // Tilt & free-fall detection – logic from accel-gyro.ino
-      // ------------------------------------------------------------------
-      currentData.tiltDetected = (currentData.accelZ < TILT_THRESHOLD_Z_AXIS);
-
-      float accelMagnitude = sqrt(currentData.accelX * currentData.accelX +
-                                  currentData.accelY * currentData.accelY +
-                                  currentData.accelZ * currentData.accelZ);
-      currentData.fallDetected = (accelMagnitude < FALL_THRESHOLD_MAGNITUDE);
-
-      // -------------------------------------------------------------
-      // Evaluate LOCK BREACH after we have both limit switch state and
-      // the desired setLocation from Firebase.
-      // Condition: lid open (limitSwitchPressed == false) AND
-      //            currentLocation string differs from the setLocation.
-      // When true, sound buzzer continuously and set wake reason.
-      // -------------------------------------------------------------
-      bool lockBreach = (!currentData.limitSwitchPressed) &&
-                        (currentData.currentLocation != currentData.deviceSetLocation);
-
-      if (lockBreach) {
-        currentData.wakeUpReason   = "LOCK BREACH";
-        currentData.buzzerIsActive = true;
-        digitalWrite(BUZZER_PIN, HIGH);  // sound continuously
-        sendBreachUpdateToFirebase();
-      } else {
-        currentData.buzzerIsActive = false;
-        digitalWrite(BUZZER_PIN, LOW);
-      }
-
+      currentData.deviceName = doc["name"] | "Unknown";
+      currentData.deviceSetLocation = doc["setLocation"] | "Unknown";
+      currentData.deviceDescription = doc["description"] | "No Description";
+      Serial.println("✓ Fetched device details from Firebase.");
     } else {
-      Serial.println("✗ Failed to parse Firebase JSON for display.");
+      Serial.println("✗ Failed to parse device details JSON.");
     }
   } else {
-    Serial.println("✗ Firebase data fetch failed.");
+    Serial.printf("✗ Firebase details fetch failed, code: %d\n", httpResponseCode);
   }
   http.end();
+}
+
+void evaluateLockBreach() {
+  // A lock breach occurs if the lid is open AND the device's physical location
+  // does not match its designated location from Firebase.
+  // Note: Limit switch is pressed (true) when the lid is CLOSED.
+  bool lockBreach = (!currentData.limitSwitchPressed) &&
+                    (currentData.currentLocation != currentData.deviceSetLocation);
+
+  if (lockBreach) {
+    Serial.println("🚨 LOCK BREACH DETECTED!");
+    currentData.wakeUpReason   = "LOCK BREACH";
+    currentData.buzzerIsActive = true;
+    digitalWrite(BUZZER_PIN, HIGH);  // Sound buzzer continuously
+  } else {
+    // If no breach, ensure buzzer is off.
+    currentData.buzzerIsActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void handleBuzzerMonitoring() {
+  if (!currentData.buzzerIsActive) return;
+
+  Serial.println("🚨 LOCK BREACH active – monitoring Firebase for dismissal…");
+  unsigned long lastPoll = 0;
+  
+  // Stay in this loop as long as the buzzer is active, polling for dismissal
+  while (currentData.buzzerIsActive) {
+    if (millis() - lastPoll > 5000) { // Poll every 5 seconds
+      lastPoll = millis();
+      if (checkDismissCommand()) {
+        Serial.println("🔕 Dismiss command received – stopping buzzer.");
+        digitalWrite(BUZZER_PIN, LOW);
+        currentData.buzzerIsActive = false;
+        currentData.buzzerDismissed = true; // Flag that it was dismissed
+        
+        // Send final state update to Firebase before sleeping
+        updateBuzzerStateInFirebase(false, true);
+        break; // Exit monitoring loop and proceed to deep sleep
+      }
+    }
+    delay(100); // Small delay to prevent busy-waiting
+  }
 }
 
 // =====================================================================
@@ -413,14 +396,56 @@ void collectSensorReading() {
   readBatteryVoltage();
   
   // ------------------------------------------------------------------
-  // Tilt & free-fall detection – logic from accel-gyro.ino
+  // Tilt & free-fall/shock detection – logic from accel-gyro.ino
+  // This is now the single source of truth for this calculation.
   // ------------------------------------------------------------------
-  currentData.tiltDetected = (currentData.accelZ < TILT_THRESHOLD_Z_AXIS);
+  if (lsm6dsl_ok) {
+    // Tilt detection with state-change logging (from the test sketch)
+    bool newTiltState = (currentData.accelZ < TILT_THRESHOLD_Z_AXIS);
+    if (newTiltState != rtcLastTiltState) {
+      if (newTiltState) {
+        Serial.println("🚨 TILT DETECTED");
+      } else {
+        Serial.println("✅ Tilt Cleared");
+      }
+    }
+    currentData.tiltDetected = newTiltState;
+    rtcLastTiltState = newTiltState; // Persist for the next wake cycle
 
-  float accelMagnitude = sqrt(currentData.accelX * currentData.accelX +
-                              currentData.accelY * currentData.accelY +
-                              currentData.accelZ * currentData.accelZ);
-  currentData.fallDetected = (accelMagnitude < FALL_THRESHOLD_MAGNITUDE);
+    float accelMagnitude = sqrt(currentData.accelX * currentData.accelX +
+                                currentData.accelY * currentData.accelY +
+                                currentData.accelZ * currentData.accelZ);
+    
+    // Shock/fall detection is now based on the CHANGE from the last reading
+    if (rtcBaselineSet) {
+      float lastMagnitude = sqrt(rtcLastAccelX * rtcLastAccelX + rtcLastAccelY * rtcLastAccelY + rtcLastAccelZ * rtcLastAccelZ);
+      float delta = abs(accelMagnitude - lastMagnitude);
+      
+      // --- Diagnostic Logging ---
+      Serial.printf("Last Accel Mag: %.2f, Current Accel Mag: %.2f, Delta: %.2f\n", lastMagnitude, accelMagnitude, delta);
+      // --------------------------
+
+      currentData.fallDetected = (delta > FALL_THRESHOLD_MAGNITUDE);
+      if (currentData.fallDetected) {
+        Serial.printf("⚡️ SHOCK DETECTED! Delta from last reading: %.2fg\n", delta);
+      }
+    } else {
+      // This is the first reading cycle, so no shock is detected.
+      // We just establish the baseline for the next cycle.
+      currentData.fallDetected = false;
+      rtcBaselineSet = true;
+      Serial.println("Setting initial accelerometer baseline for shock detection.");
+    }
+
+    // Update RTC memory with the current reading for the next cycle
+    rtcLastAccelX = currentData.accelX;
+    rtcLastAccelY = currentData.accelY;
+    rtcLastAccelZ = currentData.accelZ;
+
+  } else {
+    currentData.tiltDetected = false;
+    currentData.fallDetected = false;
+  }
 
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   currentData.limitSwitchPressed = !digitalRead(LIMIT_SWITCH_PIN);
@@ -434,41 +459,41 @@ void collectSensorReading() {
 
 void readTemperatureHumidity() {
   #if ENABLE_SHT30_SENSOR
-  currentData.temperature = sht30.readTemperature();
-  currentData.humidity = sht30.readHumidity();
-  
-  // Handle invalid readings
-  if (isnan(currentData.temperature)) {
-    currentData.temperature = 0.0;
-    Serial.println("⚠ Invalid temperature reading");
-  }
-  if (isnan(currentData.humidity)) {
-    currentData.humidity = 0.0;
-    Serial.println("⚠ Invalid humidity reading");
+  if (sht30_ok) {
+    currentData.temperature = sht30.readTemperature();
+    currentData.humidity    = sht30.readHumidity();
+
+    if (isnan(currentData.temperature)) currentData.temperature = -999;
+    if (isnan(currentData.humidity))    currentData.humidity    = -999;
+  } else {
+    currentData.temperature = -999;
+    currentData.humidity    = -999;
   }
   #else
-  // Use simulated data when SHT30 is disabled
-  currentData.temperature = 25.0 + (random(-50, 50) / 10.0); // 20-30°C range
-  currentData.humidity = 50.0 + (random(-200, 200) / 10.0);   // 30-70% range
-  Serial.println("⚠ Using simulated temperature/humidity data");
+  // Use simulated data when SHT30 is compile-time disabled
+  currentData.temperature = 25.0 + (random(-50, 50) / 10.0);
+  currentData.humidity    = 50.0 + (random(-200, 200) / 10.0);
   #endif
 }
 
 void readAccelerometerData() {
-  uint8_t rawData[6];
-  for (int i = 0; i < 6; i++) {
-    rawData[i] = readLSM6DSLRegister(LSM6DSL_OUTX_L_XL + i);
+  if (lsm6dsl_ok) {
+    uint8_t rawData[6];
+    for (int i = 0; i < 6; i++) {
+      rawData[i] = readLSM6DSLRegister(LSM6DSL_OUTX_L_XL + i);
+    }
+
+    int16_t rawX = (rawData[1] << 8) | rawData[0];
+    int16_t rawY = (rawData[3] << 8) | rawData[2];
+    int16_t rawZ = (rawData[5] << 8) | rawData[4];
+
+    // Convert to g values as in sht-gyro (±2 g FS)
+    currentData.accelX = rawX * 2.0 / 32768.0;
+    currentData.accelY = rawY * 2.0 / 32768.0;
+    currentData.accelZ = rawZ * 2.0 / 32768.0;
+  } else {
+    currentData.accelX = currentData.accelY = currentData.accelZ = 0.0;
   }
-
-  int16_t rawX = (rawData[1] << 8) | rawData[0];
-  int16_t rawY = (rawData[3] << 8) | rawData[2];
-  int16_t rawZ = (rawData[5] << 8) | rawData[4];
-
-  // ±2 g → sensitivity 0.061 mg/LSB  => 2 g / 32768
-  const float SCALE = 2.0 / 32768.0;
-  currentData.accelX = rawX * SCALE;
-  currentData.accelY = rawY * SCALE;
-  currentData.accelZ = rawZ * SCALE;
 }
 
 void readGPSLocation() {
@@ -520,24 +545,45 @@ void readBatteryVoltage() {
 // HARDWARE INITIALIZATION
 // =====================================================================
 bool initializeAllHardware() {
-  /* E-ink hardware initialisation removed */
+  // --- E-ink hardware initialisation re-enabled ---
+  if (DEV_Module_Init() != 0) {
+    Serial.println("✗ E-ink DEV_Module_Init FAILED");
+    return false;
+  }
+  EPD_7IN3F_Init();
+  EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
+
+  // Allocate memory for the display buffer
+  gImageBuffer = (UBYTE *)heap_caps_malloc(EPD_7IN3F_WIDTH * EPD_PAGE_ROWS, MALLOC_CAP_DMA);
+  if (!gImageBuffer) {
+    Serial.println("✗ Failed to allocate memory for E-ink buffer!");
+    return false;
+  }
+  // --- End E-ink init ---
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+
+  // Consolidated I2C initialization for all sensors
+  Wire.begin(SHT30_SDA_PIN, SHT30_SCL_PIN);
+  Wire.setClock(100000); // 100 kHz I2C like sht-gyro test sketch
   
   #if ENABLE_SHT30_SENSOR
-  Wire.begin(SHT30_SDA_PIN, SHT30_SCL_PIN);
-  if (!sht30.begin(0x44)) {
-    Serial.println("✗ SHT30 sensor initialization failed");
-    return false;
+  if (sht30.begin(0x44)) {
+    sht30_ok = true;
+    Serial.println("✓ SHT30 initialized successfully");
+  } else {
+    sht30_ok = false;
+    Serial.println("✗ SHT30 initialization failed");
   }
   #endif
   
-  Wire.begin(LSM6DSL_SDA_PIN, LSM6DSL_SCL_PIN);
-  if (!initLSM6DSL()) {
+  if (initLSM6DSL()) {
+    lsm6dsl_ok = true;
+  } else {
+    lsm6dsl_ok = false;
     Serial.println("✗ LSM6DSL accelerometer initialization failed");
-    return false;
   }
   
   sim7600.begin(115200, SERIAL_8N1, SIM7600_RX_PIN, SIM7600_TX_PIN);
@@ -549,6 +595,9 @@ bool initializeAllHardware() {
 }
 
 bool initLSM6DSL() {
+  // This function is now overwritten with the simpler version from sht-gyro.ino.
+  // NOTE: This version does NOT configure the hardware wake-up interrupt engine.
+  // As a result, the device will NOT wake from deep sleep on shock/tilt events.
   uint8_t addresses[] = {LSM6DSL_ADDR1, LSM6DSL_ADDR2};
 
   for (int i = 0; i < 2; i++) {
@@ -563,22 +612,18 @@ bool initLSM6DSL() {
       // CTRL3_C: Block-data-update = 1
       writeLSM6DSLRegister(LSM6DSL_CTRL3_C, 0x40);
 
-      /* ---------- restore wake-up engine ---------- */
-
+      /* ---------- Re-enabling wake-up engine for deep sleep functionality ---------- */
       // 1) turn on the slope high-pass filter (keeps gravity out)
       writeLSM6DSLRegister(LSM6DSL_CTRL8_XL, 0x80);   // HP_SLOPE_XL_EN = 1
-
-      // 2) choose a threshold – 0x08 ≈ 0.50 g when FS = ±2 g
-      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_THS, 0x08);
-
-      // 3) set minimum duration – 0x20 = 3 samples ≈ 14 ms at 208 Hz
-      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_DUR, 0x20);
-
+      // 2) Set a threshold of ~200mg to prevent false wake-ups from minor vibrations.
+      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_THS, 0x06); // 6 * 31.25mg = 187.5mg
+      // 3) set minimum duration
+      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_DUR, 0x00);
       // 4) route the wake-up interrupt to INT1
       writeLSM6DSLRegister(LSM6DSL_MD1_CFG, 0x20);    // INT1_WU = 1
 
       delay(100); // Stabilise
-      Serial.println("✓ LSM6DSL initialised (simple mode)");
+      Serial.println("✓ LSM6DSL initialised (with wake-up interrupt)");
       return true;
     }
   }
@@ -774,10 +819,9 @@ void prepareForDeepSleep() {
   // Wake when the limit-switch line goes HIGH (lid opened)
   esp_sleep_enable_ext1_wakeup(1ULL << LIMIT_SWITCH_PIN, ESP_EXT1_WAKEUP_ANY_HIGH);
   
-  // Enable the accelerometer wake-up *unconditionally* so any motion
-  // that crosses the configured threshold will wake the ESP32.
-  // esp_sleep_enable_ext0_wakeup((gpio_num_t)LSM6DSL_INT1_PIN, 0);   // Accelerometer interrupt wake (active low)
-  Serial.println("📳 Accelerometer wake-up: Enabled (always)");
+  // Re-enable the accelerometer wake-up on motion.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LSM6DSL_INT1_PIN, 0);   // Wake-up on motion interrupt (active low)
+  Serial.println("📳 Accelerometer wake-up: Enabled (on motion)");
   rtc_gpio_pullup_en((gpio_num_t)LSM6DSL_INT1_PIN);
   rtc_gpio_hold_en((gpio_num_t)LSM6DSL_INT1_PIN);
   
@@ -826,7 +870,7 @@ void determineWakeUpReason() {
       currentData.wakeUpReason = "TIMER DUE (15mns.)";
       break;
     case ESP_SLEEP_WAKEUP_EXT0:
-      currentData.wakeUpReason = "SHOCK DETECTED";
+      currentData.wakeUpReason = "MOTION DETECTED"; // Corrected label
       break;
     case ESP_SLEEP_WAKEUP_EXT1:
       currentData.wakeUpReason = "LOCK BREACH";  // final reason may be overwritten later if real lock-breach

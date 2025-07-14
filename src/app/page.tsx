@@ -621,7 +621,7 @@ export default function Home() {
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-500 max-w-xs">
                           {/* Scroll container with hidden scrollbar but scrollable */}
-                          <div className="overflow-x-scroll">
+                          <div className="overflow-x-auto">
                             {prettyLocations[boxId] ||
                               item.details.setLocation ||
                               "Location not set"}
