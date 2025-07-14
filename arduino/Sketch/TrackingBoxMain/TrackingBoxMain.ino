@@ -26,18 +26,26 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
+#include <Adafruit_LSM6DSL.h>
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 // E-ink support re-enabled
+#if ENABLE_EINK
 #include "DEV_Config.h"
 #include "EPD.h"
 #include "GUI_Paint.h"
 #include "fonts.h"
 #include "qrcode.h"   // Tiny library for generating QR bitmaps
+#endif
 #include <esp_heap_caps.h>
 
+// E-ink configuration
+#define ENABLE_EINK 0
+
 // Display paging ---------------------------------------------------------
+#if ENABLE_EINK
 #define EPD_PAGE_ROWS  40   // E-ink paging enabled
+#endif
 
 #define ENABLE_SHT30_SENSOR 1
 
@@ -46,7 +54,9 @@
 #endif
 
 // Frame buffer pointer for GUI_Paint
+#if ENABLE_EINK
 static UBYTE *gImageBuffer = nullptr;
+#endif
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -66,11 +76,9 @@ static UBYTE *gImageBuffer = nullptr;
 // LSM6DSL CONSTANTS
 // =====================================================================
 // LSM6DSL Registers
-#define LSM6DSL_WHO_AM_I         0x0F
 #define LSM6DSL_CTRL1_XL         0x10
 #define LSM6DSL_CTRL3_C          0x12
-#define LSM6DSL_OUTX_L_XL        0x28
-#define LSM6DSL_CTRL8_XL         0x17 // High-pass filter configuration
+#define LSM6DSL_TAP_CFG          0x58
 #define LSM6DSL_WAKE_UP_THS      0x5B // Wake-up threshold register
 #define LSM6DSL_WAKE_UP_DUR      0x5C // Wake-up duration register
 #define LSM6DSL_MD1_CFG          0x5E // Interrupt 1 routing register
@@ -104,6 +112,7 @@ const String DEVICE_ID = "box_001";
 #if ENABLE_SHT30_SENSOR
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
+Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
 HardwareSerial sim7600(1);
 uint8_t lsm6dsl_address = 0x6A;
 // Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
@@ -169,6 +178,7 @@ void setup() {
     
     // Fetch details needed for lock breach check
     fetchDeviceDetailsFromFirebase();
+    fetchBuzzerStateFromFirebase(); // Fetch dismissal status
 
     // Evaluate lock breach condition based on sensors and Firebase data
     evaluateLockBreach();
@@ -178,8 +188,10 @@ void setup() {
     Serial.println("✅ Sensor Data Sent to Firebase.");
 
     // Update the E-Ink display with all collected data
+#if ENABLE_EINK
     updateEInkDisplay();
     Serial.println("✅ E-ink Display Updated.");
+#endif
 
     // If buzzer is active, enter monitoring loop until dismissed from the cloud
     handleBuzzerMonitoring();
@@ -208,7 +220,7 @@ void loop() {
 // =====================================================================
 // E-INK DISPLAY UPDATE
 // =====================================================================
-#if 1   // E-INK CODE BLOCK RE-ENABLED
+#if ENABLE_EINK
 void updateEInkDisplay() {
   if (!gImageBuffer) {
     Serial.println("E-ink buffer not allocated. Cannot update display.");
@@ -264,53 +276,51 @@ void sendSensorDataToFirebase() {
   }
 
   HTTPClient http;
-  // Use PATCH to update only the sensorData node within the device's data
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + ".json?auth=" + FIREBASE_AUTH;
+  // Use PUT to replace the sensorData node directly
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
-  // Create JSON document for the PATCH request
-  DynamicJsonDocument patchDoc(1024);
+  // Create JSON document for the PUT request
+  DynamicJsonDocument doc(1024);
   
-  // Create the nested sensorData object
-  JsonObject sensorData = patchDoc.createNestedObject("sensorData");
-  sensorData["timestamp"] = millis();
-  sensorData["temp"] = currentData.temperature;
-  sensorData["humidity"] = currentData.humidity;
-  sensorData["batteryVoltage"] = currentData.batteryVoltage;
-  sensorData["gpsFixValid"] = currentData.gpsFixValid;
-  sensorData["limitSwitchPressed"] = currentData.limitSwitchPressed;
-  sensorData["tiltDetected"] = currentData.tiltDetected;
-  sensorData["fallDetected"] = currentData.fallDetected;
-  sensorData["wakeUpReason"] = currentData.wakeUpReason;
-  sensorData["buzzerIsActive"] = currentData.buzzerIsActive;
+  doc["timestamp"] = millis();
+  doc["temp"] = currentData.temperature;
+  doc["humidity"] = currentData.humidity;
+  doc["batteryVoltage"] = currentData.batteryVoltage;
+  doc["gpsFixValid"] = currentData.gpsFixValid;
+  doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
+  doc["tiltDetected"] = currentData.tiltDetected;
+  doc["fallDetected"] = currentData.fallDetected;
+  doc["wakeUpReason"] = currentData.wakeUpReason;
+  doc["buzzerIsActive"] = currentData.buzzerIsActive;
   
-  JsonObject accelerometer = sensorData.createNestedObject("accelerometer");
+  JsonObject accelerometer = doc.createNestedObject("accelerometer");
   accelerometer["x"] = currentData.accelX;
   accelerometer["y"] = currentData.accelY;
   accelerometer["z"] = currentData.accelZ;
   
   if (currentData.gpsFixValid) {
-    JsonObject location = sensorData.createNestedObject("location");
+    JsonObject location = doc.createNestedObject("location");
     location["lat"] = currentData.latitude;
     location["lng"] = currentData.longitude;
     location["alt"] = currentData.altitude;
   }
   
-  sensorData["currentLocation"] = currentData.currentLocation;
+  doc["currentLocation"] = currentData.currentLocation;
 
   // Serialize JSON to string for sending
   String jsonPayload;
-  serializeJson(patchDoc, jsonPayload);
+  serializeJson(doc, jsonPayload);
   Serial.println("Sending to Firebase: " + jsonPayload);
 
-  // Send the PATCH request
-  int httpResponseCode = http.PATCH(jsonPayload);
+  // Send the PUT request
+  int httpResponseCode = http.PUT(jsonPayload);
 
   if (httpResponseCode > 0) {
-    Serial.printf("✓ Firebase PATCH successful, response code: %d\n", httpResponseCode);
+    Serial.printf("✓ Firebase PUT successful, response code: %d\n", httpResponseCode);
   } else {
-    Serial.printf("✗ Firebase PATCH failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+    Serial.printf("✗ Firebase PUT failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
   }
 
   http.end();
@@ -342,20 +352,53 @@ void fetchDeviceDetailsFromFirebase() {
   http.end();
 }
 
+void fetchBuzzerStateFromFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  // Fetch only the 'buzzerDismissed' field from the 'sensorData' node.
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+  http.begin(url);
+  
+  int httpResponseCode = http.GET();
+  if (httpResponseCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    // Firebase returns a simple 'true' or 'false' for a boolean leaf, not a JSON object.
+    if (response == "true") {
+      currentData.buzzerDismissed = true;
+      Serial.println("✓ Buzzer state is DISMISSED.");
+    } else {
+      currentData.buzzerDismissed = false;
+    }
+  } else {
+    // If the fetch fails or the key doesn't exist, assume not dismissed.
+    currentData.buzzerDismissed = false;
+  }
+  http.end();
+}
+
 void evaluateLockBreach() {
   // A lock breach occurs if the lid is open AND the device's physical location
   // does not match its designated location from Firebase.
   // Note: Limit switch is pressed (true) when the lid is CLOSED.
-  bool lockBreach = (!currentData.limitSwitchPressed) &&
-                    (currentData.currentLocation != currentData.deviceSetLocation);
+  bool isLidOpen = !currentData.limitSwitchPressed;
+  bool isLocationMismatch = (currentData.currentLocation != currentData.deviceSetLocation);
+  bool lockBreach = isLidOpen && isLocationMismatch;
 
-  if (lockBreach) {
+  // If a new breach is detected, reset the dismissal flag in Firebase.
+  if (lockBreach && currentData.buzzerDismissed) {
+    Serial.println("🔄 New lock breach detected. Resetting dismissal state.");
+    updateBuzzerStateInFirebase(false, false);
+    currentData.buzzerDismissed = false;
+  }
+  
+  // Activate the buzzer only if there is a breach and it has NOT been dismissed.
+  if (lockBreach && !currentData.buzzerDismissed) {
     Serial.println("🚨 LOCK BREACH DETECTED!");
     currentData.wakeUpReason   = "LOCK BREACH";
     currentData.buzzerIsActive = true;
     digitalWrite(BUZZER_PIN, HIGH);  // Sound buzzer continuously
   } else {
-    // If no breach, ensure buzzer is off.
+    // If no breach or already dismissed, ensure buzzer is off.
     currentData.buzzerIsActive = false;
     digitalWrite(BUZZER_PIN, LOW);
   }
@@ -455,6 +498,20 @@ void collectSensorReading() {
   } else {
     currentData.currentLocation = "No GPS Fix";
   }
+
+  // Debug: print all sensor and state variables
+  Serial.printf("DEBUG | Temp=%.2fC Hum=%.2f%% Batt=%.2fV Acc=%.3fg %.3fg %.3fg GPSValid=%d LimitSwitch=%d Tilt=%d Fall=%d\n",
+                currentData.temperature,
+                currentData.humidity,
+                currentData.batteryVoltage,
+                currentData.accelX,
+                currentData.accelY,
+                currentData.accelZ,
+                currentData.gpsFixValid,
+                currentData.limitSwitchPressed,
+                currentData.tiltDetected,
+                currentData.fallDetected
+  );
 }
 
 void readTemperatureHumidity() {
@@ -478,19 +535,15 @@ void readTemperatureHumidity() {
 
 void readAccelerometerData() {
   if (lsm6dsl_ok) {
-    uint8_t rawData[6];
-    for (int i = 0; i < 6; i++) {
-      rawData[i] = readLSM6DSLRegister(LSM6DSL_OUTX_L_XL + i);
-    }
+    sensors_event_t accel;
+    sensors_event_t gyro;
+    sensors_event_t temp;
+    lsm6ds.getEvent(&accel, &gyro, &temp);
 
-    int16_t rawX = (rawData[1] << 8) | rawData[0];
-    int16_t rawY = (rawData[3] << 8) | rawData[2];
-    int16_t rawZ = (rawData[5] << 8) | rawData[4];
-
-    // Convert to g values as in sht-gyro (±2 g FS)
-    currentData.accelX = rawX * 2.0 / 32768.0;
-    currentData.accelY = rawY * 2.0 / 32768.0;
-    currentData.accelZ = rawZ * 2.0 / 32768.0;
+    // Convert from m/s^2 to g's
+    currentData.accelX = accel.acceleration.x / SENSORS_GRAVITY_STANDARD;
+    currentData.accelY = accel.acceleration.y / SENSORS_GRAVITY_STANDARD;
+    currentData.accelZ = accel.acceleration.z / SENSORS_GRAVITY_STANDARD;
   } else {
     currentData.accelX = currentData.accelY = currentData.accelZ = 0.0;
   }
@@ -545,6 +598,7 @@ void readBatteryVoltage() {
 // HARDWARE INITIALIZATION
 // =====================================================================
 bool initializeAllHardware() {
+#if ENABLE_EINK
   // --- E-ink hardware initialisation re-enabled ---
   if (DEV_Module_Init() != 0) {
     Serial.println("✗ E-ink DEV_Module_Init FAILED");
@@ -560,6 +614,7 @@ bool initializeAllHardware() {
     return false;
   }
   // --- End E-ink init ---
+#endif
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -595,49 +650,44 @@ bool initializeAllHardware() {
 }
 
 bool initLSM6DSL() {
-  // This function is now overwritten with the simpler version from sht-gyro.ino.
-  // NOTE: This version does NOT configure the hardware wake-up interrupt engine.
-  // As a result, the device will NOT wake from deep sleep on shock/tilt events.
   uint8_t addresses[] = {LSM6DSL_ADDR1, LSM6DSL_ADDR2};
+  bool found = false;
 
   for (int i = 0; i < 2; i++) {
-    lsm6dsl_address = addresses[i];
-
-    // Verify sensor presence
-    uint8_t whoAmI = readLSM6DSLRegister(LSM6DSL_WHO_AM_I);
-    if (whoAmI == 0x6A) {
-      // CTRL1_XL: 208 Hz ODR, ±2 g FS  -> 0x60
-      writeLSM6DSLRegister(LSM6DSL_CTRL1_XL, 0x60);
-
-      // CTRL3_C: Block-data-update = 1
-      writeLSM6DSLRegister(LSM6DSL_CTRL3_C, 0x40);
-
-      /* ---------- Re-enabling wake-up engine for deep sleep functionality ---------- */
-      // 1) turn on the slope high-pass filter (keeps gravity out)
-      writeLSM6DSLRegister(LSM6DSL_CTRL8_XL, 0x80);   // HP_SLOPE_XL_EN = 1
-      // 2) Set a threshold of ~200mg to prevent false wake-ups from minor vibrations.
-      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_THS, 0x06); // 6 * 31.25mg = 187.5mg
-      // 3) set minimum duration
-      writeLSM6DSLRegister(LSM6DSL_WAKE_UP_DUR, 0x00);
-      // 4) route the wake-up interrupt to INT1
-      writeLSM6DSLRegister(LSM6DSL_MD1_CFG, 0x20);    // INT1_WU = 1
-
-      delay(100); // Stabilise
-      Serial.println("✓ LSM6DSL initialised (with wake-up interrupt)");
-      return true;
+    if (lsm6ds.begin_I2C(addresses[i], &Wire)) {
+      lsm6dsl_address = addresses[i];
+      found = true;
+      break;
     }
   }
-  return false;
-}
 
-uint8_t readLSM6DSLRegister(uint8_t reg) {
-  Wire.beginTransmission(lsm6dsl_address);
-  Wire.write(reg);
-  uint8_t err = Wire.endTransmission(false);
-  if (err != 0) return 0xFF;
-  Wire.requestFrom(lsm6dsl_address, (uint8_t)1);
-  if (!Wire.available()) return 0xFF;
-  return Wire.read();
+  if (!found) {
+    Serial.println("✗ Failed to find LSM6DSL chip");
+    return false;
+  }
+  
+  Serial.println("✓ LSM6DSL Found!");
+
+  // Apply wake-on-motion configuration from reference sketch
+  // CTRL1_XL: 104 Hz, 2g
+  writeLSM6DSLRegister(LSM6DSL_CTRL1_XL, 0x40);
+  // CTRL3_C: Enable block data update, register auto-increment
+  writeLSM6DSLRegister(LSM6DSL_CTRL3_C, 0x44);
+  // TAP_CFG: Enable interrupts
+  writeLSM6DSLRegister(LSM6DSL_TAP_CFG, 0x80);
+  // WAKE_UP_THS: Set motion threshold (16 * 31.25mg = 500mg)
+  writeLSM6DSLRegister(LSM6DSL_WAKE_UP_THS, 0x10);
+  // WAKE_UP_DUR: No minimum duration
+  writeLSM6DSLRegister(LSM6DSL_WAKE_UP_DUR, 0x03);
+  // MD1_CFG: Route wake-up interrupt to INT1
+  writeLSM6DSLRegister(LSM6DSL_MD1_CFG, 0x20);
+
+  delay(100); // Stabilise
+  Serial.println("✓ LSM6DSL initialised (with wake-up interrupt)");
+
+  Serial.println("Last Wakeup cause: " + currentData.wakeUpReason);
+
+  return true;
 }
 
 void writeLSM6DSLRegister(uint8_t reg, uint8_t value) {
@@ -674,7 +724,7 @@ bool connectToWiFi() {
 }
 
 // ---------------------------------------------------------------------------
-#if 0   // E-INK CODE BLOCK DISABLED
+#if ENABLE_EINK
 void displayOfflineQRCode() {
   Serial.println("📱 Displaying offline QR code...");
 
@@ -820,10 +870,8 @@ void prepareForDeepSleep() {
   esp_sleep_enable_ext1_wakeup(1ULL << LIMIT_SWITCH_PIN, ESP_EXT1_WAKEUP_ANY_HIGH);
   
   // Re-enable the accelerometer wake-up on motion.
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)LSM6DSL_INT1_PIN, 0);   // Wake-up on motion interrupt (active low)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LSM6DSL_INT1_PIN, 1);   // Wake-up on motion interrupt (active high)
   Serial.println("📳 Accelerometer wake-up: Enabled (on motion)");
-  rtc_gpio_pullup_en((gpio_num_t)LSM6DSL_INT1_PIN);
-  rtc_gpio_hold_en((gpio_num_t)LSM6DSL_INT1_PIN);
   
   Serial.println("⏰ Timer wake-up: " + String(SLEEP_MINUTES) + " minutes");
   Serial.println("🔘 Limit switch wake-up: Enabled (GPIO" + String(LIMIT_SWITCH_PIN) + ")");
@@ -853,7 +901,7 @@ void buzzerAlert(int beepCount, int beepDuration) {
 // =====================================================================
 // Waveshare-based rendering functions -------------------------------------------------
 // ---------------------------------------------------------------------------
-#if 0   // E-INK CODE BLOCK DISABLED
+#if ENABLE_EINK
 void _preparePaint() {
   if (!gImageBuffer) return;
   Paint_SelectImage(gImageBuffer);
@@ -890,7 +938,7 @@ void determineWakeUpReason() {
 bool checkDismissCommand() {
   if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert.json";
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   int code = http.GET();
   if (code == HTTP_CODE_OK) {
