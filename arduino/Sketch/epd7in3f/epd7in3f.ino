@@ -1,57 +1,50 @@
-/**
-    @filename   :   EPD_7in3f.ino
-    @brief      :   EPD_7in3 e-paper F display demo
-    @author     :   Waveshare
+#include "DEV_Config.h"
+#include "EPD_7in3f.h"
+#include "GUI_Paint.h"
+#include "ImageData.h"
+#include <stdlib.h>
 
-    Copyright (C) Waveshare     10 21 2022
-
-   Permission is hereby granted, free of charge, to any person obtaining a copy
-   of this software and associated documnetation files (the "Software"), to deal
-   in the Software without restriction, including without limitation the rights
-   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-   copies of the Software, and to permit persons to  whom the Software is
-   furished to do so, subject to the following conditions:
-
-   The above copyright notice and this permission notice shall be included in
-   all copies or substantial portions of the Software.
-
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-   FITNESS OR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-   LIABILITY WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-   THE SOFTWARE.
-*/
-
-#include <SPI.h>
-#include "imagedata.h"
-#include "epd7in3f.h"
-
-void setup() {
-    // put your setup code here, to run once:
+void setup()
+{
     Serial.begin(115200);
-    Epd epd;
-    if (epd.Init() != 0) {
-        Serial.print("e-Paper init failed");
+    Serial.println("EPD_7IN3F_test Demo");
+
+    // Hardware init
+    if (DEV_Module_Init() != 0) {
+        Serial.println("Hardware init failed");
         return;
     }
 
-    Serial.print("e-Paper Clear\r\n ");
-    epd.Clear(EPD_7IN3F_WHITE);
+    Serial.println("e-Paper Init and Clear...");
+    EPD_7IN3F_Init();
+    EPD_7IN3F_Clear();
 
-    Serial.print("Show pic\r\n ");
-    epd.EPD_7IN3F_Display_part(gImage_7in3f, 250, 150, 300, 180);
-    delay(2000);
+    // Create a new image cache
+    UBYTE *BlackImage;
+    UWORD Imagesize = ((EPD_7IN3F_WIDTH % 8 == 0) ? (EPD_7IN3F_WIDTH / 8) : (EPD_7IN3F_WIDTH / 8 + 1)) * EPD_7IN3F_HEIGHT;
+    if ((BlackImage = (UBYTE *)malloc(Imagesize)) == NULL) {
+        Serial.println("Failed to allocate memory...");
+        return;
+    }
+    Paint_NewImage(BlackImage, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT, 0, WHITE);
+    Paint_SetScale(7);
+    Paint_Clear(WHITE);  // Set background to white
 
-    Serial.print("draw 7 color block\r\n ");
-    epd.EPD_7IN3F_Show7Block();
-    delay(2000);
-    
-    epd.Sleep();
+    // Draw black text on white background
+    Paint_DrawString_EN(20, 20, "Fast Refresh", &Font24, WHITE, BLACK);
+    Paint_DrawString_EN(20, 60, "Black on White", &Font24, WHITE, BLACK);
+
+    // Push image to display
+    EPD_7IN3F_Display(BlackImage);
+    delay(3000);  // Reduced delay for faster testing
+
+    // Optional: Sleep to preserve screen and save power
+    EPD_7IN3F_Sleep();
+    free(BlackImage);
+    BlackImage = NULL;
 }
 
-void loop() {
-    // put your main code here, to run repeatedly:
-
+void loop()
+{
+    // Nothing here
 }
