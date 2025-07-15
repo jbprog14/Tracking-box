@@ -29,6 +29,9 @@
 #include <Adafruit_LSM6DSL.h>
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
+#include "DEV_Config.h"
+#include "EPD.h"
+#include "GUI_Paint.h"
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -127,6 +130,7 @@ TrackerData currentData;
 
 // Forward declaration
 void determineWakeUpReason();
+void updateDisplay();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -149,6 +153,12 @@ void setup() {
     evaluateLockBreach();
     sendSensorDataToFirebase();
     Serial.println("✅ Sensor Data Sent to Firebase.");
+
+    // ------------------------------------------------------------------
+    // Update E-Ink display with the latest data pulled from Firebase and
+    // gathered from onboard sensors.
+    // ------------------------------------------------------------------
+    updateDisplay();
 
     // If buzzer is active, enter monitoring loop until dismissed
     handleBuzzerMonitoring();
@@ -631,6 +641,199 @@ void determineWakeUpReason() {
     }
   Serial.print("Last Wakeup cause: ");
   Serial.println(currentData.wakeUpReason);
+}
+
+// =====================================================================
+// SIM7600 & GPS HELPERS
+// =====================================================================
+void flushSIM7600Buffer() {
+  while (sim7600.available()) {
+    sim7600.read();
+  }
+}
+
+void sendGPSCommand(const char* cmd) {
+  flushSIM7600Buffer();
+  sim7600.println(cmd);
+}
+
+String waitForGPSResponse(unsigned long timeout) {
+  String response = "";
+  unsigned long startTime = millis();
+  while (millis() - startTime < timeout) {
+    if (sim7600.available()) {
+      response += sim7600.readString();
+    }
+  }
+  return response;
+}
+
+String getGNSSInfoLine(String response) {
+  int start = response.indexOf("+CGNSSINFO:");
+  if (start == -1) {
+    return "";
+  }
+  int end = response.indexOf('\r', start);
+  if (end == -1) {
+    end = response.length();
+  }
+  return response.substring(start, end);
+}
+
+bool isValidGPSFix(String response) {
+  String infoLine = getGNSSInfoLine(response);
+  if (infoLine.length() == 0) return false;
+
+  // +CGNSSINFO: <run status>,<fix status>,...
+  // A valid fix is indicated by fix status > 0.
+  int firstComma = infoLine.indexOf(',');
+  if (firstComma == -1) return false;
+
+  int secondComma = infoLine.indexOf(',', firstComma + 1);
+  if (secondComma == -1) return false;
+
+  String fixStatusStr = infoLine.substring(firstComma + 1, secondComma);
+  return fixStatusStr.toInt() > 0;
+}
+
+String extractGPSField(String response, int index) {
+  String infoLine = getGNSSInfoLine(response);
+  if (infoLine.length() == 0) return "";
+
+  int dataStart = infoLine.indexOf(':');
+  if (dataStart == -1) return "";
+  String data = infoLine.substring(dataStart + 2); // Skip ": "
+
+  int current_index = 1;
+  int last_pos = 0;
+
+  while(current_index < index) {
+    last_pos = data.indexOf(',', last_pos);
+    if (last_pos == -1) return "";
+    last_pos++;
+    current_index++;
+  }
+
+  int next_comma = data.indexOf(',', last_pos);
+  if (next_comma == -1) {
+    return data.substring(last_pos);
+  } else {
+    return data.substring(last_pos, next_comma);
+  }
+}
+
+double convertToDecimalDegrees(String coordinate, String direction) {
+  if (coordinate.length() == 0) {
+    return 0.0;
+  }
+  double raw_val = coordinate.toDouble();
+  int dd = int(raw_val / 100);
+  double mm = raw_val - (dd * 100);
+  double dec_deg = dd + mm / 60.0;
+  if (direction == "S" || direction == "W") {
+    dec_deg = -dec_deg;
+  }
+  return dec_deg;
+}
+
+// =====================================================================
+// DEEP SLEEP CONFIGURATION
+// =====================================================================
+void prepareForDeepSleep() {
+  Serial.println("Configuring deep sleep triggers...");
+
+  // Wake up on timer
+  esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
+  Serial.println("  - Timer wakeup enabled for 15 minutes.");
+
+  // Wake up on motion (LSM6DSL INT1 is on GPIO34)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 1); // RTC_GPIO 0, wake on HIGH
+  Serial.println("  - Motion wakeup (EXT0) on GPIO 34 enabled.");
+
+  // Wake up on limit switch (lid open - pin is LOW when open)
+  uint64_t limitSwitchMask = 1ULL << LIMIT_SWITCH_PIN;
+  esp_sleep_enable_ext1_wakeup(limitSwitchMask, ESP_EXT1_WAKEUP_ANY_HIGH); // should be ALL_LOW if switch pulls to gnd when open
+  Serial.println("  - Limit switch wakeup (EXT1) on GPIO 33 enabled.");
+  
+  // Isolate GPIO12 pin from external circuits during deep sleep to prevent flash issues.
+  rtc_gpio_isolate(GPIO_NUM_12);
+}
+
+
+// =====================================================================
+// E-PAPER DISPLAY – Waveshare 7.3" 800×400 (7-color) helper
+// =====================================================================
+void updateDisplay() {
+  Serial.println("Updating E-Ink display …");
+
+  // Basic initialisation – safe to call each cycle
+  DEV_Module_Init();
+  EPD_7IN3F_Init();
+  EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
+
+  // Allocate a quarter-frame buffer (800×200) like the Waveshare demo
+  UBYTE *imgBuf;
+  UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * (EPD_7IN3F_HEIGHT / 2);
+  imgBuf = (UBYTE *)malloc(imgSize);
+  if (!imgBuf) {
+    Serial.println("✗ Failed to allocate display buffer");
+    return;
+  }
+
+  Paint_NewImage(imgBuf, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2, 0, EPD_7IN3F_WHITE);
+  Paint_SetScale(7);          // 7-colour mode
+  Paint_SelectImage(imgBuf);
+  Paint_Clear(EPD_7IN3F_WHITE);
+
+  // ------------------------------
+  // Compose display content
+  // ------------------------------
+  uint16_t y = 5;  // Start Y-coord
+  const uint16_t lineGap = 28;
+
+  // Device name (large font)
+  Paint_DrawString_EN(10, y, currentData.deviceName.c_str(), &Font24, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap + 6;
+
+  // Location (either GPS fix or fallback string)
+  Paint_DrawString_EN(10, y, (String("Loc: ") + currentData.currentLocation).c_str(), &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap;
+
+  // Temperature & Humidity
+  char buf[64];
+  snprintf(buf, sizeof(buf), "Temp: %.1fC  Hum: %.1f%%", currentData.temperature, currentData.humidity);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap;
+
+  // Battery
+  snprintf(buf, sizeof(buf), "Battery: %.2fV", currentData.batteryVoltage);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap;
+
+  // Tilt / Shock status
+  snprintf(buf, sizeof(buf), "Tilt:%s  Shock:%s", currentData.tiltDetected ? "YES" : "NO", currentData.fallDetected ? "YES" : "NO");
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap;
+
+  // Lid status & wake-up reason
+  snprintf(buf, sizeof(buf), "Lid:%s  Wake:%s", currentData.limitSwitchPressed ? "Closed" : "OPEN", currentData.wakeUpReason.c_str());
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  y += lineGap;
+
+  // Buzzer status (if active)
+  if (currentData.buzzerIsActive) {
+    Paint_DrawString_EN(10, y, "⚠ BUZZER ACTIVE ⚠", &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  }
+
+  // ------------------------------
+  // Push buffer to display and sleep
+  // ------------------------------
+  EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
+  EPD_7IN3F_Sleep();
+  free(imgBuf);
+  imgBuf = nullptr;
+
+  Serial.println("✓ Display updated");
 }
 
 // =====================================================================
