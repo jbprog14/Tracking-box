@@ -69,11 +69,60 @@ export default function Home() {
   const [dataError, setDataError] = useState<string | null>(null);
   const [isDismissing, setIsDismissing] = useState<string | null>(null);
   const prevTrackingDataRef = useRef<TrackingData>({});
+  const [isActivatingLock, setIsActivatingLock] = useState<string | null>(null);
 
   // ------------------------------------------------------------------
   // Reverse-geocoding (lat,lon → human readable)
   // ------------------------------------------------------------------
   const geocodeCache = useRef<Record<string, string>>({});
+
+  // --------------------------------------------------------------
+  // Helper: convert coordinate strings (decimal OR DMS) to [lat,lon]
+  // --------------------------------------------------------------
+  const dmsToDecimal = (deg: number, min: number, sec: number, dir = "N") => {
+    let dec = deg + min / 60 + sec / 3600;
+    if (/[SW]/i.test(dir)) dec = -dec;
+    return dec;
+  };
+
+  const parseCoordinates = (raw: string): [number, number] | null => {
+    if (!raw) return null;
+
+    // 1) Simple decimal "lat, lon"
+    const decMatch = raw.match(/-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?/);
+    if (decMatch) {
+      const [latStr, lonStr] = decMatch[0].split(/\s*,\s*/);
+      return [parseFloat(latStr), parseFloat(lonStr)];
+    }
+
+    // 2) Degrees-minutes-seconds   14°33'43.1"N 121°06'43.3"E
+    const dmsRegex =
+      /(\d{1,3})[^0-9]+(\d{1,2})[^0-9]+(\d{1,2}(?:\.\d+)?)\s*["'′″]?\s*([NSEW])/gi;
+    const parts: { deg: number; min: number; sec: number; dir: string }[] = [];
+    let m;
+    // eslint-disable-next-line no-cond-assign
+    while ((m = dmsRegex.exec(raw))) {
+      parts.push({ deg: +m[1], min: +m[2], sec: +m[3], dir: m[4] });
+    }
+    if (parts.length >= 2) {
+      return [
+        dmsToDecimal(parts[0].deg, parts[0].min, parts[0].sec, parts[0].dir),
+        dmsToDecimal(parts[1].deg, parts[1].min, parts[1].sec, parts[1].dir),
+      ];
+    }
+
+    // 3) Fallback to first two numbers (old behaviour)
+    const nums = raw.match(/-?\d+(?:\.\d+)?/g);
+    if (nums && nums.length >= 2) {
+      let lat = parseFloat(nums[0]);
+      let lon = parseFloat(nums[1]);
+      if (/S/i.test(raw)) lat = -Math.abs(lat);
+      if (/W/i.test(raw)) lon = -Math.abs(lon);
+      return [lat, lon];
+    }
+    return null;
+  };
+
   const [prettyLocations, setPrettyLocations] = useState<
     Record<string, string>
   >({});
@@ -117,15 +166,9 @@ export default function Home() {
       await Promise.all(
         Object.entries(trackingData).map(async ([boxId, box]) => {
           const rawLoc = box.details.setLocation;
-          // Extract numbers (handles "14.6° N, 121.0° E" and "14.6, 121.0")
-          const nums = rawLoc.match(/-?\d+(?:\.\d+)?/g);
-          if (!nums || nums.length < 2) return;
-
-          let lat = parseFloat(nums[0]);
-          let lon = parseFloat(nums[1]);
-          // Handle N/S/E/W
-          if (/S/i.test(rawLoc)) lat = -Math.abs(lat);
-          if (/W/i.test(rawLoc)) lon = -Math.abs(lon);
+          const coords = parseCoordinates(rawLoc);
+          if (!coords) return;
+          const [lat, lon] = coords;
 
           const human = await fetchReverseGeocode(lat, lon);
           updates[boxId] = human;
@@ -462,6 +505,21 @@ export default function Home() {
     }
   };
 
+  // Trigger solenoid activation in Firebase
+  const handleActivateLock = async (boxId: string) => {
+    setIsActivatingLock(boxId);
+    try {
+      const lockRef = ref(db, `tracking_box/${boxId}/solenoid`);
+      await set(lockRef, true);
+      toast.success(`Lock activated for ${boxId}`, { position: "top-right" });
+    } catch (error) {
+      console.error("Error activating lock:", error);
+      toast.error(`Failed to activate lock for ${boxId}`);
+    } finally {
+      setIsActivatingLock(null);
+    }
+  };
+
   if (!isOnline) {
     return <QRLinkPage />;
   }
@@ -616,21 +674,21 @@ export default function Home() {
                     const item = trackingData[boxId];
                     return (
                       <tr key={boxId} className="hover:bg-gray-100">
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                        <td className="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-900">
                           {boxId.toUpperCase()}
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-500 max-w-xs">
-                          {/* Scroll container with hidden scrollbar but scrollable */}
-                          <div className="overflow-x-auto">
-                            {prettyLocations[boxId] ||
-                              item.details.setLocation ||
-                              "Location not set"}
+                        <td className="px-6 py-2 text-sm text-gray-500 max-w-xs">
+                          <div className="whitespace-normal break-words">
+                            {prettyLocations[boxId] || "Location not set"}
+                          </div>
+                          <div className="text-xs text-gray-400 break-words">
+                            {item.details.setLocation}
                           </div>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <td className="px-6 py-2 whitespace-nowrap text-sm text-gray-500">
                           {item.details.name || "Name not set"}
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-500">
+                        <td className="px-6 py-2 text-sm text-gray-500">
                           <button
                             onClick={() => handleViewClick(boxId)}
                             className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded-md border-2 border-blue-700 transition duration-300 text-sm"
@@ -638,13 +696,28 @@ export default function Home() {
                             View
                           </button>
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-500">
-                          <button
-                            onClick={() => handleEditClick(boxId)}
-                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
-                          >
-                            Edit Info
-                          </button>
+                        <td className="px-6 py-2 text-sm text-gray-500">
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => handleEditClick(boxId)}
+                              className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
+                            >
+                              Edit Info
+                            </button>
+                            <button
+                              onClick={() => handleActivateLock(boxId)}
+                              disabled={isActivatingLock === boxId}
+                              className={`bg-red-600 hover:bg-red-700 text-white font-bold py-1 px-3 rounded-md border-2 border-red-700 transition duration-300 text-sm ${
+                                isActivatingLock === boxId
+                                  ? "opacity-50 cursor-not-allowed"
+                                  : ""
+                              }`}
+                            >
+                              {isActivatingLock === boxId
+                                ? "Activating..."
+                                : "Activate Lock"}
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );

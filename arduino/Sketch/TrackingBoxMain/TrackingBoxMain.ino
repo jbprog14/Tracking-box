@@ -32,6 +32,7 @@
 #include "DEV_Config.h"
 #include "EPD.h"
 #include "GUI_Paint.h"
+#include <math.h>  // for haversine
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -46,6 +47,7 @@
 #define SIM7600_RX_PIN      16
 #define LIMIT_SWITCH_PIN    33
 #define BUZZER_PIN          32
+#define SOLENOID_PIN        2   // GPIO2 – electronic lock/solenoid signal
 
 // =====================================================================
 // LSM6DSL CONSTANTS
@@ -100,6 +102,29 @@ RTC_DATA_ATTR float rtcLastAccelZ = 0.0;
 RTC_DATA_ATTR bool rtcBaselineSet = false;
 RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
 
+// --------------------------------------------------------------
+// GEO HELPERS
+// --------------------------------------------------------------
+// Simple haversine – returns great-circle distance in meters
+double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0; // Earth radius metres
+  double dLat = (lat2 - lat1) * DEG_TO_RAD;
+  double dLon = (lon2 - lon1) * DEG_TO_RAD;
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
+                 sin(dLon / 2) * sin(dLon / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+bool parseCoordPair(const String &str, double &lat, double &lon) {
+  int comma = str.indexOf(',');
+  if (comma == -1) return false;
+  lat = str.substring(0, comma).toDouble();
+  lon = str.substring(comma + 1).toDouble();
+  return !(isnan(lat) || isnan(lon));
+}
+
 // This structure holds all data, both from sensors and fetched from Firebase.
 struct TrackerData {
   // Sensor-derived data
@@ -112,6 +137,7 @@ struct TrackerData {
   bool fallDetected = false;   // new free-fall / shock flag
   float batteryVoltage = 0.0;
   bool gpsFixValid = false;
+  bool usingCGPS = false;  // NEW: indicates CGPSInfo method was used this cycle
   bool limitSwitchPressed = false;
   float accelX = 0.0;
   float accelY = 0.0;
@@ -124,9 +150,13 @@ struct TrackerData {
   String wakeUpReason = "Power On";
   bool buzzerIsActive = false;
   bool buzzerDismissed = false;
+  bool solenoidActive = false; // NEW: current requested state from Firebase
 };
 
 TrackerData currentData;
+
+// Flag to request a restart after solenoid operation completes
+bool restartAfterSolenoid = false;
 
 // Forward declaration
 void determineWakeUpReason();
@@ -150,7 +180,13 @@ void setup() {
     Serial.println("✅ Sensor Readings Collected.");
     fetchDeviceDetailsFromFirebase();
     fetchBuzzerStateFromFirebase();
+    fetchSolenoidStateFromFirebase(); // NEW: read solenoid flag
     evaluateLockBreach();
+    // If solenoid flag is set, activate the lock once
+    if (currentData.solenoidActive) {
+      activateSolenoidAndClearFlag();
+      restartAfterSolenoid = true; // request reboot after this cycle
+    }
     sendSensorDataToFirebase();
     Serial.println("✅ Sensor Data Sent to Firebase.");
 
@@ -165,6 +201,14 @@ void setup() {
     if (!currentData.buzzerIsActive) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
+    }
+    // -------------------------------------------------------------
+    // If solenoid cycle finished, restart instead of deep sleep
+    // -------------------------------------------------------------
+    if (restartAfterSolenoid) {
+      Serial.println("Restarting MCU after solenoid activation …");
+      delay(500);
+      ESP.restart();
     }
   } else {
     Serial.println("❌ WiFi connection failed.");
@@ -200,6 +244,7 @@ void sendSensorDataToFirebase() {
   doc["humidity"] = currentData.humidity;
   doc["batteryVoltage"] = currentData.batteryVoltage;
   doc["gpsFixValid"] = currentData.gpsFixValid;
+  doc["usingCGPS"] = currentData.usingCGPS; // NEW flag pushed to Firebase
   doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
   doc["tiltDetected"] = currentData.tiltDetected;
   doc["fallDetected"] = currentData.fallDetected;
@@ -287,12 +332,62 @@ void fetchBuzzerStateFromFirebase() {
   http.end();
 }
 
+// ---------------------------------------------------------------------------
+// SOLENOID CONTROL
+// ---------------------------------------------------------------------------
+void fetchSolenoidStateFromFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/solenoid.json?auth=" + FIREBASE_AUTH;
+  http.begin(url);
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    String payload = http.getString();
+    currentData.solenoidActive = (payload == "true");
+  } else {
+    currentData.solenoidActive = false;
+  }
+  http.end();
+}
+
+void activateSolenoidAndClearFlag() {
+  Serial.println("🔓 Activating solenoid lock …");
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, HIGH); // energise solenoid
+  delay(10000);                      // hold for 10 s (adjust as needed)
+  digitalWrite(SOLENOID_PIN, LOW);  // release
+
+  // Clear the flag in Firebase so we don’t fire again next cycle
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/solenoid.json?auth=" + FIREBASE_AUTH;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.PUT("false");
+    http.end();
+  }
+  currentData.solenoidActive = false;
+  Serial.println("🔒 Solenoid cycle complete.");
+}
+
 void evaluateLockBreach() {
   // A lock breach occurs if the lid is open AND the device's physical location
   // does not match its designated location from Firebase.
   // Note: Limit switch is pressed (true) when the lid is CLOSED.
   bool isLidOpen = !currentData.limitSwitchPressed;
-  bool isLocationMismatch = (currentData.currentLocation != currentData.deviceSetLocation);
+
+  bool isLocationMismatch = true; // assume mismatch until proven otherwise
+
+  // If we have a valid GPS fix and a parsable setLocation, compute distance
+  if (currentData.gpsFixValid) {
+    double setLat, setLon;
+    if (parseCoordPair(currentData.deviceSetLocation, setLat, setLon)) {
+      double distMeters = haversineMeters(currentData.latitude, currentData.longitude, setLat, setLon);
+      isLocationMismatch = distMeters > 100.0; // 100-m radius
+      Serial.printf("Distance to safe zone: %.1f m\n", distMeters);
+    }
+  }
+
   bool lockBreach = isLidOpen && isLocationMismatch;
 
   // If a new breach is detected, reset the dismissal flag in Firebase.
@@ -462,32 +557,34 @@ void readAccelerometerData() {
 
 void readGPSLocation() {
   Serial.println("Reading GPS location...");
+  currentData.usingCGPS = true; // Mark that CGPS method is in use
   
-  // Enable GNSS system
-  sendGPSCommand("AT+CGNSS=1");
-  delay(2000);
-  
-  // Request current location
+  // ------------------------------------------------------------------
+  // Enable GPS using the CGPS command set (more reliable on SIM7600).
+  // ------------------------------------------------------------------
+  sendGPSCommand("AT+CGPS=1,1");   // Start GPS in standalone mode
+  delay(2000);                      // Allow the receiver to power-up
+
+  // Request current location data
   flushSIM7600Buffer();
-  sim7600.println("AT+CGNSSINFO");
+  sim7600.println("AT+CGPSINFO");
   
   String response = waitForGPSResponse(5000);
-  
-  if (response.indexOf("+CGNSSINFO:") != -1) {
+
+  if (response.indexOf("+CGPSINFO:") != -1) {
     if (isValidGPSFix(response)) {
-      // Extract GPS data fields
-      String latitude = extractGPSField(response, 4);
-      String lat_direction = extractGPSField(response, 5);
-      String longitude = extractGPSField(response, 6);
-      String lon_direction = extractGPSField(response, 7);
-      String altitude = extractGPSField(response, 10);
-      
+      // CGPSINFO format: +CGPSINFO: <lat>,<N/S>,<lon>,<E/W>,<date>,<utc>,<alt>,<speed>,<course>
+      String latitude      = extractGPSField(response, 1);
+      String lat_direction = extractGPSField(response, 2);
+      String longitude     = extractGPSField(response, 3);
+      String lon_direction = extractGPSField(response, 4);
+      String altitude      = extractGPSField(response, 7); // altitude field (may be blank)
+
       // Convert to decimal degrees
-      currentData.latitude = convertToDecimalDegrees(latitude, lat_direction);
+      currentData.latitude  = convertToDecimalDegrees(latitude,  lat_direction);
       currentData.longitude = convertToDecimalDegrees(longitude, lon_direction);
-      currentData.altitude = altitude.toFloat();
+      currentData.altitude  = altitude.toFloat();
       currentData.gpsFixValid = true;
-      
       Serial.println("✓ GPS fix acquired");
     } else {
       Serial.println("⚠ No GPS fix available");
@@ -512,6 +609,8 @@ bool initializeAllHardware() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(SOLENOID_PIN, OUTPUT); // Initialize solenoid pin
+  digitalWrite(SOLENOID_PIN, LOW); // Ensure solenoid is off initially
 
   Wire.begin(SHT30_SDA_PIN, SHT30_SCL_PIN);
   Wire.setClock(100000);
@@ -668,8 +767,8 @@ String waitForGPSResponse(unsigned long timeout) {
   return response;
 }
 
-String getGNSSInfoLine(String response) {
-  int start = response.indexOf("+CGNSSINFO:");
+String getGPSInfoLine(String response) { // Renamed: only handles CGPSINFO now
+  int start = response.indexOf("+CGPSINFO:");
   if (start == -1) {
     return "";
   }
@@ -681,23 +780,23 @@ String getGNSSInfoLine(String response) {
 }
 
 bool isValidGPSFix(String response) {
-  String infoLine = getGNSSInfoLine(response);
+  String infoLine = getGPSInfoLine(response);
   if (infoLine.length() == 0) return false;
 
-  // +CGNSSINFO: <run status>,<fix status>,...
-  // A valid fix is indicated by fix status > 0.
-  int firstComma = infoLine.indexOf(',');
+  // For CGPSINFO, a valid fix is indicated by non-empty latitude field.
+  int colonPos = infoLine.indexOf(':');
+  if (colonPos == -1) return false;
+  String data = infoLine.substring(colonPos + 1);
+  data.trim();
+  int firstComma = data.indexOf(',');
   if (firstComma == -1) return false;
-
-  int secondComma = infoLine.indexOf(',', firstComma + 1);
-  if (secondComma == -1) return false;
-
-  String fixStatusStr = infoLine.substring(firstComma + 1, secondComma);
-  return fixStatusStr.toInt() > 0;
+  String latField = data.substring(0, firstComma);
+  latField.trim();
+  return latField.length() > 0;
 }
 
 String extractGPSField(String response, int index) {
-  String infoLine = getGNSSInfoLine(response);
+  String infoLine = getGPSInfoLine(response);
   if (infoLine.length() == 0) return "";
 
   int dataStart = infoLine.indexOf(':');
@@ -791,39 +890,44 @@ void updateDisplay() {
   uint16_t y = 5;  // Start Y-coord
   const uint16_t lineGap = 28;
 
-  // Device name (large font)
-  Paint_DrawString_EN(10, y, currentData.deviceName.c_str(), &Font24, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+   // Details
+  Paint_DrawString_EN(10, y, String("DETAILS:").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
   y += lineGap + 6;
 
-  // Location (either GPS fix or fallback string)
-  Paint_DrawString_EN(10, y, (String("Loc: ") + currentData.currentLocation).c_str(), &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
-  y += lineGap;
-
-  // Temperature & Humidity
+  // Device name (large font)
   char buf[64];
-  snprintf(buf, sizeof(buf), "Temp: %.1fC  Hum: %.1f%%", currentData.temperature, currentData.humidity);
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  snprintf(buf, sizeof(buf), "PACKAGE OWNER: %s", currentData.deviceName);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
   y += lineGap;
 
-  // Battery
-  snprintf(buf, sizeof(buf), "Battery: %.2fV", currentData.batteryVoltage);
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  // Current Location
+  snprintf(buf, sizeof(buf), "CURRENT LOCATION: %s", currentData.currentLocation);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
   y += lineGap;
 
-  // Tilt / Shock status
-  snprintf(buf, sizeof(buf), "Tilt:%s  Shock:%s", currentData.tiltDetected ? "YES" : "NO", currentData.fallDetected ? "YES" : "NO");
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
+  // Item Description
+  snprintf(buf, sizeof(buf), "ITEM DESCRIPTION: %s", currentData.deviceDescription);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  y += lineGap + 6;
+
+  // Sensor Readings
+  Paint_DrawString_EN(10, y, String("SENSOR READINGS:").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED );
+  y += lineGap + 10;
+
+  // Temperature | Accel
+  snprintf(buf, sizeof(buf), "TEMPERATURE: %.1fC | ACCELEROMETER: X=%.2fg  Y=%.2fg  Z=%.2fg", currentData.temperature, currentData.accelX, currentData.accelY, currentData.accelZ);
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
   y += lineGap;
 
-  // Lid status & wake-up reason
-  snprintf(buf, sizeof(buf), "Lid:%s  Wake:%s", currentData.limitSwitchPressed ? "Closed" : "OPEN", currentData.wakeUpReason.c_str());
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
-  y += lineGap;
+  // Humidity | Battery
+  snprintf(buf, sizeof(buf), "HUMIDITY: %.1f%% | BATTERY (V): %.2fV", currentData.humidity, currentData.batteryVoltage);
+   Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+   y += lineGap;
 
-  // Buzzer status (if active)
-  if (currentData.buzzerIsActive) {
-    Paint_DrawString_EN(10, y, "⚠ BUZZER ACTIVE ⚠", &Font16, EPD_7IN3F_BLACK, EPD_7IN3F_WHITE);
-  }
+  // wake-up reason
+  snprintf(buf, sizeof(buf), "LAST WAKE-UP REASON: %s", currentData.wakeUpReason.c_str());
+  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  y += lineGap;
 
   // ------------------------------
   // Push buffer to display and sleep

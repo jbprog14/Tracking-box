@@ -1,8 +1,8 @@
 "use client";
 
-import {useState, useEffect} from "react";
-import {ref, update} from "firebase/database";
-import {db} from "@/app/firebase";
+import { useState, useEffect } from "react";
+import { ref, update } from "firebase/database";
+import { db } from "@/app/firebase";
 import {
   Dialog,
   DialogContent,
@@ -10,8 +10,8 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import {ScrollArea} from "@/components/ui/scroll-area";
-import {Badge} from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Badge } from "@/components/ui/badge";
 import {
   Battery,
   Thermometer,
@@ -115,7 +115,7 @@ export default function TrackingBoxModal({
     const accel =
       typeof sd.accelerometer === "object" && sd.accelerometer
         ? sd.accelerometer
-        : {x: 0, y: 0, z: 0};
+        : { x: 0, y: 0, z: 0 };
     const point = {
       time: new Date(ts).toLocaleTimeString(),
       temp: sd.temp,
@@ -188,6 +188,21 @@ export default function TrackingBoxModal({
   };
 
   const status = getStatus();
+
+  // Determine display label for last wake-up event
+  const lastWakeupDisplay =
+    currentSensorData.wakeUpReason ??
+    (currentSensorData.bootCount === 0 ? "FIRST BOOT" : "Unknown");
+
+  // Normalize timestamp (handle seconds vs milliseconds) and build display string
+  const lastUpdateTimestamp =
+    currentSensorData.timestamp && currentSensorData.timestamp < 1e12
+      ? currentSensorData.timestamp * 1000 // convert seconds → ms
+      : currentSensorData.timestamp;
+
+  const lastUpdateDisplay = lastUpdateTimestamp
+    ? new Date(lastUpdateTimestamp).toLocaleTimeString()
+    : "N/A";
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -322,7 +337,7 @@ export default function TrackingBoxModal({
                 <div>
                   <p className="text-sm text-gray-500">Last Wakeup</p>
                   <p className="text-xl font-bold text-gray-900">
-                    {currentSensorData.wakeUpReason ?? "Unknown"}
+                    {lastWakeupDisplay}
                   </p>
                 </div>
               </div>
@@ -371,11 +386,7 @@ export default function TrackingBoxModal({
                   <div className="flex justify-between items-center">
                     <span className="text-gray-600">Last Update</span>
                     <span className="font-semibold text-gray-900">
-                      {currentSensorData.timestamp
-                        ? new Date(
-                            currentSensorData.timestamp
-                          ).toLocaleTimeString()
-                        : "N/A"}
+                      {lastUpdateDisplay}
                     </span>
                   </div>
                 </div>
@@ -393,7 +404,7 @@ export default function TrackingBoxModal({
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
                     data={chartData}
-                    margin={{top: 5, right: 20, left: 0, bottom: 5}}
+                    margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis
@@ -412,7 +423,7 @@ export default function TrackingBoxModal({
                       dataKey="temp"
                       stroke="#ef4444"
                       name="Temp (°C)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -423,7 +434,7 @@ export default function TrackingBoxModal({
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
                     data={chartData}
-                    margin={{top: 5, right: 20, left: 0, bottom: 5}}
+                    margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis
@@ -442,7 +453,7 @@ export default function TrackingBoxModal({
                       dataKey="humidity"
                       stroke="#3b82f6"
                       name="Humidity (%)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -453,7 +464,7 @@ export default function TrackingBoxModal({
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
                     data={chartData}
-                    margin={{top: 5, right: 20, left: 0, bottom: 5}}
+                    margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis
@@ -472,7 +483,7 @@ export default function TrackingBoxModal({
                       dataKey="battery"
                       stroke="#10b981"
                       name="Battery (V)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -483,7 +494,7 @@ export default function TrackingBoxModal({
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
                     data={chartData}
-                    margin={{top: 5, right: 20, left: 0, bottom: 5}}
+                    margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis
@@ -502,21 +513,21 @@ export default function TrackingBoxModal({
                       dataKey="accelX"
                       stroke="#f97316"
                       name="Accel X (g)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                     <Line
                       type="monotone"
                       dataKey="accelY"
                       stroke="#06b6d4"
                       name="Accel Y (g)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                     <Line
                       type="monotone"
                       dataKey="accelZ"
                       stroke="#a855f7"
                       name="Accel Z (g)"
-                      dot={{r: 3}}
+                      dot={{ r: 3 }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
