@@ -901,7 +901,7 @@ void updateDisplay() {
   y += lineGap;
 
   // Current Location
-  snprintf(buf, sizeof(buf), "CURRENT LOCATION: %s", currentData.currentLocation);
+  snprintf(buf, sizeof(buf), "CURRENT LOCATION: %s", currentData.currentLocation.c_str());
   Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
   y += lineGap;
 
