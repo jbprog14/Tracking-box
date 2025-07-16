@@ -2,10 +2,8 @@
 
 import { useParams } from "next/navigation";
 import { useState, useEffect } from "react";
-import { db } from "../../firebase";
-import { ref, onValue } from "firebase/database";
-
-export const runtime = "edge";
+// NOTE: We load Firebase dynamically *only* in the browser to keep the
+// Cloudflare Pages / Edge bundle free of Node-specific polyfills.
 
 interface DeviceDetails {
   name: string;
@@ -45,11 +43,29 @@ export default function QRDevicePage() {
   const [dataError, setDataError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isAuthenticated && deviceId) {
-      setIsLoading(true);
+    let unsubscribe: (() => void) | undefined;
+
+    const initRealtime = async () => {
+      // Dynamically import Firebase only in the browser
+      const { getDatabase, ref, onValue } = await import("firebase/database");
+      const { initializeApp } = await import("firebase/app");
+
+      // Minimal client-side init (avoid shared singleton to keep things
+      // tree-shakable in the edge build)
+      const firebaseConfig = {
+        apiKey: "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY",
+        authDomain: "tracking-box-e17a1.firebaseapp.com",
+        databaseURL:
+          "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app",
+        projectId: "tracking-box-e17a1",
+      } as const;
+
+      const app = initializeApp(firebaseConfig, "qr-viewer");
+      const db = getDatabase(app);
+
       const deviceRef = ref(db, `tracking_box/${deviceId}`);
 
-      const unsubscribe = onValue(
+      unsubscribe = onValue(
         deviceRef,
         (snapshot) => {
           try {
@@ -103,9 +119,20 @@ export default function QRDevicePage() {
           setIsLoading(false);
         }
       );
+    };
 
-      return () => unsubscribe();
+    if (isAuthenticated && deviceId && typeof window !== "undefined") {
+      setIsLoading(true);
+      initRealtime().catch((err) => {
+        console.error("Firebase init error", err);
+        setDataError("Failed to connect to database");
+        setIsLoading(false);
+      });
     }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
   }, [isAuthenticated, deviceId]);
 
   const handleLogin = (e: React.FormEvent) => {

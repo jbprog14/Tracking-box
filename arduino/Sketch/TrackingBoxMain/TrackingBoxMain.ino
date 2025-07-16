@@ -980,7 +980,7 @@ void updateDisplay() {
 // OFFLINE PAGE – render QR code to help user configure network
 // ---------------------------------------------------------------------------
 void showOfflineQRCode() {
-  const char *url = "https://tracking-box.pages.dev/qrcode";
+  const char *url = "https://tracking-box.pages.dev/qr/box_001";
 
   // Generate QR (version-3 ⇒ 29×29)
   uint8_t qrcodeData[qrcode_getBufferSize(3)];
