@@ -30,6 +30,10 @@ interface DeviceData {
   sensorData: SensorData;
 }
 
+// Cloudflare Pages ➜ Next-on-Pages requires each non-static route to declare
+// that it runs in the Edge runtime.
+export const runtime = "edge";
+
 export default function QRDevicePage() {
   const params = useParams();
   const deviceId = params.deviceId as string;
