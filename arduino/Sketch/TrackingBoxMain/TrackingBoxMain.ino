@@ -32,6 +32,7 @@
 #include "DEV_Config.h"
 #include "EPD.h"
 #include "GUI_Paint.h"
+#include "qrcode.h"   // NEW – small QR code generator
 #include <math.h>  // for haversine
 
 // =====================================================================
@@ -77,8 +78,8 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "archer_2.4G";
-const char* WIFI_PASSWORD = "05132000";
+const char* WIFI_SSID = "";
+const char* WIFI_PASSWORD = "";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
@@ -157,6 +158,7 @@ TrackerData currentData;
 
 // Flag to request a restart after solenoid operation completes
 bool restartAfterSolenoid = false;
+bool awaitSolenoid = false; // lid open within safe zone waiting for lock release
 
 // Forward declaration
 void determineWakeUpReason();
@@ -187,17 +189,28 @@ void setup() {
       activateSolenoidAndClearFlag();
       restartAfterSolenoid = true; // request reboot after this cycle
     }
+
+    // If lid is open in safe zone, wait for solenoid activation command
+    if (awaitSolenoid) {
+      waitForSolenoidActivation();
+    }
     sendSensorDataToFirebase();
     Serial.println("✅ Sensor Data Sent to Firebase.");
 
-    // ------------------------------------------------------------------
-    // Update E-Ink display with the latest data pulled from Firebase and
-    // gathered from onboard sensors.
-    // ------------------------------------------------------------------
-    updateDisplay();
+    // --------------------------------------------------------------
+    // If buzzer alarm is active, wait for dismissal BEFORE refreshing
+    // the power-hungry E-Ink display. This keeps the device responsive.
+    // --------------------------------------------------------------
+    if (currentData.buzzerIsActive) {
+      handleBuzzerMonitoring();
+    }
 
-    // If buzzer is active, enter monitoring loop until dismissed
-    handleBuzzerMonitoring();
+    // Only refresh the display when no alarm is sounding, not waiting for
+    // solenoid.
+    if (!currentData.buzzerIsActive && !awaitSolenoid) {
+      updateDisplay();
+    }
+
     if (!currentData.buzzerIsActive) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
@@ -212,11 +225,11 @@ void setup() {
     }
   } else {
     Serial.println("❌ WiFi connection failed.");
+    showOfflineQRCode();
+    Serial.println("Cycle complete → deep sleep.");
+    prepareForDeepSleep();
+    esp_deep_sleep_start();
   }
-
-  Serial.println("Cycle complete → deep sleep.");
-  prepareForDeepSleep();
-  esp_deep_sleep_start();
 }
 
 void loop() {
@@ -383,12 +396,15 @@ void evaluateLockBreach() {
     double setLat, setLon;
     if (parseCoordPair(currentData.deviceSetLocation, setLat, setLon)) {
       double distMeters = haversineMeters(currentData.latitude, currentData.longitude, setLat, setLon);
-      isLocationMismatch = distMeters > 100.0; // 100-m radius
+      isLocationMismatch = distMeters > 50.0; // 50-m radius
       Serial.printf("Distance to safe zone: %.1f m\n", distMeters);
     }
   }
 
   bool lockBreach = isLidOpen && isLocationMismatch;
+
+  // If lid is open but still within safe zone, we will await solenoid command
+  awaitSolenoid = isLidOpen && !isLocationMismatch;
 
   // If a new breach is detected, reset the dismissal flag in Firebase.
   if (lockBreach && currentData.buzzerDismissed) {
@@ -432,6 +448,26 @@ void handleBuzzerMonitoring() {
       }
     }
     delay(100); // Small delay to prevent busy-waiting
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wait for solenoid activation when lid open in safe zone
+// ---------------------------------------------------------------------------
+void waitForSolenoidActivation() {
+  Serial.println("🔓 Lid open within safe distance – awaiting solenoid activation …");
+  unsigned long lastPoll = 0;
+  while (true) {
+    if (millis() - lastPoll > 5000) {
+      lastPoll = millis();
+      fetchSolenoidStateFromFirebase();
+      if (currentData.solenoidActive) {
+        activateSolenoidAndClearFlag();
+        restartAfterSolenoid = true;
+        break;
+      }
+    }
+    delay(100);
   }
 }
 
@@ -502,7 +538,7 @@ void collectSensorReading() {
   if (currentData.gpsFixValid) {
     currentData.currentLocation = String(currentData.latitude, 4) + ", " + String(currentData.longitude, 4);
   } else {
-    currentData.currentLocation = "No GPS Fix";
+    currentData.currentLocation = "GPS Initializing. Please Wait. . .";
   }
 
   // Debug: print all sensor and state variables
@@ -940,6 +976,64 @@ void updateDisplay() {
   Serial.println("✓ Display updated");
 }
 
+// ---------------------------------------------------------------------------
+// OFFLINE PAGE – render QR code to help user configure network
+// ---------------------------------------------------------------------------
+void showOfflineQRCode() {
+  const char *url = "https://tracking-box.pages.dev/qrcode";
+
+  // Generate QR (version-3 ⇒ 29×29)
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  QRCode qrcode;
+  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
+
+  // Init display
+  DEV_Module_Init();
+  EPD_7IN3F_Init();
+  EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
+
+  // Allocate half-height buffer (same as updateDisplay)
+  UBYTE *imgBuf;
+  UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * (EPD_7IN3F_HEIGHT / 2);
+  imgBuf = (UBYTE *)malloc(imgSize);
+  if (!imgBuf) return;
+
+  Paint_NewImage(imgBuf, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2, 0, EPD_7IN3F_WHITE);
+  Paint_SetScale(7);
+  Paint_SelectImage(imgBuf);
+  Paint_Clear(EPD_7IN3F_WHITE);
+
+  // Compute placement – center horizontally, 29 modules * 8px ≈ 232px
+  const int scale = 8;
+  const int qrSize = qrcode.size;
+  const int qrPix  = qrSize * scale;
+  const int offsetX = (EPD_7IN3F_WIDTH  - qrPix) / 2;
+  const int offsetY = 10; // top margin
+
+  for (int y = 0; y < qrSize; y++) {
+    for (int x = 0; x < qrSize; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        Paint_DrawRectangle(offsetX + x * scale,
+                            offsetY + y * scale,
+                            offsetX + (x + 1) * scale,
+                            offsetY + (y + 1) * scale,
+                            EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+      }
+    }
+  }
+
+  // Caption beneath QR
+  Paint_DrawString_EN(10, offsetY + qrPix + 20,
+                      (char *)"Scan code for help page", &Font16,
+                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+
+  // Push to display
+  EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
+  EPD_7IN3F_Sleep();
+  free(imgBuf);
+  Serial.println("✓ Offline QR displayed");
+}
+
 // =====================================================================
 // END OF TRACKING BOX MAIN FIRMWARE
 // ===================================================================== 
@@ -947,17 +1041,13 @@ void updateDisplay() {
 bool checkDismissCommand() {
   if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert.json?auth=" + FIREBASE_AUTH;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   int code = http.GET();
   if (code == HTTP_CODE_OK) {
     String payload = http.getString();
-    DynamicJsonDocument doc(128);
-    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
-      bool dismissed = doc["dismissed"] | false;
-      http.end();
-      return dismissed;
-    }
+    http.end();
+    return payload == "true";
   }
   http.end();
   return false;

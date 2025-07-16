@@ -253,41 +253,44 @@ export default function Home() {
 
               if (isNowCritical && !wasPreviouslyCritical) {
                 toast.error(
-                  (t) => (
-                    <div className="flex flex-col gap-2">
-                      <span className="font-bold">
-                        CRITICAL SECURITY BREACH!
-                      </span>
-                      <span>
-                        {currentBox.details.name || boxId} has been moved
-                        outside the safe zone.
-                      </span>
-                      <div className="flex gap-2 mt-2">
-                        <button
-                          onClick={() => {
-                            dismissCriticalAlert(boxId);
-                            toast.dismiss(t.id);
-                          }}
-                          disabled={isDismissing === boxId}
-                          className={`flex-1 font-semibold py-1 px-2 rounded-md transition-colors ${
-                            isDismissing === boxId
-                              ? "bg-gray-400 cursor-not-allowed"
-                              : "bg-red-700 hover:bg-red-800"
-                          } text-white`}
-                        >
-                          {isDismissing === boxId
-                            ? "Dismissing..."
-                            : "DISMISS ALARM"}
-                        </button>
-                        <button
-                          onClick={() => toast.dismiss(t.id)}
-                          className="flex-1 bg-gray-500 text-white font-semibold py-1 px-2 rounded-md hover:bg-gray-600 transition-colors"
-                        >
-                          Close
-                        </button>
+                  (t) => {
+                    if (!currentBox) return null;
+                    return (
+                      <div className="flex flex-col gap-2">
+                        <span className="font-bold">
+                          CRITICAL SECURITY BREACH!
+                        </span>
+                        <span>
+                          {currentBox.details.name || boxId} has been moved
+                          outside the safe zone.
+                        </span>
+                        <div className="flex gap-2 mt-2">
+                          <button
+                            onClick={() => {
+                              dismissCriticalAlert(boxId);
+                              toast.dismiss(t.id);
+                            }}
+                            disabled={isDismissing === boxId}
+                            className={`flex-1 font-semibold py-1 px-2 rounded-md transition-colors ${
+                              isDismissing === boxId
+                                ? "bg-gray-400 cursor-not-allowed"
+                                : "bg-red-700 hover:bg-red-800"
+                            } text-white`}
+                          >
+                            {isDismissing === boxId
+                              ? "Dismissing..."
+                              : "DISMISS ALARM"}
+                          </button>
+                          <button
+                            onClick={() => toast.dismiss(t.id)}
+                            className="flex-1 bg-gray-500 text-white font-semibold py-1 px-2 rounded-md hover:bg-gray-600 transition-colors"
+                          >
+                            Close
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                  ),
+                    );
+                  },
                   {
                     id: `critical-toast-${boxId}`, // Prevent duplicate toasts for the same box
                     duration: Infinity, // Keep toast open until manually dismissed
@@ -384,17 +387,10 @@ export default function Home() {
     setIsDismissing(boxId);
 
     try {
-      // 1. Send dismiss command to the device to stop the buzzer
-      const dismissRef = ref(db, `tracking_box/${boxId}/dismissAlert`);
-      await set(dismissRef, { dismissed: true, timestamp: Date.now() });
-
-      // 2. Immediately reset the alert-related state in Firebase for a responsive UI.
-      // The device will pick up the dismiss command and stop its own alert cycle,
-      // preventing these flags from being immediately overwritten.
       const sensorDataRef = ref(db, `tracking_box/${boxId}/sensorData`);
       await update(sensorDataRef, {
         buzzerIsActive: false,
-        buzzerDismissed: true, // Mark as dismissed to prevent re-alerts for the same event
+        buzzerDismissed: true, // Mark as dismissed; device will acknowledge
       });
 
       toast.success(`Alarm for ${boxId} dismissed successfully.`, {

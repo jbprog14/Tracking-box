@@ -4,7 +4,7 @@ import React from "react";
 import QRCode from "react-qr-code";
 
 const QRLinkPage = () => {
-  const url = "https://example.com";
+  const url = "https://tracking-box.pages.dev/qr/box_001/";
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center bg-gray-100 p-24">
@@ -12,7 +12,7 @@ const QRLinkPage = () => {
         <h1 className="text-3xl font-bold text-gray-900 mb-6">Scan QR Code</h1>
         <div
           className="flex justify-center"
-          style={{background: "white", padding: "16px"}}
+          style={{ background: "white", padding: "16px" }}
         >
           <QRCode value={url} size={256} />
         </div>

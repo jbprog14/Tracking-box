@@ -64,14 +64,25 @@ export default function QRDevicePage() {
                 sensorData: {
                   temp: data.sensorData?.temp || 0,
                   humidity: data.sensorData?.humidity || 0,
-                  accelerometer: data.sensorData?.accelerometer || "NORMAL",
-                  currentLocation: data.sensorData?.currentLocation || "No GPS Fix",
+                  accelerometer: (() => {
+                    const raw = data.sensorData?.accelerometer;
+                    if (typeof raw === "string") return raw;
+                    if (raw && typeof raw === "object") {
+                      if (raw.fallDetected) return "FALL DETECTED";
+                      if (raw.tiltDetected) return "TILT DETECTED";
+                      return "MOVING"; // generic non-normal motion
+                    }
+                    return "NORMAL";
+                  })(),
+                  currentLocation:
+                    data.sensorData?.currentLocation || "No GPS Fix",
                   batteryVoltage: data.sensorData?.batteryVoltage || 0,
                   wakeReason: data.sensorData?.wakeReason || "",
                   timestamp: data.sensorData?.timestamp || 0,
                   bootCount: data.sensorData?.bootCount || 0,
                   altitude: data.sensorData?.altitude || 0,
-                  limitSwitchPressed: data.sensorData?.limitSwitchPressed || false,
+                  limitSwitchPressed:
+                    data.sensorData?.limitSwitchPressed || false,
                   locationBreach: data.sensorData?.locationBreach || false,
                 },
               });
@@ -107,8 +118,6 @@ export default function QRDevicePage() {
     }
   };
 
-
-
   const getStatusColor = (status: string | boolean) => {
     if (typeof status === "boolean") {
       return status ? "text-red-600" : "text-green-600";
@@ -122,20 +131,42 @@ export default function QRDevicePage() {
         <div className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-md">
           <div className="text-center mb-8">
             <div className="mx-auto w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center mb-4">
-              <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              <svg
+                className="w-8 h-8 text-white"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
+                />
               </svg>
             </div>
-            <h1 className="text-2xl font-bold text-gray-900 mb-2">Device Access</h1>
+            <h1 className="text-2xl font-bold text-gray-900 mb-2">
+              Device Access
+            </h1>
             <p className="text-gray-600">
-              Viewing details for device: <span className="font-mono font-semibold">{deviceId?.toUpperCase()}</span>
+              Viewing details for device:{" "}
+              <span className="font-mono font-semibold">
+                {deviceId?.toUpperCase()}
+              </span>
             </p>
-            <p className="text-sm text-gray-500 mt-2">Please authenticate to access device information</p>
+            <p className="text-sm text-gray-500 mt-2">
+              Please authenticate to access device information
+            </p>
           </div>
 
           <form onSubmit={handleLogin} className="space-y-6">
             <div>
-              <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-2">Username</label>
+              <label
+                htmlFor="username"
+                className="block text-sm font-medium text-gray-700 mb-2"
+              >
+                Username
+              </label>
               <input
                 type="text"
                 id="username"
@@ -148,7 +179,12 @@ export default function QRDevicePage() {
             </div>
 
             <div>
-              <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-2">Password</label>
+              <label
+                htmlFor="password"
+                className="block text-sm font-medium text-gray-700 mb-2"
+              >
+                Password
+              </label>
               <input
                 type="password"
                 id="password"
@@ -176,7 +212,8 @@ export default function QRDevicePage() {
 
           <div className="mt-6 text-center">
             <p className="text-xs text-gray-500">
-              This page provides offline access to device information when scanned from the device QR code.
+              This page provides offline access to device information when
+              scanned from the device QR code.
             </p>
           </div>
         </div>
@@ -190,13 +227,17 @@ export default function QRDevicePage() {
         <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">Device: {deviceId?.toUpperCase()}</h1>
+              <h1 className="text-3xl font-bold text-gray-900">
+                Device: {deviceId?.toUpperCase()}
+              </h1>
               <p className="text-gray-600 mt-1">Offline Device Access Portal</p>
             </div>
             <div className="flex items-center gap-4">
               <div className="text-right">
                 <p className="text-sm text-gray-500">Accessed via QR Code</p>
-                <p className="text-xs text-gray-400">{new Date().toLocaleString()}</p>
+                <p className="text-xs text-gray-400">
+                  {new Date().toLocaleString()}
+                </p>
               </div>
               <button
                 onClick={() => setIsAuthenticated(false)}
@@ -215,55 +256,87 @@ export default function QRDevicePage() {
           </div>
         ) : dataError ? (
           <div className="bg-white rounded-xl shadow-lg p-8 text-center">
-            <svg className="h-12 w-12 text-red-500 mx-auto mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.854-.833-2.598 0L3.268 19c-.77.833.192 2.5 1.732 2.5z" />
+            <svg
+              className="h-12 w-12 text-red-500 mx-auto mb-4"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.854-.833-2.598 0L3.268 19c-.77.833.192 2.5 1.732 2.5z"
+              />
             </svg>
             <p className="text-red-600 font-medium">{dataError}</p>
           </div>
         ) : deviceData ? (
           <div className="space-y-6">
             <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-900 mb-4">Device Information</h2>
+              <h2 className="text-xl font-bold text-gray-900 mb-4">
+                Device Information
+              </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="bg-gray-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Device Name</p>
-                  <p className="font-semibold text-gray-900">{deviceData.details.name || "Not Set"}</p>
+                  <p className="font-semibold text-gray-900">
+                    {deviceData.details.name || "Not Set"}
+                  </p>
                 </div>
                 <div className="bg-gray-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Set Location</p>
-                  <p className="font-semibold text-gray-900">{deviceData.details.setLocation || "Not Set"}</p>
+                  <p className="font-semibold text-gray-900">
+                    {deviceData.details.setLocation || "Not Set"}
+                  </p>
                 </div>
               </div>
             </div>
 
             <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-900 mb-4">Current Sensor Data</h2>
+              <h2 className="text-xl font-bold text-gray-900 mb-4">
+                Current Sensor Data
+              </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 <div className="bg-red-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Temperature</p>
-                  <p className="text-2xl font-bold text-red-600">{deviceData.sensorData.temp}°C</p>
+                  <p className="text-2xl font-bold text-red-600">
+                    {deviceData.sensorData.temp}°C
+                  </p>
                 </div>
                 <div className="bg-blue-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Humidity</p>
-                  <p className="text-2xl font-bold text-blue-600">{deviceData.sensorData.humidity}%</p>
+                  <p className="text-2xl font-bold text-blue-600">
+                    {deviceData.sensorData.humidity}%
+                  </p>
                 </div>
                 <div className="bg-green-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Battery</p>
-                  <p className="text-2xl font-bold text-green-600">{deviceData.sensorData.batteryVoltage?.toFixed(2)}V</p>
+                  <p className="text-2xl font-bold text-green-600">
+                    {deviceData.sensorData.batteryVoltage?.toFixed(2)}V
+                  </p>
                 </div>
                 <div className="bg-purple-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Current Location</p>
-                  <p className="font-semibold text-purple-600">{deviceData.sensorData.currentLocation}</p>
+                  <p className="font-semibold text-purple-600">
+                    {deviceData.sensorData.currentLocation}
+                  </p>
                 </div>
                 <div className="bg-orange-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Motion Status</p>
-                  <p className={`font-semibold ${getStatusColor(deviceData.sensorData.accelerometer)}`}>
+                  <p
+                    className={`font-semibold ${getStatusColor(
+                      deviceData.sensorData.accelerometer
+                    )}`}
+                  >
                     {deviceData.sensorData.accelerometer}
                   </p>
                 </div>
                 <div className="bg-gray-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Boot Count</p>
-                  <p className="text-2xl font-bold text-gray-600">{deviceData.sensorData.bootCount}</p>
+                  <p className="text-2xl font-bold text-gray-600">
+                    {deviceData.sensorData.bootCount}
+                  </p>
                 </div>
               </div>
             </div>
@@ -272,4 +345,4 @@ export default function QRDevicePage() {
       </div>
     </div>
   );
-} 
+}
