@@ -34,6 +34,10 @@
 #include "GUI_Paint.h"
 #include "qrcode.h"   // NEW – small QR code generator
 #include <math.h>  // for haversine
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+#include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -78,8 +82,8 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID = "archer_2.4G";
+const char* WIFI_PASSWORD = "05132000";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
@@ -92,6 +96,15 @@ Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
 HardwareSerial sim7600(1);
+TinyGsm      gsmModem(sim7600);           // Re-use the same UART for data
+TinyGsmClient gsmNet(gsmModem);
+
+// APN credentials for the SIM
+const char APN[]  = "smartlte";
+const char APN_USER[] = "";
+const char APN_PASS[] = "";
+
+bool useCellular = false; // set true when Wi-Fi fails and GPRS succeeds
 uint8_t lsm6dsl_address = 0x6A;
 // Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
 bool sht30_ok   = false;
@@ -118,12 +131,74 @@ double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
   return R * c;
 }
 
-bool parseCoordPair(const String &str, double &lat, double &lon) {
+// --------------------------------------------------------------
+// Parse coordinate string that may be in:
+//   1) Decimal "lat, lon"       e.g. 14.5620,121.1121
+//   2) Decimal with spaces       e.g. "14.5620, 121.1121"
+//   3) Simple DMS string         e.g. "14°33'43.1\"N 121°06'43.3\"E"
+// Only two components (lat,lon) are supported; altitude ignored.
+// --------------------------------------------------------------
+bool parseCoordPair(const String &raw, double &lat, double &lon) {
+  String str = raw;
+  str.trim();
+
+  // --- Case 1: decimal with comma ---
   int comma = str.indexOf(',');
-  if (comma == -1) return false;
-  lat = str.substring(0, comma).toDouble();
-  lon = str.substring(comma + 1).toDouble();
-  return !(isnan(lat) || isnan(lon));
+  if (comma != -1) {
+    lat = str.substring(0, comma).toFloat();
+    lon = str.substring(comma + 1).toFloat();
+    if (!isnan(lat) && !isnan(lon) && lat != 0.0) return true;
+  }
+
+  // --- Case 2: DMS pattern (very lightweight parser) ---
+  // Expect four numbers: deg min sec for lat + dir, then same for lon
+  double deg[2] = {0, 0}, min[2] = {0, 0}, sec[2] = {0, 0};
+  char dir[2] = {'N', 'E'};
+
+  // Replace degree, quote symbols with spaces for easier splitting
+  String cleaned = str;
+  cleaned.replace("°", " ");
+  cleaned.replace("'", " ");
+  cleaned.replace("\"", " ");
+
+  // Split by space
+  double nums[6];
+  int numIdx = 0;
+  int start = 0;
+  while (numIdx < 6) {
+    int space = cleaned.indexOf(' ', start);
+    if (space == -1) space = cleaned.length();
+    String token = cleaned.substring(start, space);
+    token.trim();
+    if (token.length() > 0 && isdigit(token[0])) {
+      nums[numIdx++] = token.toFloat();
+    }
+    start = space + 1;
+    if (start >= cleaned.length()) break;
+  }
+  if (numIdx == 6) {
+    deg[0] = nums[0]; min[0] = nums[1]; sec[0] = nums[2];
+    deg[1] = nums[3]; min[1] = nums[4]; sec[1] = nums[5];
+    // Find N/S and E/W letters
+    int nPos = str.indexOf('N');
+    int sPos = str.indexOf('S');
+    int ePos = str.indexOf('E');
+    int wPos = str.indexOf('W');
+    if (sPos != -1) dir[0] = 'S';
+    if (wPos != -1) dir[1] = 'W';
+
+    auto dmsToDec = [](double d, double m, double s, char c) {
+      double dec = d + m / 60.0 + s / 3600.0;
+      if (c == 'S' || c == 'W') dec = -dec;
+      return dec;
+    };
+
+    lat = dmsToDec(deg[0], min[0], sec[0], dir[0]);
+    lon = dmsToDec(deg[1], min[1], sec[1], dir[1]);
+    return true;
+  }
+
+  return false; // unsupported format
 }
 
 // This structure holds all data, both from sensors and fetched from Firebase.
@@ -222,13 +297,37 @@ void setup() {
       Serial.println("Restarting MCU after solenoid activation …");
       delay(500);
       ESP.restart();
+    } else {
+      // Normal cycle end – enter deep sleep until next wake trigger
+      Serial.println("Cycle complete → deep sleep (Wi-Fi mode).");
+      prepareForDeepSleep();
+      esp_deep_sleep_start();
     }
   } else {
-    Serial.println("❌ WiFi connection failed.");
-    showOfflineQRCode();
-    Serial.println("Cycle complete → deep sleep.");
-    prepareForDeepSleep();
-    esp_deep_sleep_start();
+    Serial.println("❌ WiFi connection failed. Attempting cellular fallback …");
+
+    if (connectToCellular()) {
+      Serial.println("✅ Cellular connected – continuing cycle.");
+      useCellular = true;
+
+      // We already collected sensor data above only inside Wi-Fi path.
+      // For cellular fallback, we still need hardware initialisation & readings.
+      initializeAllHardware();
+      collectSensorReading();
+
+      sendSensorDataToFirebaseViaGPRS();
+
+      // Short path: no display refresh to save data + power
+      Serial.println("Cycle complete → deep sleep (cellular mode).");
+      prepareForDeepSleep();
+      esp_deep_sleep_start();
+    } else {
+      Serial.println("❌ Cellular fallback failed.");
+      showOfflineQRCode();
+      Serial.println("Cycle complete → deep sleep.");
+      prepareForDeepSleep();
+      esp_deep_sleep_start();
+    }
   }
 }
 
@@ -980,7 +1079,7 @@ void updateDisplay() {
 // OFFLINE PAGE – render QR code to help user configure network
 // ---------------------------------------------------------------------------
 void showOfflineQRCode() {
-  const char *url = "https://tracking-box.pages.dev/qr/box_001";
+  const char *url = "https://tracking-box.vercel.app/qr/box_001/";
 
   // Generate QR (version-3 ⇒ 29×29)
   uint8_t qrcodeData[qrcode_getBufferSize(3)];
@@ -1065,4 +1164,81 @@ void updateBuzzerStateInFirebase(bool active, bool dismissed) {
   String body; serializeJson(doc, body);
   http.PATCH(body);
   http.end();
+} 
+
+// ---------------------------------------------------------------------------
+// CELLULAR (SIM7600) HELPERS
+// ---------------------------------------------------------------------------
+
+bool connectToCellular() {
+  // Initialise UART if not already
+  sim7600.begin(115200, SERIAL_8N1, SIM7600_RX_PIN, SIM7600_TX_PIN);
+  delay(3000);
+
+  Serial.println("Restarting SIM7600 modem …");
+  gsmModem.restart();
+
+  Serial.print("Waiting for network … ");
+  if (!gsmModem.waitForNetwork()) {
+    Serial.println("❌");
+    return false;
+  }
+  Serial.println("✅");
+
+  Serial.print("Connecting to APN: "); Serial.println(APN);
+  if (!gsmModem.gprsConnect(APN, APN_USER, APN_PASS)) {
+    Serial.println("❌ GPRS failed");
+    return false;
+  }
+  Serial.println("✅ GPRS connected");
+  return true;
+}
+
+void sendSensorDataToFirebaseViaGPRS() {
+  // Prepare JSON (reuse existing helper to create payload)
+  DynamicJsonDocument doc(1024);
+  doc["timestamp"] = millis();
+  doc["temp"] = currentData.temperature;
+  doc["humidity"] = currentData.humidity;
+  doc["batteryVoltage"] = currentData.batteryVoltage;
+  doc["gpsFixValid"] = currentData.gpsFixValid;
+  doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
+  doc["tiltDetected"] = currentData.tiltDetected;
+  doc["fallDetected"] = currentData.fallDetected;
+  doc["wakeUpReason"] = currentData.wakeUpReason;
+
+  if (currentData.gpsFixValid) {
+    JsonObject location = doc.createNestedObject("location");
+    location["lat"] = currentData.latitude;
+    location["lng"] = currentData.longitude;
+    location["alt"] = currentData.altitude;
+  }
+  doc["currentLocation"] = currentData.currentLocation;
+
+  String jsonPayload; serializeJson(doc, jsonPayload);
+
+  // Build HTTP path (Firebase REST) – using http (port 80) to avoid TLS size
+  String path = "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
+
+  HttpClient http(gsmNet, "tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app", 80);
+  Serial.println("Posting sensor data via cellular …");
+
+  http.beginRequest();
+  http.put(path);           // Use PUT to overwrite node
+  http.sendHeader("Content-Type", "application/json");
+  http.sendHeader("Content-Length", jsonPayload.length());
+  http.beginBody();
+  http.print(jsonPayload);
+  http.endRequest();
+
+  int statusCode = http.responseStatusCode();
+  String response = http.responseBody();
+  Serial.print("Status Code: "); Serial.println(statusCode);
+  if (statusCode == 200) {
+    Serial.println("✓ Data sent successfully via cellular.");
+  } else {
+    Serial.println("✗ Failed to send data via cellular.");
+    // NEW: Show offline QR code so user can configure network manually
+    showOfflineQRCode();
+  }
 } 

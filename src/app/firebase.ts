@@ -1,12 +1,12 @@
 // Import the functions you need from the SDKs you need
-import {initializeApp} from "firebase/app";
-import {getDatabase} from "firebase/database";
+import { initializeApp } from "firebase/app";
+import { getDatabase } from "firebase/database";
 // TODO: Add SDKs for Firebase products that you want to use
 // https://firebase.google.com/docs/web/setup#available-libraries
 
 // Your web app's Firebase configuration
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
-const firebaseConfig = {
+export const firebaseConfig = {
   apiKey: "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY",
   authDomain: "tracking-box-e17a1.firebaseapp.com",
   databaseURL:
@@ -22,4 +22,4 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getDatabase(app);
 
-export {db};
+export { db };

@@ -30,9 +30,12 @@ interface DeviceData {
   sensorData: SensorData;
 }
 
-// Cloudflare Pages ➜ Next-on-Pages requires each non-static route to declare
-// that it runs in the Edge runtime.
-export const runtime = "edge";
+// Conditional runtime export: Edge for Cloudflare Pages, default Node.js for Vercel
+// Set NEXT_PUBLIC_DEPLOYMENT_TARGET="cloudflare" in your Cloudflare Pages env vars
+export const runtime =
+  process.env.NEXT_PUBLIC_DEPLOYMENT_TARGET === "cloudflare"
+    ? "edge"
+    : "nodejs";
 
 export default function QRDevicePage() {
   const params = useParams();
@@ -54,15 +57,8 @@ export default function QRDevicePage() {
       const { getDatabase, ref, onValue } = await import("firebase/database");
       const { initializeApp } = await import("firebase/app");
 
-      // Minimal client-side init (avoid shared singleton to keep things
-      // tree-shakable in the edge build)
-      const firebaseConfig = {
-        apiKey: "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY",
-        authDomain: "tracking-box-e17a1.firebaseapp.com",
-        databaseURL:
-          "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app",
-        projectId: "tracking-box-e17a1",
-      } as const;
+      // Import shared config
+      const { firebaseConfig } = await import("../../firebase");
 
       const app = initializeApp(firebaseConfig, "qr-viewer");
       const db = getDatabase(app);
