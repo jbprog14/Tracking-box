@@ -82,8 +82,8 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "archer_2.4G";
-const char* WIFI_PASSWORD = "05132000";
+const char* WIFI_SSID = "";
+const char* WIFI_PASSWORD = "";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
@@ -100,7 +100,7 @@ TinyGsm      gsmModem(sim7600);           // Re-use the same UART for data
 TinyGsmClient gsmNet(gsmModem);
 
 // APN credentials for the SIM
-const char APN[]  = "smartlte";
+const char APN[]  = "internet";
 const char APN_USER[] = "";
 const char APN_PASS[] = "";
 
@@ -1102,8 +1102,8 @@ void showOfflineQRCode() {
   Paint_SelectImage(imgBuf);
   Paint_Clear(EPD_7IN3F_WHITE);
 
-  // Compute placement – center horizontally, 29 modules * 8px ≈ 232px
-  const int scale = 8;
+  // Compute placement – center horizontally. Scale down so QR fits entirely within half-height buffer.
+  const int scale = 6;  // 29 modules * 6px = 174px (fits within 200px buffer)
   const int qrSize = qrcode.size;
   const int qrPix  = qrSize * scale;
   const int offsetX = (EPD_7IN3F_WIDTH  - qrPix) / 2;
@@ -1121,10 +1121,15 @@ void showOfflineQRCode() {
     }
   }
 
-  // Caption beneath QR
-  Paint_DrawString_EN(10, offsetY + qrPix + 20,
-                      (char *)"Scan code for help page", &Font16,
-                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  // Caption beneath QR – center horizontally to align with QR
+  const char *caption = "Scan code to see package details: https://tracking-box.vercel.app/qr";
+  // Approximate character width for Font12 (7 px per char). Adjust if fonts differ.
+  int captionWidth = strlen(caption) * 7;
+  int captionX = (EPD_7IN3F_WIDTH - captionWidth) / 2;
+  if (captionX < 0) captionX = 0; // safety
+  Paint_DrawString_EN(captionX, offsetY + qrPix + 10,
+                       (char *)caption, &Font12,
+                       EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
 
   // Push to display
   EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
