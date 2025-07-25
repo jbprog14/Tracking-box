@@ -31,12 +31,8 @@ interface DeviceData {
   sensorData: SensorData;
 }
 
-// Conditional runtime export: Edge for Cloudflare Pages, default Node.js for Vercel
-// Set NEXT_PUBLIC_DEPLOYMENT_TARGET="cloudflare" in your Cloudflare Pages env vars
-export const runtime =
-  process.env.NEXT_PUBLIC_DEPLOYMENT_TARGET === "cloudflare"
-    ? "edge"
-    : "nodejs";
+// Next.js route runtime configuration
+export const runtime = "nodejs";
 
 export default function QRDevicePage() {
   const params = useParams();
