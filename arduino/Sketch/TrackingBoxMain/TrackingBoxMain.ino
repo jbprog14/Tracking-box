@@ -731,27 +731,24 @@ void readGPSLocation() {
   sendGPSCommand("AT+CGPSNMEARATE=1");
   sendGPSCommand("AT+CGPS=1,1");   // Start GPS in standalone mode
   delay(2000);                      // Allow the receiver to power-up
-#if DEBUG_GNSS
+
   // Enable unsolicited CGPSINFO while we wait so we can observe sentences
   sendAT("AT+CGPSINFOCFG=1,31", 2000);
-  Serial.println("\nWaiting 1mn for GPS to get signal...");
-  delay(1 * 60 * 1000UL); // 1 minute blocking only in debug mode
+  Serial.println("\nWaiting 1 minute for GPS to get signal...");
+  delay(1 * 60 * 1000UL); // 1 minute blocking to acquire fix
   sendAT("AT+CGPSINFOCFG=0,31", 2000);
   // Power-mode and NMEA configuration diagnostics
   sendAT("AT+CGPSPMD?", 2000);
   sendAT("AT+CGPSNMEA?", 2000);
-#endif
 
   // Request current location data
   flushSIM7600Buffer();
 
-#if DEBUG_GNSS
-  sim7600.println("AT+CGNSSINFO"); // extra line for immediate GNSS info
-#endif
+  sim7600.println("AT+CGNSSINFO"); // Query both for robustness
   sim7600.println("AT+CGPSINFO");
   String response = waitForGPSResponse(5000);
 
-  if (response.indexOf("+CGNSSINFO:") != -1 && isValidGPSFix(response)) {
+  if (response.indexOf("+CGPSINFO:") != -1 && isValidGPSFix(response)) {
     // +CGPSINFO: <lat>,<N/S>,<lon>,<E/W>,<date>,<utc>,<alt>,<speed>,<course>
     String latitude      = extractGPSField(response, 1);
     String lat_direction = extractGPSField(response, 2);
@@ -763,12 +760,12 @@ void readGPSLocation() {
     currentData.longitude = convertToDecimalDegrees(longitude, lon_direction);
     currentData.altitude  = altitude.toFloat();
     currentData.gpsFixValid = true;
+    currentData.coarseFix = false; // This is a high-accuracy fix
     Serial.println("✓ GPS fix acquired");
   } else {
-    Serial.println("⚠ No GPS fix available (single query)");
+    Serial.println("⚠ No GPS fix available after waiting.");
     currentData.gpsFixValid = false;
   }
-//-----------------------------------------------------------------------
 }
 
 // Helper to send an AT command and echo response for a given duration (ms)
