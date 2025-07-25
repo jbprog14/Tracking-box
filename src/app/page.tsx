@@ -10,7 +10,8 @@ import TrackingBoxModal from "@/components/TrackingBoxModal";
 
 interface TrackingBoxDetails {
   name: string;
-  setLocation: string;
+  setLocation: string; // coordinates
+  setLocationLabel?: string; // human-friendly address
   description?: string;
 }
 
@@ -24,15 +25,13 @@ interface SensorData {
         z: number;
         tiltDetected: boolean;
       }
-    | string; // Support both new object format and old string format for backwards compatibility
+    | string;
   currentLocation: string;
-  // Additional monitoring data
   batteryVoltage?: number;
-  wakeReason?: string;
+  wakeUpReason?: string; // standardized key
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
-  // Security data
   limitSwitchPressed?: boolean;
   locationBreach?: boolean;
   securityBreachActive?: boolean;
@@ -205,6 +204,7 @@ export default function Home() {
                   details: {
                     name: box.details?.name || "",
                     setLocation: box.details?.setLocation || "",
+                    setLocationLabel: box.details?.setLocationLabel || "",
                     description: box.details?.description || "",
                   },
                   sensorData: {
@@ -214,7 +214,10 @@ export default function Home() {
                     currentLocation:
                       box.sensorData?.currentLocation || "No GPS Fix",
                     batteryVoltage: box.sensorData?.batteryVoltage || 0,
-                    wakeReason: box.sensorData?.wakeReason || "",
+                    wakeUpReason:
+                      box.sensorData?.wakeUpReason ||
+                      box.sensorData?.wakeReason ||
+                      "",
                     timestamp: box.sensorData?.timestamp || 0,
                     bootCount: box.sensorData?.bootCount || 0,
                     altitude: box.sensorData?.altitude || 0,
@@ -468,16 +471,17 @@ export default function Home() {
 
   const handleSaveInfo = async (
     boxId: string,
-    setLocation: string,
-    name: string
+    coords: string,
+    name: string,
+    label: string
   ) => {
     try {
-      let coordString = await forwardGeocode(setLocation);
-      if (!coordString) coordString = setLocation; // fallback
+      const coordString = coords || (await forwardGeocode(label)) || label;
 
       const boxRef = ref(db, `tracking_box/${boxId}/details`);
       await update(boxRef, {
         setLocation: coordString,
+        setLocationLabel: label,
         name: name,
       });
 
@@ -489,13 +493,14 @@ export default function Home() {
           details: {
             ...prev[boxId]?.details,
             setLocation: coordString,
+            setLocationLabel: label,
             name: name,
           },
         },
       }));
 
       // cache human-readable for immediate UI feedback
-      setPrettyLocations((prev) => ({ ...prev, [boxId]: setLocation }));
+      setPrettyLocations((prev) => ({ ...prev, [boxId]: label }));
     } catch (error) {
       console.error("Error updating tracking box info:", error);
     }
@@ -740,7 +745,9 @@ export default function Home() {
             boxId={selectedEditBoxId}
             currentAddress={
               selectedEditBoxId
-                ? trackingData[selectedEditBoxId]?.details?.setLocation || ""
+                ? trackingData[selectedEditBoxId]?.details?.setLocationLabel ||
+                  trackingData[selectedEditBoxId]?.details?.setLocation ||
+                  ""
                 : ""
             }
             currentOwner={

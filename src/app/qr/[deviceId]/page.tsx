@@ -8,6 +8,7 @@ import { useState, useEffect } from "react";
 interface DeviceDetails {
   name: string;
   setLocation: string;
+  setLocationLabel?: string;
   description?: string;
 }
 
@@ -17,7 +18,7 @@ interface SensorData {
   accelerometer: string;
   currentLocation: string;
   batteryVoltage?: number;
-  wakeReason?: string;
+  wakeUpReason?: string;
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
@@ -75,6 +76,7 @@ export default function QRDevicePage() {
                 details: {
                   name: data.details?.name || "",
                   setLocation: data.details?.setLocation || "",
+                  setLocationLabel: data.details?.setLocationLabel || "",
                   description: data.details?.description || "",
                 },
                 sensorData: {
@@ -93,7 +95,10 @@ export default function QRDevicePage() {
                   currentLocation:
                     data.sensorData?.currentLocation || "No GPS Fix",
                   batteryVoltage: data.sensorData?.batteryVoltage || 0,
-                  wakeReason: data.sensorData?.wakeReason || "",
+                  wakeUpReason:
+                    data.sensorData?.wakeUpReason ||
+                    data.sensorData?.wakeReason ||
+                    "",
                   timestamp: data.sensorData?.timestamp || 0,
                   bootCount: data.sensorData?.bootCount || 0,
                   altitude: data.sensorData?.altitude || 0,

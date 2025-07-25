@@ -38,6 +38,8 @@
 #define TINY_GSM_RX_BUFFER 1024
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
+#include <time.h>
+#define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -82,8 +84,8 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID = "archer_2.4G";
+const char* WIFI_PASSWORD = "05132000";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
@@ -115,6 +117,7 @@ RTC_DATA_ATTR float rtcLastAccelY = 0.0;
 RTC_DATA_ATTR float rtcLastAccelZ = 0.0;
 RTC_DATA_ATTR bool rtcBaselineSet = false;
 RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
+RTC_DATA_ATTR uint32_t rtcBootCount = 0;     // persists across deep-sleep cycles
 
 // --------------------------------------------------------------
 // GEO HELPERS
@@ -221,12 +224,15 @@ struct TrackerData {
   String currentLocation = "Unknown";
   // Data fetched from Firebase
   String deviceName = "Unknown";
-  String deviceSetLocation = "Unknown";
+  String deviceSetLocation = "Unknown"; // coordinates
+  String deviceSetLabel = "";            // human readable
   String deviceDescription = "No Description";
   String wakeUpReason = "Power On";
   bool buzzerIsActive = false;
   bool buzzerDismissed = false;
   bool solenoidActive = false; // NEW: current requested state from Firebase
+  uint32_t bootCount = 0;   // number of wake-ups since power-on
+  bool coarseFix = false;   // true if only CLBS/IP based fix available
 };
 
 TrackerData currentData;
@@ -247,11 +253,17 @@ void setup() {
   delay(1000);
   Serial.println("\n===== WAKING UP =====");
 
+  // Increment persistent boot counter
+  rtcBootCount++;
+  currentData.bootCount = rtcBootCount;
+
   determineWakeUpReason();
+
+  // Initialise sensors and peripherals early so wake-up sources remain active
+  initializeAllHardware();
 
   if (connectToWiFi()) {
     Serial.println("✅ WiFi Connected.");
-    initializeAllHardware();
     Serial.println("✅ Hardware Initialized.");
     collectSensorReading();
     Serial.println("✅ Sensor Readings Collected.");
@@ -310,9 +322,6 @@ void setup() {
       Serial.println("✅ Cellular connected – continuing cycle.");
       useCellular = true;
 
-      // We already collected sensor data above only inside Wi-Fi path.
-      // For cellular fallback, we still need hardware initialisation & readings.
-      initializeAllHardware();
       collectSensorReading();
 
       sendSensorDataToFirebaseViaGPRS();
@@ -351,12 +360,16 @@ void sendSensorDataToFirebase() {
   // Create JSON document for the PUT request
   DynamicJsonDocument doc(1024);
   
-  doc["timestamp"] = millis();
+  time_t nowSec = time(nullptr);
+  uint64_t epochMs = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
+  doc["timestamp"] = epochMs;
+  doc["bootCount"] = currentData.bootCount;
   doc["temp"] = currentData.temperature;
   doc["humidity"] = currentData.humidity;
   doc["batteryVoltage"] = currentData.batteryVoltage;
   doc["gpsFixValid"] = currentData.gpsFixValid;
   doc["usingCGPS"] = currentData.usingCGPS; // NEW flag pushed to Firebase
+  doc["coarseFix"] = currentData.coarseFix;
   doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
   doc["tiltDetected"] = currentData.tiltDetected;
   doc["fallDetected"] = currentData.fallDetected;
@@ -376,6 +389,7 @@ void sendSensorDataToFirebase() {
   }
   
   doc["currentLocation"] = currentData.currentLocation;
+  doc["coarseFix"] = currentData.coarseFix;
 
   // Serialize JSON to string for sending
   String jsonPayload;
@@ -409,6 +423,7 @@ void fetchDeviceDetailsFromFirebase() {
     if (!error) {
       currentData.deviceName = doc["name"] | "Unknown";
       currentData.deviceSetLocation = doc["setLocation"] | "Unknown";
+      currentData.deviceSetLabel = doc["setLocationLabel"] | String("");
       currentData.deviceDescription = doc["description"] | "No Description";
       Serial.println("✓ Fetched device details from Firebase.");
     } else {
@@ -576,7 +591,20 @@ void waitForSolenoidActivation() {
 void collectSensorReading() {
   readTemperatureHumidity();
   readAccelerometerData();
+  // ------------------------------------------------------------------
+  // 1. Try to obtain a GNSS fix first (preferred, highest accuracy)
+  // ------------------------------------------------------------------
   readGPSLocation();
+
+  // ------------------------------------------------------------------
+  // 2. If GNSS failed (no valid fix) fall back to a fast, coarse
+  //    Cell-Tower Location (CLBS). We keep the original sensor-OK guard
+  //    so the fallback only runs when the modem & sensors are healthy.
+  // ------------------------------------------------------------------
+  if (!currentData.gpsFixValid && lsm6dsl_ok) {
+    readCellLocation();
+  }
+
   readBatteryVoltage();
   
   // ------------------------------------------------------------------
@@ -694,40 +722,65 @@ void readGPSLocation() {
   Serial.println("Reading GPS location...");
   currentData.usingCGPS = true; // Mark that CGPS method is in use
   
-  // ------------------------------------------------------------------
   // Enable GPS using the CGPS command set (more reliable on SIM7600).
-  // ------------------------------------------------------------------
+  // Reset GPS first then configure GNSS before starting.
+  sendGPSCommand("AT+CGPS=0");
+  delay(500);
+  sendGPSCommand("AT+CGNSSMODE=15,1");
+  sendGPSCommand("AT+CGPSNMEA=200191");
+  sendGPSCommand("AT+CGPSNMEARATE=1");
   sendGPSCommand("AT+CGPS=1,1");   // Start GPS in standalone mode
   delay(2000);                      // Allow the receiver to power-up
+#if DEBUG_GNSS
+  // Enable unsolicited CGPSINFO while we wait so we can observe sentences
+  sendAT("AT+CGPSINFOCFG=1,31", 2000);
+  Serial.println("\nWaiting 1mn for GPS to get signal...");
+  delay(1 * 60 * 1000UL); // 1 minute blocking only in debug mode
+  sendAT("AT+CGPSINFOCFG=0,31", 2000);
+  // Power-mode and NMEA configuration diagnostics
+  sendAT("AT+CGPSPMD?", 2000);
+  sendAT("AT+CGPSNMEA?", 2000);
+#endif
 
   // Request current location data
   flushSIM7600Buffer();
+
+#if DEBUG_GNSS
+  sim7600.println("AT+CGNSSINFO"); // extra line for immediate GNSS info
+#endif
   sim7600.println("AT+CGPSINFO");
-  
   String response = waitForGPSResponse(5000);
 
-  if (response.indexOf("+CGPSINFO:") != -1) {
-    if (isValidGPSFix(response)) {
-      // CGPSINFO format: +CGPSINFO: <lat>,<N/S>,<lon>,<E/W>,<date>,<utc>,<alt>,<speed>,<course>
-      String latitude      = extractGPSField(response, 1);
-      String lat_direction = extractGPSField(response, 2);
-      String longitude     = extractGPSField(response, 3);
-      String lon_direction = extractGPSField(response, 4);
-      String altitude      = extractGPSField(response, 7); // altitude field (may be blank)
+  if (response.indexOf("+CGNSSINFO:") != -1 && isValidGPSFix(response)) {
+    // +CGPSINFO: <lat>,<N/S>,<lon>,<E/W>,<date>,<utc>,<alt>,<speed>,<course>
+    String latitude      = extractGPSField(response, 1);
+    String lat_direction = extractGPSField(response, 2);
+    String longitude     = extractGPSField(response, 3);
+    String lon_direction = extractGPSField(response, 4);
+    String altitude      = extractGPSField(response, 7);
 
-      // Convert to decimal degrees
-      currentData.latitude  = convertToDecimalDegrees(latitude,  lat_direction);
-      currentData.longitude = convertToDecimalDegrees(longitude, lon_direction);
-      currentData.altitude  = altitude.toFloat();
-      currentData.gpsFixValid = true;
-      Serial.println("✓ GPS fix acquired");
-    } else {
-      Serial.println("⚠ No GPS fix available");
-      currentData.gpsFixValid = false;
-    }
+    currentData.latitude  = convertToDecimalDegrees(latitude,  lat_direction);
+    currentData.longitude = convertToDecimalDegrees(longitude, lon_direction);
+    currentData.altitude  = altitude.toFloat();
+    currentData.gpsFixValid = true;
+    Serial.println("✓ GPS fix acquired");
   } else {
-    Serial.println("✗ GPS communication error");
+    Serial.println("⚠ No GPS fix available (single query)");
     currentData.gpsFixValid = false;
+  }
+//-----------------------------------------------------------------------
+}
+
+// Helper to send an AT command and echo response for a given duration (ms)
+void sendAT(const char *cmd, uint16_t delayMs) {
+  Serial.print("\n>> "); Serial.println(cmd);
+  flushSIM7600Buffer();
+  sim7600.println(cmd);
+  unsigned long timeout = millis() + delayMs;
+  while (millis() < timeout) {
+    while (sim7600.available()) {
+      Serial.write(sim7600.read());
+    }
   }
 }
 
@@ -735,6 +788,45 @@ void readBatteryVoltage() {
   // Read battery voltage through ADC with voltage divider
   int adcReading = analogRead(BATTERY_ADC_PIN);
   currentData.batteryVoltage = (adcReading * 3.3 * 2.0) / 4095.0;
+}
+
+// ---------------------------------------------------------------------------
+// Fast Cell-tower location (CLBS)
+// ---------------------------------------------------------------------------
+bool readCellLocation() {
+  flushSIM7600Buffer();
+  sim7600.println("AT+CLBS=1,1");
+  String resp = waitForGPSResponse(5000);
+
+  int idx = resp.indexOf("+CLBS:");
+  if (idx == -1) return false;
+
+  // Expect format: +CLBS: <err>,<lat>,<lon>,<date>,<time>
+  int firstComma = resp.indexOf(',', idx);
+  if (firstComma == -1) return false;
+  int err = resp.substring(idx + 7, firstComma).toInt();
+  if (err != 0) return false;
+
+  int secondComma = resp.indexOf(',', firstComma + 1);
+  if (secondComma == -1) return false;
+  int thirdComma = resp.indexOf(',', secondComma + 1);
+  if (thirdComma == -1) return false;
+
+  String latStr = resp.substring(firstComma + 1, secondComma);
+  String lonStr = resp.substring(secondComma + 1, thirdComma);
+
+  double lat = latStr.toDouble();
+  double lon = lonStr.toDouble();
+  if (lat == 0.0 || lon == 0.0) return false;
+
+  currentData.latitude = lat;
+  currentData.longitude = lon;
+  currentData.altitude = 0;
+  currentData.gpsFixValid = false;   // not a GNSS fix
+  currentData.coarseFix = true;
+
+  Serial.printf("✓ CLBS coarse fix: %.5f, %.5f\n", lat, lon);
+  return true;
 }
 
 // =====================================================================
@@ -770,14 +862,7 @@ bool initializeAllHardware() {
   delay(2000);
   flushSIM7600Buffer();
 
-  // Configure SIM7600 to supply power to the active GNSS antenna
-  Serial.println("Configuring active GNSS antenna power...");
-  sim7600.println("AT+CVAUXV=3050"); // Set auxiliary voltage to 3.05V
-  delay(200);
-  sim7600.println("AT+CVAUXS=1");   // Enable auxiliary voltage output
-  delay(200);
-  flushSIM7600Buffer(); // Clear any "OK" responses
-  Serial.println("✓ Active antenna power configured.");
+  // Auxiliary voltage setup removed – external active antenna no longer required.
 
   return true;
 }
@@ -848,6 +933,20 @@ bool connectToWiFi() {
     Serial.println("");
     Serial.println("✓ WiFi connected successfully");
     Serial.println("IP Address: " + WiFi.localIP().toString());
+
+    // -------- Configure SNTP to get current epoch time --------
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm timeinfo;
+    for (uint8_t i = 0; i < 10; ++i) {   // wait up to ~5 s
+      if (getLocalTime(&timeinfo, 500)) break;
+    }
+    if (timeinfo.tm_year > 120) {
+      Serial.printf("✓ Time synced: %04d-%02d-%02d %02d:%02d\n",
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                    timeinfo.tm_hour, timeinfo.tm_min);
+    } else {
+      Serial.println("⚠ Time sync failed – falling back to millis()");
+    }
     return true;
   } else {
     Serial.println("");
@@ -1026,12 +1125,12 @@ void updateDisplay() {
   const uint16_t lineGap = 28;
 
    // Details
-  Paint_DrawString_EN(10, y, String("DETAILS:").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
+  Paint_DrawString_EN(10, y, String("DETAILS").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
   y += lineGap + 6;
 
   // Device name (large font)
   char buf[64];
-  snprintf(buf, sizeof(buf), "PACKAGE OWNER: %s", currentData.deviceName);
+  snprintf(buf, sizeof(buf), "PACKAGE OWNER: %s", currentData.deviceName.c_str());
   Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
   y += lineGap;
 
@@ -1041,28 +1140,31 @@ void updateDisplay() {
   y += lineGap;
 
   // Item Description
-  snprintf(buf, sizeof(buf), "ITEM DESCRIPTION: %s", currentData.deviceDescription);
+  snprintf(buf, sizeof(buf), "DROP-OFF LOCATION: %s", currentData.deviceSetLocation.c_str());
   Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  y += lineGap + 6;
+  y += lineGap;
+
+
+  y += 6;
 
   // Sensor Readings
-  Paint_DrawString_EN(10, y, String("SENSOR READINGS:").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED );
+  Paint_DrawString_EN(10, y, String("PRIORITY MAIL | HANDLE WITH CARE").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED );
   y += lineGap + 10;
 
-  // Temperature | Accel
-  snprintf(buf, sizeof(buf), "TEMPERATURE: %.1fC | ACCELEROMETER: X=%.2fg  Y=%.2fg  Z=%.2fg", currentData.temperature, currentData.accelX, currentData.accelY, currentData.accelZ);
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  y += lineGap;
+  // // Temperature | Accel
+  // snprintf(buf, sizeof(buf), "TEMPERATURE: %.1fC | ACCELEROMETER: X=%.2fg  Y=%.2fg  Z=%.2fg", currentData.temperature, currentData.accelX, currentData.accelY, currentData.accelZ);
+  // Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  // y += lineGap;
 
-  // Humidity | Battery
-  snprintf(buf, sizeof(buf), "HUMIDITY: %.1f%% | BATTERY (V): %.2fV", currentData.humidity, currentData.batteryVoltage);
-   Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-   y += lineGap;
+  // // Humidity | Battery
+  // snprintf(buf, sizeof(buf), "HUMIDITY: %.1f%% | BATTERY (V): %.2fV", currentData.humidity, currentData.batteryVoltage);
+  //  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  //  y += lineGap;
 
-  // wake-up reason
-  snprintf(buf, sizeof(buf), "LAST WAKE-UP REASON: %s", currentData.wakeUpReason.c_str());
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  y += lineGap;
+  // // wake-up reason
+  // snprintf(buf, sizeof(buf), "LAST WAKE-UP REASON: %s", currentData.wakeUpReason.c_str());
+  // Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  // y += lineGap;
 
   // ------------------------------
   // Push buffer to display and sleep
@@ -1202,7 +1304,10 @@ bool connectToCellular() {
 void sendSensorDataToFirebaseViaGPRS() {
   // Prepare JSON (reuse existing helper to create payload)
   DynamicJsonDocument doc(1024);
-  doc["timestamp"] = millis();
+  
+  time_t nowSec = time(nullptr);
+  uint64_t epochMs = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
+  doc["timestamp"] = epochMs;
   doc["temp"] = currentData.temperature;
   doc["humidity"] = currentData.humidity;
   doc["batteryVoltage"] = currentData.batteryVoltage;
@@ -1211,6 +1316,8 @@ void sendSensorDataToFirebaseViaGPRS() {
   doc["tiltDetected"] = currentData.tiltDetected;
   doc["fallDetected"] = currentData.fallDetected;
   doc["wakeUpReason"] = currentData.wakeUpReason;
+  doc["bootCount"] = currentData.bootCount;
+  doc["coarseFix"] = currentData.coarseFix;
 
   if (currentData.gpsFixValid) {
     JsonObject location = doc.createNestedObject("location");

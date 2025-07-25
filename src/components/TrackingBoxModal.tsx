@@ -39,7 +39,8 @@ import {
 
 interface TrackingBoxDetails {
   name: string;
-  setLocation: string;
+  setLocation: string; // coords
+  setLocationLabel?: string; // human readable
   description?: string;
 }
 
@@ -116,8 +117,13 @@ export default function TrackingBoxModal({
       typeof sd.accelerometer === "object" && sd.accelerometer
         ? sd.accelerometer
         : { x: 0, y: 0, z: 0 };
+    const timeLabel = new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
     const point = {
-      time: new Date(ts).toLocaleTimeString(),
+      time: timeLabel,
       temp: sd.temp,
       humidity: sd.humidity,
       battery: sd.batteryVoltage || 0,
@@ -191,8 +197,8 @@ export default function TrackingBoxModal({
 
   // Determine display label for last wake-up event
   const lastWakeupDisplay =
-    currentSensorData.wakeUpReason ??
-    (currentSensorData.bootCount === 0 ? "FIRST BOOT" : "Unknown");
+    currentSensorData.wakeUpReason ||
+    (currentSensorData.bootCount === 0 ? "FIRST BOOT" : "TIMER SCHEDULE");
 
   // Normalize timestamp (handle seconds vs milliseconds) and build display string
   const lastUpdateTimestamp =
@@ -411,8 +417,8 @@ export default function TrackingBoxModal({
                       dataKey="time"
                       minTickGap={20}
                       tickFormatter={(str) => {
-                        const [, time] = str.split(" ");
-                        return time.replace(":", "").slice(0, 5);
+                        const [time] = str.split(" ");
+                        return time.slice(0, 5);
                       }}
                     />
                     <YAxis domain={[0, "auto"]} />
@@ -441,8 +447,8 @@ export default function TrackingBoxModal({
                       dataKey="time"
                       minTickGap={20}
                       tickFormatter={(str) => {
-                        const [, time] = str.split(" ");
-                        return time.replace(":", "").slice(0, 5);
+                        const [time] = str.split(" ");
+                        return time.slice(0, 5);
                       }}
                     />
                     <YAxis domain={[0, "auto"]} />
@@ -471,8 +477,8 @@ export default function TrackingBoxModal({
                       dataKey="time"
                       minTickGap={20}
                       tickFormatter={(str) => {
-                        const [, time] = str.split(" ");
-                        return time.replace(":", "").slice(0, 5);
+                        const [time] = str.split(" ");
+                        return time.slice(0, 5);
                       }}
                     />
                     <YAxis domain={[0, "auto"]} />
@@ -501,8 +507,8 @@ export default function TrackingBoxModal({
                       dataKey="time"
                       minTickGap={20}
                       tickFormatter={(str) => {
-                        const [, time] = str.split(" ");
-                        return time.replace(":", "").slice(0, 5);
+                        const [time] = str.split(" ");
+                        return time.slice(0, 5);
                       }}
                     />
                     <YAxis domain={[-2, 2]} />
