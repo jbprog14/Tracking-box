@@ -84,6 +84,7 @@ bool connectToWiFi();
 void flushSIM7600Buffer();
 String extractSMSContent(String response);
 String extractSMSContentFromCMGR(String response);
+void testSMSFunctionality();
 
 // =====================================================================
 // SETUP
@@ -99,13 +100,28 @@ void setup() {
   sim7600.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
   delay(2000);
   
-  // Configure SIM7600 for SMS
-  sendAT("AT", 500);
-  sendAT("AT+CMGF=1", 500);                   // Text mode
-  sendAT("AT+CPMS=\"SM\",\"SM\",\"SM\"", 500); // Use SIM storage
-  sendAT("AT+CNMI=1,2,0,0,0", 500);          // New SMS indication
+  // Configure SIM7600 for SMS with verification
+  Serial.println("Testing SIM7600 connectivity...");
+  sendAT("AT", 1000);
   
-  Serial.println("SIM7600 initialized successfully");
+  Serial.println("Checking SIM card status...");
+  sendAT("AT+CPIN?", 1000);                  // Check SIM card status
+  
+  Serial.println("Checking network registration...");
+  sendAT("AT+CREG?", 1000);                  // Check network registration
+  
+  Serial.println("Configuring SMS settings...");
+  sendAT("AT+CMGF=1", 1000);                 // Text mode
+  sendAT("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000); // Use SIM storage
+  sendAT("AT+CNMI=1,2,0,0,0", 1000);        // New SMS indication
+  
+  Serial.println("Checking SMS storage status...");
+  sendAT("AT+CPMS?", 1000);                  // Check SMS storage status
+  
+  Serial.println("SIM7600 SMS configuration complete");
+  
+  // Test SMS functionality
+  testSMSFunctionality();
   
   // Connect to WiFi
   if (connectToWiFi()) {
@@ -127,12 +143,30 @@ void setup() {
   }
   
   Serial.println("Starting SMS monitoring loop...");
+  Serial.println("\n💡 DEBUG COMMANDS:");
+  Serial.println("   Type 'sms' or 'check' to manually trigger SMS check");
+  Serial.println("   Type 'help' for command list");
+  Serial.println("   Device will automatically check for SMS every 3 seconds\n");
 }
 
 // =====================================================================
 // MAIN LOOP
 // =====================================================================
 void loop() {
+  // Check for manual SMS check command from Serial
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    if (command == "sms" || command == "check" || command == "test") {
+      Serial.println("🔍 Manual SMS check triggered...");
+      readNewestSMS();
+    } else if (command == "help") {
+      Serial.println("Available commands:");
+      Serial.println("  sms/check/test - Manual SMS check");
+      Serial.println("  help - Show this help");
+    }
+  }
+  
   // Check WiFi connection first and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠ WiFi disconnected, attempting reconnection...");
@@ -151,8 +185,16 @@ void loop() {
   static unsigned long lastStatusReport = 0;
   if (millis() - lastStatusReport > 30000) {
     Serial.println("📡 Master device active - WiFi: " + 
-                   String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+                   String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + 
+                   " | Uptime: " + String(millis() / 1000) + "s");
     lastStatusReport = millis();
+  }
+  
+  // Debug status every 15 seconds during development
+  static unsigned long lastDebugReport = 0;
+  if (millis() - lastDebugReport > 15000) {
+    Serial.println("🔄 SMS monitoring active - checking every 3 seconds");
+    lastDebugReport = millis();
   }
 }
 
@@ -162,11 +204,13 @@ void loop() {
 void readNewestSMS() {
   // First, list unread messages to get their indices
   flushSIM7600Buffer();
+  Serial.println("🔍 Checking for unread SMS messages...");
   sim7600.println("AT+CMGL=\"REC UNREAD\"");  // List unread messages
   delay(1000);
 
   if (sim7600.available()) {
     String listResponse = sim7600.readString();
+    Serial.println("📋 CMGL Response: " + listResponse);
     
     if (listResponse.indexOf("+CMGL:") != -1) {
       Serial.println("=== UNREAD SMS DETECTED ===");
@@ -196,7 +240,11 @@ void readNewestSMS() {
       }
       
       Serial.println("=========================");
+    } else {
+      Serial.println("📭 No unread SMS messages found");
     }
+  } else {
+    Serial.println("⚠ No response from SIM7600 to CMGL command");
   }
 }
 
@@ -523,4 +571,47 @@ void flushSIM7600Buffer() {
   while (sim7600.available()) {
     sim7600.read();
   }
+}
+
+void testSMSFunctionality() {
+  Serial.println("\n🧪 TESTING SMS FUNCTIONALITY");
+  Serial.println("===============================");
+  
+  // Test 1: Check if we can list ALL messages (not just unread)
+  Serial.println("Test 1: Listing ALL SMS messages...");
+  flushSIM7600Buffer();
+  sim7600.println("AT+CMGL=\"ALL\"");
+  delay(2000);
+  
+  if (sim7600.available()) {
+    String response = sim7600.readString();
+    Serial.println("ALL SMS Response: " + response);
+    if (response.indexOf("+CMGL:") != -1) {
+      Serial.println("✓ SMS storage has messages");
+    } else {
+      Serial.println("ℹ SMS storage appears empty");
+    }
+  } else {
+    Serial.println("❌ No response to AT+CMGL=\"ALL\"");
+  }
+  
+  // Test 2: Check SMS service center
+  Serial.println("\nTest 2: Checking SMS service center...");
+  sendAT("AT+CSCA?", 2000);
+  
+  // Test 3: Manual check for unread messages
+  Serial.println("\nTest 3: Manual check for unread messages...");
+  flushSIM7600Buffer();
+  sim7600.println("AT+CMGL=\"REC UNREAD\"");
+  delay(2000);
+  
+  if (sim7600.available()) {
+    String unreadResponse = sim7600.readString();
+    Serial.println("Unread SMS Response: " + unreadResponse);
+  } else {
+    Serial.println("❌ No response to unread SMS check");
+  }
+  
+  Serial.println("===============================");
+  Serial.println("🧪 SMS FUNCTIONALITY TEST COMPLETE\n");
 } 
