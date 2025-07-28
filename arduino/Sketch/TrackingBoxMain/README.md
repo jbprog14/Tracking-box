@@ -255,16 +255,15 @@ TrackingBoxMain/
 
 ### Overview
 
-The firmware now includes a **multi-tier communication fallback system** that ensures data transmission even in areas with poor connectivity:
+The firmware now includes a **simplified communication fallback system** that ensures data transmission even in areas with poor connectivity:
 
 1. **WiFi + Firebase** (Preferred - full functionality)
-2. **Cellular + Firebase** (Limited functionality, no display refresh)
-3. **SMS to Master Device** (Emergency fallback, minimal data)
-4. **Offline mode with QR code** (No connectivity available)
+2. **SMS to Master Device** (Fallback when WiFi fails)
+3. **Offline mode with QR code** (No connectivity available)
 
 ### SMS Slave Mode
 
-When both WiFi and Cellular connections fail, the device automatically switches to **SMS Slave Mode**:
+When WiFi connection fails, the device automatically switches to **SMS Slave Mode**:
 
 - Formats sensor data as a comma-separated SMS message
 - Sends SMS to a configured Master device phone number
@@ -308,18 +307,26 @@ Tracking Device (Slave)
         ↓
     WiFi Failed?
         ↓
-   Cellular Failed?
-        ↓
     SMS to Master ──→ Master Device ──→ Firebase
 ```
 
 ### Benefits
 
-- **Redundant Communication**: Multiple fallback options ensure data delivery
-- **Emergency Coverage**: SMS works in areas with basic cellular coverage
-- **Cost Effective**: SMS only used when other methods fail
+- **Reliable Communication**: Simplified fallback ensures data delivery
+- **Wide Coverage**: SMS works in areas with basic cellular coverage
+- **Cost Effective**: SMS only used when WiFi fails
 - **Centralized**: Multiple devices can use single Master for Firebase access
 - **Low Power**: Minimal SMS transmission preserves battery life
+- **Simplified**: Fewer communication layers reduce complexity and power consumption
+
+### Cellular Location Services (CLBS)
+
+The SIM7600 module continues to provide location services:
+
+- **GNSS/GPS Tracking**: Primary location method using satellite positioning
+- **CLBS Fallback**: Cell tower location when GPS signal is unavailable
+- **No Data Costs**: Location services don't require cellular data plan
+- **Power Efficient**: Location queries use minimal power compared to data transmission
 
 ## License
 

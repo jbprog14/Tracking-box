@@ -4,7 +4,7 @@
  * =====================================================================
  * 
  * This sketch implements a streamlined, single-cycle operation for the
- * tracking device with multi-tier communication fallback system.
+ * tracking device with simplified communication fallback system.
  * 
  * On every wake-up, it performs the following:
  * 1. Initialize all hardware.
@@ -17,14 +17,18 @@
  * 
  * COMMUNICATION FALLBACK CHAIN:
  * 1. WiFi + Firebase (Preferred - full functionality)
- * 2. Cellular + Firebase (Limited functionality, no display refresh)
- * 3. SMS to Master Device (Emergency fallback, minimal data)
- * 4. Offline mode with QR code (No connectivity available)
+ * 2. SMS to Master Device (Fallback when WiFi fails)
+ * 3. Offline mode with QR code (No connectivity available)
  * 
  * SMS SLAVE MODE:
- * When both WiFi and Cellular fail, the device acts as a "Slave" and
- * sends compiled sensor data via SMS to a Master device for Firebase
- * forwarding. SMS format: comma-separated values matching Firebase schema.
+ * When WiFi connection fails, the device acts as a "Slave" and sends
+ * compiled sensor data via SMS to a Master device for Firebase forwarding.
+ * SMS format: comma-separated values matching Firebase schema.
+ * 
+ * CELLULAR LOCATION SERVICES:
+ * SIM7600 cellular module is used for GNSS/GPS tracking and CLBS (Cell Location
+ * Based Services) as a fallback when GPS signal is unavailable, but cellular
+ * data transmission has been removed in favor of SMS communication.
  * 
  * The device wakes from deep sleep based on three triggers:
  * - A 15-minute timer.
@@ -47,10 +51,8 @@
 #include "GUI_Paint.h"
 #include "qrcode.h"   // NEW – small QR code generator
 #include <math.h>  // for haversine
-#define TINY_GSM_MODEM_SIM7600
-#define TINY_GSM_RX_BUFFER 1024
-#include <TinyGsmClient.h>
-#include <ArduinoHttpClient.h>
+// Note: TinyGSM includes removed as cellular data transmission is no longer used
+// Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
 #define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
 
@@ -116,15 +118,8 @@ Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
 HardwareSerial sim7600(1);
-TinyGsm      gsmModem(sim7600);           // Re-use the same UART for data
-TinyGsmClient gsmNet(gsmModem);
-
-// APN credentials for the SIM
-const char APN[]  = "internet";
-const char APN_USER[] = "";
-const char APN_PASS[] = "";
-
-bool useCellular = false; // set true when Wi-Fi fails and GPRS succeeds
+// Note: TinyGSM objects removed as cellular data transmission is no longer used
+// SIM7600 module is still used for GNSS/GPS and CLBS location services
 uint8_t lsm6dsl_address = 0x6A;
 // Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
 bool sht30_ok   = false;
@@ -338,39 +333,23 @@ void setup() {
       esp_deep_sleep_start();
     }
   } else {
-    Serial.println("❌ WiFi connection failed. Attempting cellular fallback …");
-
-    if (connectToCellular()) {
-      Serial.println("✅ Cellular connected – continuing cycle.");
-      useCellular = true;
-
-      collectSensorReading();
-
-      sendSensorDataToFirebaseViaGPRS();
-
-      // Short path: no display refresh to save data + power
-      Serial.println("Cycle complete → deep sleep (cellular mode).");
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
+    Serial.println("❌ WiFi connection failed. Attempting SMS fallback ...");
+    
+    // Collect sensor data for SMS transmission
+    collectSensorReading();
+    
+    // Attempt to send data via SMS
+    if (sendSensorDataViaSMS()) {
+      Serial.println("✅ Sensor data sent via SMS to Master device.");
+      Serial.println("Cycle complete → deep sleep (SMS mode).");
     } else {
-      Serial.println("❌ Cellular fallback failed. Attempting SMS fallback ...");
-      
-      // Collect sensor data for SMS transmission
-      collectSensorReading();
-      
-      // Attempt to send data via SMS
-      if (sendSensorDataViaSMS()) {
-        Serial.println("✅ Sensor data sent via SMS to Master device.");
-        Serial.println("Cycle complete → deep sleep (SMS mode).");
-      } else {
-        Serial.println("❌ SMS fallback also failed. All communication methods exhausted.");
-        showOfflineQRCode();
-        Serial.println("Cycle complete → deep sleep (offline mode).");
-      }
-      
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
+      Serial.println("❌ SMS fallback also failed. All communication methods exhausted.");
+      showOfflineQRCode();
+      Serial.println("Cycle complete → deep sleep (offline mode).");
     }
+    
+    prepareForDeepSleep();
+    esp_deep_sleep_start();
   }
 }
 
@@ -1305,93 +1284,17 @@ void updateBuzzerStateInFirebase(bool active, bool dismissed) {
 } 
 
 // ---------------------------------------------------------------------------
-// CELLULAR (SIM7600) HELPERS
+// CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
 // ---------------------------------------------------------------------------
-
-bool connectToCellular() {
-  // Initialise UART if not already
-  sim7600.begin(115200, SERIAL_8N1, SIM7600_RX_PIN, SIM7600_TX_PIN);
-  delay(3000);
-
-  Serial.println("Restarting SIM7600 modem …");
-  gsmModem.restart();
-
-  Serial.print("Waiting for network … ");
-  if (!gsmModem.waitForNetwork()) {
-    Serial.println("❌");
-    return false;
-  }
-  Serial.println("✅");
-
-  Serial.print("Connecting to APN: "); Serial.println(APN);
-  if (!gsmModem.gprsConnect(APN, APN_USER, APN_PASS)) {
-    Serial.println("❌ GPRS failed");
-    return false;
-  }
-  Serial.println("✅ GPRS connected");
-  return true;
-}
-
-void sendSensorDataToFirebaseViaGPRS() {
-  // Prepare JSON (reuse existing helper to create payload)
-  DynamicJsonDocument doc(1024);
-  
-  time_t nowSec = time(nullptr);
-  uint64_t epochMs = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
-  doc["timestamp"] = epochMs;
-  doc["temp"] = currentData.temperature;
-  doc["humidity"] = currentData.humidity;
-  doc["batteryVoltage"] = currentData.batteryVoltage;
-  doc["gpsFixValid"] = currentData.gpsFixValid;
-  doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
-  doc["tiltDetected"] = currentData.tiltDetected;
-  doc["fallDetected"] = currentData.fallDetected;
-  doc["wakeUpReason"] = currentData.wakeUpReason;
-  doc["bootCount"] = currentData.bootCount;
-  doc["coarseFix"] = currentData.coarseFix;
-
-  if (currentData.gpsFixValid) {
-    JsonObject location = doc.createNestedObject("location");
-    location["lat"] = currentData.latitude;
-    location["lng"] = currentData.longitude;
-    location["alt"] = currentData.altitude;
-  }
-  doc["currentLocation"] = currentData.currentLocation;
-
-  String jsonPayload; serializeJson(doc, jsonPayload);
-
-  // Build HTTP path (Firebase REST) – using http (port 80) to avoid TLS size
-  String path = "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
-
-  HttpClient http(gsmNet, "tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app", 80);
-  Serial.println("Posting sensor data via cellular …");
-
-  http.beginRequest();
-  http.put(path);           // Use PUT to overwrite node
-  http.sendHeader("Content-Type", "application/json");
-  http.sendHeader("Content-Length", jsonPayload.length());
-  http.beginBody();
-  http.print(jsonPayload);
-  http.endRequest();
-
-  int statusCode = http.responseStatusCode();
-  String response = http.responseBody();
-  Serial.print("Status Code: "); Serial.println(statusCode);
-  if (statusCode == 200) {
-    Serial.println("✓ Data sent successfully via cellular.");
-  } else {
-    Serial.println("✗ Failed to send data via cellular.");
-    // NEW: Show offline QR code so user can configure network manually
-    showOfflineQRCode();
-  }
-} 
+// Note: Cellular data transmission functions removed - using SMS fallback instead
+// Cellular location services (CLBS) retained for GPS fallback functionality
 
 // =====================================================================
 // SMS COMMUNICATION FUNCTIONS
 // =====================================================================
 // These functions implement the SMS fallback communication system.
-// When both WiFi and Cellular data connections fail, the device sends
-// sensor data via SMS to a Master device that forwards it to Firebase.
+// When WiFi connection fails, the device sends sensor data via SMS
+// to a Master device that forwards it to Firebase.
 // SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
 // =====================================================================
 bool sendSensorDataViaSMS() {
