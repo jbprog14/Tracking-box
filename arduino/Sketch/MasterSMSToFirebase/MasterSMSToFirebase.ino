@@ -469,7 +469,8 @@ void sendDataToFirebase(const SMSData &data) {
 
   HTTPClient http;
   // Use PUT to replace the sensorData node for the specific device
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + data.deviceID + "/sensorData.json?auth=" + FIREBASE_AUTH;
+  String url = "http://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app/tracking_box/" + 
+             data.deviceID + "/sensorData.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
