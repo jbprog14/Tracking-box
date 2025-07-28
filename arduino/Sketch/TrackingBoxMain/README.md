@@ -251,6 +251,76 @@ TrackingBoxMain/
 - Optimized for low-power battery operation
 - Includes comprehensive error handling and debugging
 
+## SMS Fallback Communication
+
+### Overview
+
+The firmware now includes a **multi-tier communication fallback system** that ensures data transmission even in areas with poor connectivity:
+
+1. **WiFi + Firebase** (Preferred - full functionality)
+2. **Cellular + Firebase** (Limited functionality, no display refresh)
+3. **SMS to Master Device** (Emergency fallback, minimal data)
+4. **Offline mode with QR code** (No connectivity available)
+
+### SMS Slave Mode
+
+When both WiFi and Cellular connections fail, the device automatically switches to **SMS Slave Mode**:
+
+- Formats sensor data as a comma-separated SMS message
+- Sends SMS to a configured Master device phone number
+- Master device receives SMS and forwards data to Firebase
+- Minimal power consumption compared to continuous connection attempts
+
+### SMS Message Format
+
+```
+DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
+```
+
+**Example SMS:**
+
+```
+box_001,1703123456789,25.5,60.0,14.562000,121.112100,15.0,0,0,1,0.020,-0.010,0.980,3.85,TIMER DUE (15mns.)
+```
+
+### Configuration
+
+Update the Master device phone number in the sketch:
+
+```cpp
+// SMS FALLBACK CONFIGURATION
+const String MASTER_PHONE_NUMBER = "+1234567890"; // Replace with actual Master device number
+```
+
+### Master Device Setup
+
+Use the **MasterSMSToFirebase** sketch on a separate ESP32 with SIM7600 module:
+
+1. Place Master device in location with reliable WiFi
+2. Configure same Firebase credentials
+3. Master receives SMS messages from multiple tracking devices
+4. Automatically parses and forwards data to Firebase database
+
+### Communication Flow
+
+```
+Tracking Device (Slave)
+        ↓
+    WiFi Failed?
+        ↓
+   Cellular Failed?
+        ↓
+    SMS to Master ──→ Master Device ──→ Firebase
+```
+
+### Benefits
+
+- **Redundant Communication**: Multiple fallback options ensure data delivery
+- **Emergency Coverage**: SMS works in areas with basic cellular coverage
+- **Cost Effective**: SMS only used when other methods fail
+- **Centralized**: Multiple devices can use single Master for Firebase access
+- **Low Power**: Minimal SMS transmission preserves battery life
+
 ## License
 
 This firmware is part of the Tracking Box Device project and follows the same licensing terms as the overall project.

@@ -1,17 +1,30 @@
 /*
  * =====================================================================
- * TRACKING BOX DEVICE - FINALIZED FIRMWARE
+ * TRACKING BOX DEVICE - FINALIZED FIRMWARE WITH SMS FALLBACK
  * =====================================================================
  * 
  * This sketch implements a streamlined, single-cycle operation for the
- * tracking device. On every wake-up, it performs the following:
+ * tracking device with multi-tier communication fallback system.
+ * 
+ * On every wake-up, it performs the following:
  * 1. Initialize all hardware.
  * 2. Gather a full set of sensor readings.
- * 3. Connect to WiFi.
- * 4. Send sensor data to the Firebase database.
- * 5. Fetch the latest device details from Firebase.
- * 6. Update the E-Ink display with all data. This action queues the
- *    device to immediately enter deep sleep.
+ * 3. Attempt communication via WiFi → Cellular → SMS (fallback chain)
+ * 4. Send sensor data using the first available communication method.
+ * 5. Fetch the latest device details from Firebase (WiFi/Cellular only).
+ * 6. Update the E-Ink display with all data.
+ * 7. Enter deep sleep until next wake trigger.
+ * 
+ * COMMUNICATION FALLBACK CHAIN:
+ * 1. WiFi + Firebase (Preferred - full functionality)
+ * 2. Cellular + Firebase (Limited functionality, no display refresh)
+ * 3. SMS to Master Device (Emergency fallback, minimal data)
+ * 4. Offline mode with QR code (No connectivity available)
+ * 
+ * SMS SLAVE MODE:
+ * When both WiFi and Cellular fail, the device acts as a "Slave" and
+ * sends compiled sensor data via SMS to a Master device for Firebase
+ * forwarding. SMS format: comma-separated values matching Firebase schema.
  * 
  * The device wakes from deep sleep based on three triggers:
  * - A 15-minute timer.
@@ -89,6 +102,11 @@ const char* WIFI_PASSWORD = "05132000";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
+
+// SMS FALLBACK CONFIGURATION
+// Configure the phone number of the Master device that will receive SMS
+// and forward data to Firebase when WiFi/Cellular connections fail
+const String MASTER_PHONE_NUMBER = "+639184652918"; // SMS Master device phone number
 
 // =====================================================================
 // GLOBAL OBJECTS & VARIABLES
@@ -244,6 +262,10 @@ bool awaitSolenoid = false; // lid open within safe zone waiting for lock releas
 // Forward declaration
 void determineWakeUpReason();
 void updateDisplay();
+bool sendSensorDataViaSMS();
+bool sendSMS(String phoneNumber, String message);
+bool waitForSMSPrompt();
+String formatSensorDataForSMS(const TrackerData &data);
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -331,9 +353,21 @@ void setup() {
       prepareForDeepSleep();
       esp_deep_sleep_start();
     } else {
-      Serial.println("❌ Cellular fallback failed.");
-      showOfflineQRCode();
-      Serial.println("Cycle complete → deep sleep.");
+      Serial.println("❌ Cellular fallback failed. Attempting SMS fallback ...");
+      
+      // Collect sensor data for SMS transmission
+      collectSensorReading();
+      
+      // Attempt to send data via SMS
+      if (sendSensorDataViaSMS()) {
+        Serial.println("✅ Sensor data sent via SMS to Master device.");
+        Serial.println("Cycle complete → deep sleep (SMS mode).");
+      } else {
+        Serial.println("❌ SMS fallback also failed. All communication methods exhausted.");
+        showOfflineQRCode();
+        Serial.println("Cycle complete → deep sleep (offline mode).");
+      }
+      
       prepareForDeepSleep();
       esp_deep_sleep_start();
     }
@@ -1351,3 +1385,129 @@ void sendSensorDataToFirebaseViaGPRS() {
     showOfflineQRCode();
   }
 } 
+
+// =====================================================================
+// SMS COMMUNICATION FUNCTIONS
+// =====================================================================
+// These functions implement the SMS fallback communication system.
+// When both WiFi and Cellular data connections fail, the device sends
+// sensor data via SMS to a Master device that forwards it to Firebase.
+// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
+// =====================================================================
+bool sendSensorDataViaSMS() {
+  Serial.println("Attempting to send sensor data via SMS...");
+  
+  // Format sensor data as SMS message
+  String smsMessage = formatSensorDataForSMS(currentData);
+  
+  if (smsMessage.length() > 160) {
+    Serial.println("❌ SMS message too long, truncating...");
+    smsMessage = smsMessage.substring(0, 160);
+  }
+  
+  Serial.println("SMS Content: " + smsMessage);
+  
+  // Send SMS to Master device
+  return sendSMS(MASTER_PHONE_NUMBER, smsMessage);
+}
+
+bool sendSMS(String phoneNumber, String message) {
+  Serial.println("Sending SMS to: " + phoneNumber);
+  
+  // Ensure SIM7600 is initialized
+  flushSIM7600Buffer();
+  
+  // Set SMS mode
+  sim7600.println("AT+CMGF=1");
+  delay(500);
+  
+  // Set character set
+  sim7600.println("AT+CSCS=\"GSM\"");
+  delay(500);
+  
+  // Set recipient
+  sim7600.print("AT+CMGS=\"");
+  sim7600.print(phoneNumber);
+  sim7600.println("\"");
+  delay(1000);
+  
+  // Wait for prompt
+  if (!waitForSMSPrompt()) {
+    Serial.println("❌ Failed to get SMS prompt");
+    return false;
+  }
+  
+  // Send message content
+  sim7600.print(message);
+  delay(500);
+  
+  // Send Ctrl+Z to finish SMS
+  sim7600.write(26);
+  delay(5000);
+  
+  // Check response
+  String response = "";
+  unsigned long timeout = millis() + 15000; // 15 second timeout
+  
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      response += sim7600.readString();
+    }
+  }
+  
+  Serial.println("SMS Response: " + response);
+  
+  // Check if SMS was sent successfully
+  bool success = (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1);
+  
+  if (success) {
+    Serial.println("✓ SMS sent successfully");
+  } else {
+    Serial.println("❌ Failed to send SMS");
+  }
+  
+  return success;
+}
+
+bool waitForSMSPrompt() {
+  unsigned long timeout = millis() + 5000; // 5 second timeout
+  String response = "";
+  
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      char c = sim7600.read();
+      response += c;
+      if (response.indexOf(">") != -1) {
+        return true; // Found prompt
+      }
+    }
+  }
+  
+  return false;
+}
+
+String formatSensorDataForSMS(const TrackerData &data) {
+  // Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
+  
+  // Get current timestamp
+  time_t nowSec = time(nullptr);
+  uint64_t timestamp = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
+  
+  String message = DEVICE_ID + ",";
+  message += String(timestamp) + ",";
+  message += String(data.temperature, 1) + ",";
+  message += String(data.humidity, 1) + ",";
+  message += String(data.latitude, 6) + ",";
+  message += String(data.longitude, 6) + ",";
+  message += String(data.altitude, 1) + ",";
+  message += (data.tiltDetected ? "1" : "0") + ",";
+  message += (data.fallDetected ? "1" : "0") + ",";
+  message += (data.limitSwitchPressed ? "1" : "0") + ",";
+  message += String(data.accelX, 3) + ",";
+  message += String(data.accelY, 3) + ",";
+  message += String(data.accelZ, 3) + ",";
+  message += String(data.batteryVoltage, 2) + ",";
+  message += data.wakeUpReason;
+  
+  return message;
+}
