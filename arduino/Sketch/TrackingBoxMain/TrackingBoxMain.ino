@@ -99,8 +99,8 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "archer_2.4G";
-const char* WIFI_PASSWORD = "05132000";
+const char* WIFI_SSID = "";
+const char* WIFI_PASSWORD = "";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
@@ -131,6 +131,15 @@ RTC_DATA_ATTR float rtcLastAccelZ = 0.0;
 RTC_DATA_ATTR bool rtcBaselineSet = false;
 RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
 RTC_DATA_ATTR uint32_t rtcBootCount = 0;     // persists across deep-sleep cycles
+
+// RTC memory to store device details for SMS mode
+RTC_DATA_ATTR char rtcDeviceSetLocation[64] = "Unknown";
+RTC_DATA_ATTR char rtcDeviceName[64] = "Unknown";
+RTC_DATA_ATTR bool rtcDeviceDetailsValid = false;
+
+// SMS cleanup timing
+unsigned long lastSMSCleanup = 0;
+const unsigned long SMS_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
 
 // --------------------------------------------------------------
 // GEO HELPERS
@@ -261,6 +270,10 @@ bool sendSensorDataViaSMS();
 bool sendSMS(String phoneNumber, String message);
 bool waitForSMSPrompt();
 String formatSensorDataForSMS(const TrackerData &data);
+void checkForControlSMS();
+void parseControlSMS(String smsContent);
+void cleanupSMSMemory();
+void notifyPackageDelivery();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -335,12 +348,39 @@ void setup() {
   } else {
     Serial.println("❌ WiFi connection failed. Attempting SMS fallback ...");
     
+    // Initialize hardware
+    initializeAllHardware();
+    
+    // Clean up SMS memory on first entry to SMS mode
+    cleanupSMSMemory();
+    lastSMSCleanup = millis();
+    
+    // Restore device details from RTC memory if available
+    if (rtcDeviceDetailsValid) {
+      currentData.deviceName = String(rtcDeviceName);
+      currentData.deviceSetLocation = String(rtcDeviceSetLocation);
+      Serial.println("✓ Restored device details from RTC memory:");
+      Serial.println("  Device name: " + currentData.deviceName);
+      Serial.println("  Set location: " + currentData.deviceSetLocation);
+    } else {
+      Serial.println("⚠️ No device details in RTC memory - using defaults");
+    }
+    
     // Collect sensor data for SMS transmission
     collectSensorReading();
+    
+    // In SMS mode, we need to evaluate lock breach locally
+    evaluateLockBreach();
     
     // Attempt to send data via SMS
     if (sendSensorDataViaSMS()) {
       Serial.println("✅ Sensor data sent via SMS to Master device.");
+      
+      // If buzzer is active, monitor for control SMS
+      if (currentData.buzzerIsActive) {
+        Serial.println("🚨 Buzzer active in SMS mode - monitoring for control commands...");
+      }
+      
       Serial.println("Cycle complete → deep sleep (SMS mode).");
     } else {
       Serial.println("❌ SMS fallback also failed. All communication methods exhausted.");
@@ -438,7 +478,15 @@ void fetchDeviceDetailsFromFirebase() {
       currentData.deviceSetLocation = doc["setLocation"] | "Unknown";
       currentData.deviceSetLabel = doc["setLocationLabel"] | String("");
       currentData.deviceDescription = doc["description"] | "No Description";
+      
+      // Store in RTC memory for SMS mode
+      strncpy(rtcDeviceName, currentData.deviceName.c_str(), sizeof(rtcDeviceName) - 1);
+      strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
+      rtcDeviceDetailsValid = true;
+      
       Serial.println("✓ Fetched device details from Firebase.");
+      Serial.println("  Device name: " + currentData.deviceName);
+      Serial.println("  Set location: " + currentData.deviceSetLocation);
     } else {
       Serial.println("✗ Failed to parse device details JSON.");
     }
@@ -451,8 +499,8 @@ void fetchDeviceDetailsFromFirebase() {
 void fetchBuzzerStateFromFirebase() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  // Fetch only the 'buzzerDismissed' field from the 'sensorData' node.
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+  // Fetch dismiss state from dismissAlert node
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   
   int httpResponseCode = http.GET();
@@ -461,13 +509,15 @@ void fetchBuzzerStateFromFirebase() {
     // Firebase returns a simple 'true' or 'false' for a boolean leaf, not a JSON object.
     if (response == "true") {
       currentData.buzzerDismissed = true;
-      Serial.println("✓ Buzzer state is DISMISSED.");
+      Serial.println("✓ Buzzer state is DISMISSED (from dismissAlert).");
     } else {
       currentData.buzzerDismissed = false;
+      Serial.println("✓ Buzzer state is NOT dismissed (from dismissAlert).");
     }
   } else {
     // If the fetch fails or the key doesn't exist, assume not dismissed.
     currentData.buzzerDismissed = false;
+    Serial.println("⚠️ dismissAlert not found or fetch failed - assuming not dismissed.");
   }
   http.end();
 }
@@ -515,42 +565,76 @@ void evaluateLockBreach() {
   // does not match its designated location from Firebase.
   // Note: Limit switch is pressed (true) when the lid is CLOSED.
   bool isLidOpen = !currentData.limitSwitchPressed;
+  
+  Serial.println("=== EVALUATING LOCK BREACH ===");
+  Serial.println("Lid status: " + String(isLidOpen ? "OPEN" : "CLOSED"));
+  Serial.println("Limit switch: " + String(currentData.limitSwitchPressed ? "PRESSED" : "NOT PRESSED"));
 
   bool isLocationMismatch = true; // assume mismatch until proven otherwise
 
   // If we have a valid GPS fix and a parsable setLocation, compute distance
   if (currentData.gpsFixValid) {
     double setLat, setLon;
+    Serial.println("GPS fix valid. Current location: " + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6));
+    Serial.println("Set location: " + currentData.deviceSetLocation);
+    
     if (parseCoordPair(currentData.deviceSetLocation, setLat, setLon)) {
       double distMeters = haversineMeters(currentData.latitude, currentData.longitude, setLat, setLon);
       isLocationMismatch = distMeters > 50.0; // 50-m radius
-      Serial.printf("Distance to safe zone: %.1f m\n", distMeters);
+      Serial.printf("Distance to safe zone: %.1f m (threshold: 50m)\n", distMeters);
+      Serial.println("Location mismatch: " + String(isLocationMismatch ? "YES" : "NO"));
+    } else {
+      Serial.println("Failed to parse set location coordinates!");
     }
+  } else {
+    Serial.println("GPS fix not valid - assuming location mismatch");
   }
 
   bool lockBreach = isLidOpen && isLocationMismatch;
+  Serial.println("Lock breach detected: " + String(lockBreach ? "YES" : "NO"));
 
   // If lid is open but still within safe zone, we will await solenoid command
   awaitSolenoid = isLidOpen && !isLocationMismatch;
+  
+  // Notify about package delivery when lid is opened within safe zone
+  static bool deliveryNotified = false;
+  if (awaitSolenoid && !deliveryNotified) {
+    Serial.println("📦 Package delivered! Lid open within safe zone - notifying Firebase");
+    notifyPackageDelivery();
+    deliveryNotified = true;
+  }
+  
+  // Reset notification flag when lid is closed
+  if (!isLidOpen) {
+    deliveryNotified = false;
+  }
 
-  // If a new breach is detected, reset the dismissal flag in Firebase.
-  if (lockBreach && currentData.buzzerDismissed) {
-    Serial.println("🔄 New lock breach detected. Resetting dismissal state.");
+  // If a new breach is detected, but the device state has changed (lid reopened), 
+  // reset the dismissal flag
+  static bool lastLockBreachState = false;
+  if (lockBreach && !lastLockBreachState && currentData.buzzerDismissed) {
+    Serial.println("🔄 New lock breach detected (lid reopened). Resetting dismissal state.");
     updateBuzzerStateInFirebase(false, false);
     currentData.buzzerDismissed = false;
   }
+  lastLockBreachState = lockBreach;
   
   // Activate the buzzer only if there is a breach and it has NOT been dismissed.
   if (lockBreach && !currentData.buzzerDismissed) {
     Serial.println("🚨 LOCK BREACH DETECTED!");
+    Serial.println("Activating buzzer...");
     currentData.wakeUpReason   = "LOCK BREACH";
     currentData.buzzerIsActive = true;
     digitalWrite(BUZZER_PIN, HIGH);  // Sound buzzer continuously
   } else {
     // If no breach or already dismissed, ensure buzzer is off.
+    Serial.println("No lock breach OR already dismissed - buzzer OFF");
+    Serial.println("  Lock breach: " + String(lockBreach));
+    Serial.println("  Buzzer dismissed: " + String(currentData.buzzerDismissed));
     currentData.buzzerIsActive = false;
     digitalWrite(BUZZER_PIN, LOW);
   }
+  Serial.println("=== END LOCK BREACH EVALUATION ===");
 }
 
 void handleBuzzerMonitoring() {
@@ -740,15 +824,18 @@ void readGPSLocation() {
   sendGPSCommand("AT+CGPS=0");
   delay(500);
   sendGPSCommand("AT+CGNSSMODE=15,1");
+  delay(2000);                      
   sendGPSCommand("AT+CGPSNMEA=200191");
+  delay(2000);                      
   sendGPSCommand("AT+CGPSNMEARATE=1");
+  delay(2000);                      
   sendGPSCommand("AT+CGPS=1,1");   // Start GPS in standalone mode
   delay(2000);                      // Allow the receiver to power-up
 
   // Enable unsolicited CGPSINFO while we wait so we can observe sentences
   sendAT("AT+CGPSINFOCFG=1,31", 2000);
-  Serial.println("\nWaiting 1 minute for GPS to get signal...");
-  delay(1 * 60 * 1000UL); // 1 minute blocking to acquire fix
+  Serial.println("\nWaiting 30 seconds for GPS to get signal...");
+  delay(0.5 * 60 * 1000UL); // 30 seconds blocking to acquire fix
   sendAT("AT+CGPSINFOCFG=0,31", 2000);
   // Power-mode and NMEA configuration diagnostics
   sendAT("AT+CGPSPMD?", 2000);
@@ -758,10 +845,11 @@ void readGPSLocation() {
   flushSIM7600Buffer();
 
   sim7600.println("AT+CGNSSINFO"); // Query both for robustness
+  delay(2000);                      
   sim7600.println("AT+CGPSINFO");
   String response = waitForGPSResponse(5000);
 
-  if (response.indexOf("+CGPSINFO:") != -1 && isValidGPSFix(response)) {
+  if (response.indexOf("+CGNSSINFO:") != -1 && isValidGPSFix(response)) {
     // +CGPSINFO: <lat>,<N/S>,<lon>,<E/W>,<date>,<utc>,<alt>,<speed>,<course>
     String latitude      = extractGPSField(response, 1);
     String lat_direction = extractGPSField(response, 2);
@@ -1257,7 +1345,7 @@ void showOfflineQRCode() {
 bool checkDismissCommand() {
   if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   int code = http.GET();
   if (code == HTTP_CODE_OK) {
@@ -1271,17 +1359,69 @@ bool checkDismissCommand() {
 
 void updateBuzzerStateInFirebase(bool active, bool dismissed) {
   if (WiFi.status() != WL_CONNECTED) return;
+  
+  // Update buzzerIsActive in sensorData
+  HTTPClient httpSensor;
+  String sensorUrl = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
+  httpSensor.begin(sensorUrl);
+  httpSensor.addHeader("Content-Type", "application/json");
+  DynamicJsonDocument sensorDoc(64);
+  sensorDoc["buzzerIsActive"] = active;
+  String sensorBody; 
+  serializeJson(sensorDoc, sensorBody);
+  httpSensor.PATCH(sensorBody);
+  httpSensor.end();
+  
+  // Update dismissAlert separately
+  HTTPClient httpDismiss;
+  String dismissUrl = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert.json?auth=" + FIREBASE_AUTH;
+  httpDismiss.begin(dismissUrl);
+  httpDismiss.addHeader("Content-Type", "application/json");
+  
+  // Create dismissAlert object with dismissed flag and timestamp
+  DynamicJsonDocument dismissDoc(128);
+  dismissDoc["dismissed"] = dismissed;
+  dismissDoc["timestamp"] = millis();
+  String dismissBody;
+  serializeJson(dismissDoc, dismissBody);
+  
+  httpDismiss.PUT(dismissBody);
+  httpDismiss.end();
+  
+  Serial.println("Updated Firebase - buzzerIsActive: " + String(active) + ", dismissed: " + String(dismissed));
+}
+
+// Notify Firebase about package delivery
+void notifyPackageDelivery() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ Cannot notify delivery - WiFi not connected");
+    return;
+  }
+  
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/deliveryNotification.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  DynamicJsonDocument doc(128);
-  doc["buzzerIsActive"] = active;
-  doc["buzzerDismissed"] = dismissed;
-  String body; serializeJson(doc, body);
-  http.PATCH(body);
+  
+  // Create delivery notification with timestamp and status
+  DynamicJsonDocument doc(256);
+  doc["delivered"] = true;
+  doc["timestamp"] = millis();
+  doc["awaitingSolenoid"] = true;
+  doc["location"] = currentData.currentLocation;
+  doc["message"] = "Package delivered successfully. Security lock awaiting activation.";
+  
+  String body;
+  serializeJson(doc, body);
+  
+  int code = http.PUT(body);
+  if (code > 0 && code < 400) {
+    Serial.println("✓ Delivery notification sent to Firebase");
+  } else {
+    Serial.println("✗ Failed to send delivery notification, code: " + String(code));
+  }
   http.end();
-} 
+}
 
 // ---------------------------------------------------------------------------
 // CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
@@ -1295,23 +1435,31 @@ void updateBuzzerStateInFirebase(bool active, bool dismissed) {
 // These functions implement the SMS fallback communication system.
 // When WiFi connection fails, the device sends sensor data via SMS
 // to a Master device that forwards it to Firebase.
-// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
+// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
 // =====================================================================
 bool sendSensorDataViaSMS() {
   Serial.println("Attempting to send sensor data via SMS...");
   
-  // Format sensor data as SMS message
-  String smsMessage = formatSensorDataForSMS(currentData);
-  
-  if (smsMessage.length() > 160) {
-    Serial.println("❌ SMS message too long, truncating...");
-    smsMessage = smsMessage.substring(0, 160);
+  // Check if it's time to clean up SMS memory
+  if (millis() - lastSMSCleanup > SMS_CLEANUP_INTERVAL) {
+    cleanupSMSMemory();
+    lastSMSCleanup = millis();
   }
   
-  Serial.println("SMS Content: " + smsMessage);
+  // Format and send sensor data matching MasterSMSToFirebase format
+  String smsMessage = formatSensorDataForSMS(currentData);
+  Serial.println("SMS Message: " + smsMessage);
   
-  // Send SMS to Master device
-  return sendSMS(MASTER_PHONE_NUMBER, smsMessage);
+  bool success = sendSMS(MASTER_PHONE_NUMBER, smsMessage);
+  
+  if (success) {
+    // After sending, check for any control commands from Master
+    Serial.println("Waiting 20 seconds for control SMS from Master...");
+    delay(10000); // Give Master more time to process and respond
+    checkForControlSMS();
+  }
+  
+  return success;
 }
 
 bool sendSMS(String phoneNumber, String message) {
@@ -1326,6 +1474,10 @@ bool sendSMS(String phoneNumber, String message) {
   
   // Set character set
   sim7600.println("AT+CSCS=\"GSM\"");
+  delay(500);
+  
+  // Set SMS storage to SIM card
+  sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");
   delay(500);
   
   // Set recipient
@@ -1390,11 +1542,11 @@ bool waitForSMSPrompt() {
 }
 
 String formatSensorDataForSMS(const TrackerData &data) {
-  // Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
+  // Format matching MasterSMSToFirebase expectations (15 fields):
+  // DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
   
-  // Get current timestamp
-  time_t nowSec = time(nullptr);
-  uint64_t timestamp = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
+  // Get current timestamp in milliseconds
+  uint64_t timestamp = millis();
   
   String message = DEVICE_ID + ",";
   message += String(timestamp) + ",";
@@ -1403,9 +1555,10 @@ String formatSensorDataForSMS(const TrackerData &data) {
   message += String(data.latitude, 6) + ",";
   message += String(data.longitude, 6) + ",";
   message += String(data.altitude, 1) + ",";
-  message += (data.tiltDetected ? "1" : "0") + ",";
-  message += (data.fallDetected ? "1" : "0") + ",";
-  message += (data.limitSwitchPressed ? "1" : "0") + ",";
+  message += String(data.tiltDetected ? "1" : "0") + ",";
+  message += String(data.fallDetected ? "1" : "0") + ",";
+  message += String(data.limitSwitchPressed ? "1" : "0") + ",";
+  message += String(data.solenoidActive ? "1" : "0") + ",";
   message += String(data.accelX, 3) + ",";
   message += String(data.accelY, 3) + ",";
   message += String(data.accelZ, 3) + ",";
@@ -1413,4 +1566,177 @@ String formatSensorDataForSMS(const TrackerData &data) {
   message += data.wakeUpReason;
   
   return message;
+}
+
+
+// =====================================================================
+// SMS CONTROL RECEIVING FUNCTIONS
+// =====================================================================
+void checkForControlSMS() {
+  Serial.println("Checking for control SMS from Master...");
+  
+  // Configure to receive SMS
+  sim7600.println("AT+CMGF=1");  // Text mode
+  delay(500);
+  sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");  // Use SIM storage
+  delay(500);
+  
+  // List unread messages
+  sim7600.println("AT+CMGL=\"REC UNREAD\"");
+  delay(2000);
+  
+  if (sim7600.available()) {
+    String response = sim7600.readString();
+    Serial.println("SMS Response: " + response);
+    
+    // Look for control messages starting with "CMD,"
+    int cmdIndex = response.indexOf("CMD,");
+    if (cmdIndex != -1) {
+      // Extract the control message
+      int endIndex = response.indexOf('\r', cmdIndex);
+      if (endIndex == -1) endIndex = response.indexOf('\n', cmdIndex);
+      if (endIndex == -1) endIndex = response.length();
+      
+      String controlMsg = response.substring(cmdIndex, endIndex);
+      Serial.println("Control message received: " + controlMsg);
+      
+      // Parse and apply the control command
+      parseControlSMS(controlMsg);
+      
+      // Find and delete the SMS
+      int msgIndexStart = response.lastIndexOf("+CMGL: ", cmdIndex);
+      if (msgIndexStart != -1) {
+        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
+        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
+        
+        // Delete the SMS
+        sim7600.print("AT+CMGD=");
+        sim7600.println(smsIndex);
+        delay(1000);
+        
+        // Verify deletion
+        String delResponse = waitForGPSResponse(1000);
+        if (delResponse.indexOf("OK") != -1) {
+          Serial.println("✅ Control SMS deleted successfully");
+        } else {
+          Serial.println("❌ Failed to delete control SMS");
+        }
+      }
+    } else {
+      Serial.println("No control SMS found in response.");
+    }
+  } else {
+    Serial.println("No SMS response received from modem.");
+  }
+}
+
+void parseControlSMS(String smsContent) {
+  // Format: "CMD,buzzer,solenoid,dismiss"
+  // Example: "CMD,1,0,1" means buzzer on, solenoid off, dismissed true
+  
+  if (!smsContent.startsWith("CMD,")) return;
+  
+  // Remove "CMD," prefix
+  smsContent = smsContent.substring(4);
+  
+  // Parse values
+  int firstComma = smsContent.indexOf(',');
+  int secondComma = smsContent.indexOf(',', firstComma + 1);
+  
+  if (firstComma != -1 && secondComma != -1) {
+    String buzzerStr = smsContent.substring(0, firstComma);
+    String solenoidStr = smsContent.substring(firstComma + 1, secondComma);
+    String dismissStr = smsContent.substring(secondComma + 1);
+    
+    // Apply control states
+    bool newBuzzerState = (buzzerStr == "1");
+    bool newSolenoidState = (solenoidStr == "1");
+    bool newDismissState = (dismissStr == "1");
+    
+    Serial.printf("Applying control: Buzzer=%d, Solenoid=%d, Dismiss=%d\n", 
+                  newBuzzerState, newSolenoidState, newDismissState);
+    
+    // Update dismiss state first
+    currentData.buzzerDismissed = newDismissState;
+    
+    // If dismissed, turn off buzzer regardless of buzzer state
+    if (newDismissState) {
+      Serial.println("🔕 Buzzer DISMISSED via SMS control");
+      currentData.buzzerIsActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+    } else {
+      // Update buzzer based on control command
+      if (newBuzzerState != currentData.buzzerIsActive) {
+        currentData.buzzerIsActive = newBuzzerState;
+        digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
+        Serial.println(newBuzzerState ? "🔔 Buzzer activated via SMS" : "🔕 Buzzer deactivated via SMS");
+      }
+    }
+    
+    // Handle solenoid activation
+    if (newSolenoidState && !currentData.solenoidActive) {
+      currentData.solenoidActive = true;
+      Serial.println("🔓 Solenoid activation requested via SMS");
+      
+      // Activate solenoid immediately
+      pinMode(SOLENOID_PIN, OUTPUT);
+      digitalWrite(SOLENOID_PIN, HIGH);
+      delay(10000);  // Hold for 10 seconds
+      digitalWrite(SOLENOID_PIN, LOW);
+      currentData.solenoidActive = false;
+      
+      Serial.println("🔒 Solenoid cycle complete (SMS triggered)");
+    }
+  }
+}
+
+// =====================================================================
+// SMS MEMORY CLEANUP
+// =====================================================================
+
+// Clean up SMS memory by deleting all messages
+void cleanupSMSMemory() {
+  Serial.println("\n🧹 Cleaning up SMS memory...");
+  
+  flushSIM7600Buffer();
+  
+  // Delete all messages (read, unread, sent, unsent)
+  // AT+CMGD=1,4 deletes all messages
+  sim7600.println("AT+CMGD=1,4");
+  delay(5000);
+  
+  String response = waitForGPSResponse(5000);
+  
+  if (response.indexOf("OK") != -1) {
+    Serial.println("✅ SMS memory cleaned successfully");
+  } else {
+    Serial.println("❌ Failed to clean SMS memory");
+    
+    // Alternative: Try deleting by type
+    Serial.println("Trying alternative deletion method...");
+    
+    // Delete all read messages
+    sim7600.println("AT+CMGD=1,1");
+    delay(2000);
+    
+    // Delete all sent messages  
+    sim7600.println("AT+CMGD=1,2");
+    delay(2000);
+    
+    // Delete all unsent messages
+    sim7600.println("AT+CMGD=1,3");
+    delay(2000);
+  }
+  
+  // Show SMS storage status
+  showSMSStorageStatus();
+}
+
+// Show SMS storage status
+void showSMSStorageStatus() {
+  flushSIM7600Buffer();
+  sim7600.println("AT+CPMS?");
+  delay(1000);
+  String response = waitForGPSResponse(1000);
+  Serial.println("SMS Storage Status: " + response);
 }

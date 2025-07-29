@@ -240,6 +240,49 @@ export default function Home() {
               const currentBox = validatedData[boxId];
               const prevBox = prevData ? prevData[boxId] : null;
 
+              // Check for delivery notification
+              const rawBox = rawData[boxId];
+              if (rawBox && rawBox.delivery) {
+                const delivery = rawBox.delivery;
+                const prevDelivery = prevData && prevData[boxId] && rawData[boxId] ? rawData[boxId].delivery : null;
+                
+                // Show toast if delivery is new or just updated
+                if (delivery.delivered && delivery.awaitingSolenoid && 
+                    (!prevDelivery || !prevDelivery.delivered)) {
+                  toast.success(
+                    (t) => (
+                      <div className="flex flex-col gap-2">
+                        <span className="font-bold text-lg">
+                          📦 PACKAGE DELIVERED!
+                        </span>
+                        <span>
+                          {currentBox.details.name || boxId} has been successfully delivered at the destination.
+                        </span>
+                        <span className="text-sm text-gray-600">
+                          Location: {delivery.deliveryLocation || currentBox.sensorData.currentLocation}
+                        </span>
+                        <span className="text-sm font-semibold text-green-700">
+                          Security lock is awaiting activation.
+                        </span>
+                        <button
+                          onClick={() => toast.dismiss(t.id)}
+                          className="mt-2 bg-green-600 text-white font-semibold py-1 px-2 rounded-md hover:bg-green-700 transition-colors"
+                        >
+                          OK
+                        </button>
+                      </div>
+                    ),
+                    {
+                      id: `delivery-toast-${boxId}`,
+                      duration: 10000, // Show for 10 seconds
+                      style: {
+                        maxWidth: '400px',
+                      },
+                    }
+                  );
+                }
+              }
+
               const isNowCritical =
                 currentBox &&
                 !currentBox.sensorData.limitSwitchPressed &&
