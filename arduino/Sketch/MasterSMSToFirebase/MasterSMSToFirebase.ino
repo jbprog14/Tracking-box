@@ -40,6 +40,11 @@ const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southe
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 
 // ---------------------------------------------------------------------
+// MATH CONSTANTS
+// ---------------------------------------------------------------------
+#define DEG_TO_RAD 0.017453292519943295
+
+// ---------------------------------------------------------------------
 // DEBUG HELPER FOR FIREBASE ONLY
 // ---------------------------------------------------------------------
 const bool DEBUG_FB = true;
@@ -63,6 +68,10 @@ void sendSolenoidToFirebase(const String &deviceId, bool state);
 void cleanupSMSMemory();
 void updateDismissAlert(const String &deviceId, bool dismissed);
 void notifyPackageDelivery(const String &deviceId, float lat, float lon);
+String getSetLocationFromFirebase(const String &deviceId);
+bool parseCoordinates(const String &coordStr, float &lat, float &lon);
+float calculateDistance(float lat1, float lon1, float lat2, float lon2);
+void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive);
 
 // =====================================================================
 // SETUP
@@ -320,16 +329,40 @@ void readSMS(int index) {
     updateDismissAlert(deviceId, false);
   }
   
-  // Check for package delivery (lid open but no location mismatch)
+  // Check for package delivery - need to evaluate if within safe zone
   bool lidOpen = (debugTokens[9] == "0");
   float lat = debugTokens[4].toFloat();
   float lon = debugTokens[5].toFloat();
   
-  // Check if package is delivered (lid open within safe zone)
-  if (lidOpen && !buzzerActive && lat != 0.0 && lon != 0.0) {
-    // This means lid is open but buzzer is not active, so it's within safe zone
+  // Get setLocation from Firebase to check distance
+  String setLocation = getSetLocationFromFirebase(deviceId);
+  bool withinSafeZone = false;
+  
+  if (lat != 0.0 && lon != 0.0 && setLocation.length() > 0) {
+    // Parse setLocation and calculate distance
+    float setLat, setLon;
+    if (parseCoordinates(setLocation, setLat, setLon)) {
+      float distance = calculateDistance(lat, lon, setLat, setLon);
+      withinSafeZone = (distance <= 50.0); // 50 meters threshold
+      Serial.println("Distance to safe zone: " + String(distance) + "m, Within safe zone: " + String(withinSafeZone ? "YES" : "NO"));
+    }
+  }
+  
+  // Determine actual buzzer state based on location
+  bool actualBuzzerState = false;
+  if (lidOpen && !withinSafeZone) {
+    // Lock breach - lid open outside safe zone
+    actualBuzzerState = true;
+    Serial.println("🚨 Lock breach detected - lid open outside safe zone");
+  } else if (lidOpen && withinSafeZone) {
+    // Package delivered - lid open within safe zone
+    actualBuzzerState = false;
+    Serial.println("📦 Package delivered - lid open within safe zone");
     notifyPackageDelivery(deviceId, lat, lon);
   }
+  
+  // Update Firebase with correct buzzer state
+  updateBuzzerInFirebase(deviceId, actualBuzzerState);
 }
 
 // Extracts the text part (after first CRLF) from CMGR response
@@ -410,13 +443,12 @@ String csvToFirebaseJson(const String &csv) {
   // Boot count (not in SMS, default to 1)
   json += "\"bootCount\":1,";
   
-  // Buzzer state - determine from limit switch and wake reason
-  bool lidOpen = (tokens[9] == "0"); // limitSwitch is false when lid is open
+  // Don't determine buzzer state here - it will be set based on location check
+  // Just report current buzzer state from the wake reason for now
   bool isLockBreach = (tokens[15].indexOf("LOCK BREACH") != -1);
-  bool buzzerActive = lidOpen && isLockBreach;
   
   // Only include buzzerIsActive, NOT buzzerDismissed (that's in dismissAlert)
-  json += "\"buzzerIsActive\":" + String(buzzerActive ? "true" : "false") + ",";
+  json += "\"buzzerIsActive\":" + String(isLockBreach ? "true" : "false") + ",";
   
   // Coarse fix (assume true if no GPS)
   json += "\"coarseFix\":" + String(!gpsValid ? "true" : "false") + ",";
@@ -535,7 +567,7 @@ void checkAndSendControlStates(const String &deviceId, const String &phoneNumber
     return;
   }
 
-  // Get buzzer state from sensorData (buzzerIsActive)
+  // Get buzzer state that was just calculated and stored
   String buzzerUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerIsActive.json?auth=" + FIREBASE_AUTH;
   HTTPClient httpBuzzer;
   httpBuzzer.begin(buzzerUrl);
@@ -746,6 +778,88 @@ void showSMSStorageStatus() {
   Serial.println("SMS Storage Status: " + response);
 }
 
+// Get setLocation from Firebase for a specific device
+String getSetLocationFromFirebase(const String &deviceId) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_FB("✗ Cannot get setLocation – WiFi unavailable");
+    return "";
+  }
+  
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/details/setLocation.json?auth=" + FIREBASE_AUTH;
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  String setLocation = "";
+  
+  if (code == 200) {
+    setLocation = http.getString();
+    DBG_FB("Raw setLocation from Firebase: " + setLocation);
+    setLocation.replace("\"", "");
+    setLocation.trim();
+    DBG_FB("Cleaned setLocation: " + setLocation);
+  } else {
+    DBG_FB("Failed to get setLocation, HTTP code: " + String(code));
+  }
+  http.end();
+  
+  return setLocation;
+}
+
+// Parse coordinate string (supports decimal format "lat,lon")
+bool parseCoordinates(const String &coordStr, float &lat, float &lon) {
+  int commaIndex = coordStr.indexOf(',');
+  if (commaIndex == -1) return false;
+  
+  String latStr = coordStr.substring(0, commaIndex);
+  String lonStr = coordStr.substring(commaIndex + 1);
+  
+  latStr.trim();
+  lonStr.trim();
+  
+  lat = latStr.toFloat();
+  lon = lonStr.toFloat();
+  
+  return (lat != 0.0 && lon != 0.0);
+}
+
+// Calculate distance between two GPS coordinates in meters using Haversine formula
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000.0; // Earth radius in meters
+  float dLat = (lat2 - lat1) * DEG_TO_RAD;
+  float dLon = (lon2 - lon1) * DEG_TO_RAD;
+  
+  float a = sin(dLat / 2) * sin(dLat / 2) +
+            cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
+            sin(dLon / 2) * sin(dLon / 2);
+            
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+// Update buzzer state in Firebase
+void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_FB("✗ Cannot update buzzer state – WiFi unavailable");
+    return;
+  }
+  
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerIsActive.json?auth=" + FIREBASE_AUTH;
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  String payload = buzzerActive ? "true" : "false";
+  DBG_FB("Updating buzzer state to: " + payload);
+  
+  int code = http.PUT(payload);
+  if (code > 0 && code < 400) {
+    DBG_FB("✓ Firebase buzzer state updated, code " + String(code));
+  } else {
+    DBG_FB("✗ Firebase buzzer state update failed, code " + String(code));
+  }
+  http.end();
+}
+
 // Update dismissAlert in Firebase
 void updateDismissAlert(const String &deviceId, bool dismissed) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -783,13 +897,13 @@ void notifyPackageDelivery(const String &deviceId, float lat, float lon) {
     return;
   }
   
-  // Create delivery notification in Firebase
+  // Create delivery notification in Firebase - same path as website expects
   String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/delivery.json?auth=" + FIREBASE_AUTH;
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   
-  // Create JSON with delivery info
+  // Create JSON with delivery info matching website format
   String json = "{";
   json += "\"delivered\":true,";
   json += "\"awaitingSolenoid\":true,";

@@ -570,31 +570,32 @@ void evaluateLockBreach() {
   Serial.println("Lid status: " + String(isLidOpen ? "OPEN" : "CLOSED"));
   Serial.println("Limit switch: " + String(currentData.limitSwitchPressed ? "PRESSED" : "NOT PRESSED"));
 
-  bool isLocationMismatch = true; // assume mismatch until proven otherwise
+  bool isWithinSafeZone = false; // assume outside safe zone until proven otherwise
 
   // If we have a valid GPS fix and a parsable setLocation, compute distance
-  if (currentData.gpsFixValid) {
+  if (currentData.gpsFixValid && currentData.deviceSetLocation != "Unknown") {
     double setLat, setLon;
     Serial.println("GPS fix valid. Current location: " + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6));
     Serial.println("Set location: " + currentData.deviceSetLocation);
     
     if (parseCoordPair(currentData.deviceSetLocation, setLat, setLon)) {
       double distMeters = haversineMeters(currentData.latitude, currentData.longitude, setLat, setLon);
-      isLocationMismatch = distMeters > 50.0; // 50-m radius
+      isWithinSafeZone = distMeters <= 50.0; // 50-m radius
       Serial.printf("Distance to safe zone: %.1f m (threshold: 50m)\n", distMeters);
-      Serial.println("Location mismatch: " + String(isLocationMismatch ? "YES" : "NO"));
+      Serial.println("Within safe zone: " + String(isWithinSafeZone ? "YES" : "NO"));
     } else {
       Serial.println("Failed to parse set location coordinates!");
     }
   } else {
-    Serial.println("GPS fix not valid - assuming location mismatch");
+    Serial.println("GPS fix not valid or setLocation unknown - assuming outside safe zone");
   }
 
-  bool lockBreach = isLidOpen && isLocationMismatch;
+  // Lock breach only happens when lid is open AND outside the safe zone
+  bool lockBreach = isLidOpen && !isWithinSafeZone;
   Serial.println("Lock breach detected: " + String(lockBreach ? "YES" : "NO"));
 
   // If lid is open but still within safe zone, we will await solenoid command
-  awaitSolenoid = isLidOpen && !isLocationMismatch;
+  awaitSolenoid = isLidOpen && isWithinSafeZone;
   
   // Notify about package delivery when lid is opened within safe zone
   static bool deliveryNotified = false;
@@ -631,6 +632,7 @@ void evaluateLockBreach() {
     Serial.println("No lock breach OR already dismissed - buzzer OFF");
     Serial.println("  Lock breach: " + String(lockBreach));
     Serial.println("  Buzzer dismissed: " + String(currentData.buzzerDismissed));
+    Serial.println("  Within safe zone: " + String(isWithinSafeZone));
     currentData.buzzerIsActive = false;
     digitalWrite(BUZZER_PIN, LOW);
   }
@@ -1399,16 +1401,16 @@ void notifyPackageDelivery() {
   }
   
   HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/deliveryNotification.json?auth=" + FIREBASE_AUTH;
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/delivery.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   
-  // Create delivery notification with timestamp and status
+  // Create delivery notification matching website format
   DynamicJsonDocument doc(256);
   doc["delivered"] = true;
-  doc["timestamp"] = millis();
+  doc["deliveryTime"] = millis();
   doc["awaitingSolenoid"] = true;
-  doc["location"] = currentData.currentLocation;
+  doc["deliveryLocation"] = currentData.currentLocation;
   doc["message"] = "Package delivered successfully. Security lock awaiting activation.";
   
   String body;
