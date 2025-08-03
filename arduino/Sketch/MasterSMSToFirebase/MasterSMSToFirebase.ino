@@ -11,11 +11,13 @@
  * TrackingBoxMain.ino sketch.
  *
  * =====================================================================
+ *
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <HardwareSerial.h>
+#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -29,20 +31,34 @@
 // =====================================================================
 HardwareSerial sim7600(1);
 unsigned long lastSMSCleanup = 0;
-const unsigned long SMS_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+const unsigned long SMS_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutes in milliseconds
+
+// Device tracking for monitoring control states
+struct ActiveDevice {
+  String deviceId;
+  String phoneNumber;
+  bool buzzerActive;
+  bool buzzerDismissed;
+  bool solenoidActive;
+  unsigned long lastChecked;
+};
+
+const int MAX_DEVICES = 10;
+ActiveDevice activeDevices[MAX_DEVICES];
+int activeDeviceCount = 0;
+unsigned long lastFirebaseCheck = 0;
+const unsigned long FIREBASE_CHECK_INTERVAL = 10000; // Check every 10 seconds
+
 
 // ---------------------------------------------------------------------
-// FIREBASE & WIFI CONFIGURATION (copied from TrackingBoxMain)
+// FIREBASE CONFIGURATION
 // ---------------------------------------------------------------------
-const char* WIFI_SSID = "archer_2.4G";
-const char* WIFI_PASSWORD = "05132000";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 
-// ---------------------------------------------------------------------
-// MATH CONSTANTS
-// ---------------------------------------------------------------------
-#define DEG_TO_RAD 0.017453292519943295
+// WiFiManager instance
+WiFiManager wifiManager;
+
 
 // ---------------------------------------------------------------------
 // DEBUG HELPER FOR FIREBASE ONLY
@@ -50,8 +66,6 @@ const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const bool DEBUG_FB = true;
 inline void DBG_FB(const String &msg) { if (DEBUG_FB) Serial.println(msg); }
 
-// No longer needed; we'll poll for unread messages directly
-// via AT+CMGL="REC UNREAD" and read them one-by-one with CMGR
 
 // =====================================================================
 // FUNCTION DECLARATIONS
@@ -64,23 +78,36 @@ void readSMS(int index);
 String extractSMSContent(const String &resp);
 String csvToFirebaseJson(const String &csv);
 String extractFieldFromCSV(const String &csv, int fieldIndex);
+String extractPhoneNumberFromCMGR(const String &resp);
+bool connectToWiFi();
+void sendJsonToFirebase(const String &json, const String &deviceId, const String &phoneNumber);
+void sendControlSMS(const String &phoneNumber, const String &message);
 void sendSolenoidToFirebase(const String &deviceId, bool state);
 void cleanupSMSMemory();
-void updateDismissAlert(const String &deviceId, bool dismissed);
-void notifyPackageDelivery(const String &deviceId, float lat, float lon);
+void showSMSStorageStatus();
 String getSetLocationFromFirebase(const String &deviceId);
 bool parseCoordinates(const String &coordStr, float &lat, float &lon);
 float calculateDistance(float lat1, float lon1, float lat2, float lon2);
 void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive);
+void updateDismissAlert(const String &deviceId, bool dismissed);
+void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId);
+void updateActiveDevice(const String &deviceId, const String &phoneNumber, bool buzzerActive, bool buzzerDismissed, bool solenoidActive);
+void checkActiveDevicesForDismissal();
 
 // =====================================================================
 // SETUP
-// =================================S====================================
+// ====================================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("===== MASTER SMS RECEIVER - DEBUG MODE =====");
+  Serial.println("===== MASTER SMS RECEIVER - DEBUG TOOL =====");
+  
+  // Optional: Reset WiFi settings - uncomment to force WiFi reconfiguration
+  // wifiManager.resetSettings();
+  
+  // Initialize WiFi connection
+  connectToWiFi();
   
   // Initialize SIM7600
   sim7600.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
@@ -112,6 +139,12 @@ void loop() {
   if (millis() - lastSMSCleanup > SMS_CLEANUP_INTERVAL) {
     cleanupSMSMemory();
     lastSMSCleanup = millis();
+  }
+  
+  // Periodic Firebase check for active devices
+  if (millis() - lastFirebaseCheck > FIREBASE_CHECK_INTERVAL) {
+    checkActiveDevicesForDismissal();
+    lastFirebaseCheck = millis();
   }
   
   delay(5000);  // Poll every 5 seconds
@@ -245,6 +278,16 @@ void readSMS(int index) {
 
   Serial.println("SMS Raw Body: " + smsBody);
   
+  // Extract device ID
+  String tempDeviceId = smsBody.substring(0, smsBody.indexOf(','));
+  tempDeviceId.replace("§", "_");
+  tempDeviceId.replace("\xA7", "_");
+  
+  // Send setLocation to slave first
+  Serial.println("\n📍 SENDING SETLOCATION TO SLAVE DEVICE...");
+  sendSetLocationToDevice(phoneNumber, tempDeviceId);
+  delay(3000); // Give time for slave to receive and process
+  
   // Debug: Print each field
   Serial.println("\n=== PARSING SMS DATA ===");
   String debugTokens[16];
@@ -288,81 +331,138 @@ void readSMS(int index) {
 
   // Send to Firebase
   String deviceId = smsBody.substring(0, smsBody.indexOf(','));
-  Serial.println("Raw deviceId: " + deviceId);
-  
-  // Print each character's ASCII value for debugging
-  Serial.print("Character codes: ");
-  for (int i = 0; i < deviceId.length(); i++) {
-    Serial.print((int)deviceId[i]);
-    Serial.print(" ");
-  }
-  Serial.println();
-  
   // Fix character encoding issue: replace section sign with underscore
   deviceId.replace("§", "_");
   deviceId.replace("\xA7", "_"); // Section sign in hex
   
-  // Also handle other potential encoding issues
-  for (int i = 0; i < deviceId.length(); i++) {
-    // Replace any non-printable characters (except underscore) with underscore
-    if (deviceId[i] < 32 || deviceId[i] > 126) {
-      if (deviceId[i] != '_') {
-        deviceId[i] = '_';
-      }
-    }
-  }
-  
-  Serial.println("Fixed deviceId: " + deviceId);
+  Serial.println("Device ID: " + deviceId);
   
   // Extract solenoid state from SMS (field 10, index 10 in CSV)
-  String solenoidState = extractFieldFromCSV(smsBody, 10);
+  String solenoidStateFromSMS = extractFieldFromCSV(smsBody, 10);
   
   // Send sensor data to Firebase
   sendJsonToFirebase(json, deviceId, phoneNumber);
   
   // Send solenoid state separately
-  sendSolenoidToFirebase(deviceId, solenoidState == "1");
+  sendSolenoidToFirebase(deviceId, solenoidStateFromSMS == "1");
   
-  // If buzzer is active (lock breach detected), reset dismissAlert
-  bool buzzerActive = (debugTokens[9] == "0") && (debugTokens[15].indexOf("LOCK BREACH") != -1);
-  if (buzzerActive) {
-    updateDismissAlert(deviceId, false);
+  // Get setLocation from Firebase for geofencing info
+  String setLocation = getSetLocationFromFirebase(deviceId);
+  Serial.println("Set location: " + setLocation);
+  
+  // GEOFENCING LOGIC - Determine if buzzer should be active
+  bool shouldBuzzerBeActive = false;
+  bool lidOpen = (debugTokens[9] == "0"); // Limit switch NOT pressed means lid is open
+  float currentLat = debugTokens[4].toFloat();
+  float currentLon = debugTokens[5].toFloat();
+  
+  if (lidOpen) {
+    Serial.println("\n=== GEOFENCING CHECK ===");
+    Serial.println("Lid is OPEN - checking location...");
+    
+    if (currentLat != 0.0 && currentLon != 0.0 && setLocation.length() > 0) {
+      float setLat, setLon;
+      if (parseCoordinates(setLocation, setLat, setLon)) {
+        float distance = calculateDistance(currentLat, currentLon, setLat, setLon);
+        Serial.println("Current location: " + String(currentLat, 6) + ", " + String(currentLon, 6));
+        Serial.println("Set location: " + String(setLat, 6) + ", " + String(setLon, 6));
+        Serial.println("Distance: " + String(distance, 1) + " meters");
+        
+        if (distance > 50.0) {
+          shouldBuzzerBeActive = true;
+          Serial.println("🚨 OUTSIDE SAFE ZONE - BUZZER SHOULD ACTIVATE!");
+        } else {
+          Serial.println("✅ Within safe zone - buzzer remains off");
+        }
+      }
+    } else {
+      // If GPS not ready or no setLocation, activate buzzer as safety measure
+      if (currentLat == 0.0 || currentLon == 0.0) {
+        Serial.println("⚠️ GPS not ready - activating buzzer as safety measure");
+        shouldBuzzerBeActive = true;
+      }
+      if (setLocation.length() == 0) {
+        Serial.println("⚠️ No setLocation defined - activating buzzer");
+        shouldBuzzerBeActive = true;
+      }
+    }
+  } else {
+    Serial.println("Lid is CLOSED - buzzer not needed");
   }
   
-  // Check for package delivery - need to evaluate if within safe zone
-  bool lidOpen = (debugTokens[9] == "0");
-  float lat = debugTokens[4].toFloat();
-  float lon = debugTokens[5].toFloat();
+  // Update buzzer state in Firebase if it needs to change
+  if (shouldBuzzerBeActive) {
+    updateBuzzerInFirebase(deviceId, true);
+  }
   
-  // Get setLocation from Firebase to check distance
-  String setLocation = getSetLocationFromFirebase(deviceId);
-  bool withinSafeZone = false;
+  // Fetch and relay Firebase control states
+  Serial.println("\n=== FETCHING FIREBASE CONTROL STATES ===");
   
-  if (lat != 0.0 && lon != 0.0 && setLocation.length() > 0) {
-    // Parse setLocation and calculate distance
-    float setLat, setLon;
-    if (parseCoordinates(setLocation, setLat, setLon)) {
-      float distance = calculateDistance(lat, lon, setLat, setLon);
-      withinSafeZone = (distance <= 50.0); // 50 meters threshold
-      Serial.println("Distance to safe zone: " + String(distance) + "m, Within safe zone: " + String(withinSafeZone ? "YES" : "NO"));
+  // 1. setLocation already fetched above, just send it to slave
+  if (setLocation.length() > 0) {
+    Serial.println("📍 SENDING SETLOCATION TO SLAVE: " + setLocation);
+    sendSetLocationToDevice(phoneNumber, deviceId);
+    delay(2000);
+  }
+  
+  // 2. Get SOLENOID state
+  String solenoidUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/solenoid.json?auth=" + FIREBASE_AUTH;
+  DBG_FB("Fetching solenoid from: " + solenoidUrl);
+  HTTPClient httpSolenoid;
+  httpSolenoid.begin(solenoidUrl);
+  int solenoidCode = httpSolenoid.GET();
+  bool solenoidState = false;
+  if (solenoidCode == 200) {
+    String solenoidResp = httpSolenoid.getString();
+    DBG_FB("Raw solenoid response from Firebase: " + solenoidResp);
+    solenoidResp.replace("\"", "");
+    solenoidResp.trim();
+    solenoidState = (solenoidResp == "true");
+    DBG_FB("Parsed solenoid state: " + String(solenoidState));
+  } else {
+    DBG_FB("Failed to get solenoid state, HTTP code: " + String(solenoidCode));
+    if (solenoidCode == 404) {
+      DBG_FB("Solenoid path not found - it may not exist in Firebase yet");
     }
   }
+  httpSolenoid.end();
+  Serial.println("🔐 SOLENOID: " + String(solenoidState ? "ACTIVATE" : "OFF"));
   
-  // Determine actual buzzer state based on location
-  bool actualBuzzerState = false;
-  if (lidOpen && !withinSafeZone) {
-    // Lock breach - lid open outside safe zone
-    actualBuzzerState = true;
-    Serial.println("🚨 Lock breach detected - lid open outside safe zone");
-  } else if (lidOpen && withinSafeZone) {
-    // Package delivered - lid open within safe zone
-    actualBuzzerState = false;
-    Serial.println("📦 Package delivered - lid open within safe zone");
-    notifyPackageDelivery(deviceId, lat, lon);
+  // 3. Use calculated buzzer state (from geofencing logic above)
+  bool buzzerState = shouldBuzzerBeActive;
+  Serial.println("🔔 BUZZER: " + String(buzzerState ? "ACTIVATE" : "OFF"));
+  
+  // 4. Get BUZZER DISMISSED state
+  String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+  HTTPClient httpBuzzerDismissed;
+  httpBuzzerDismissed.begin(buzzerDismissedUrl);
+  int buzzerDismissedCode = httpBuzzerDismissed.GET();
+  bool buzzerDismissedState = false;
+  if (buzzerDismissedCode == 200) {
+    String buzzerDismissedResp = httpBuzzerDismissed.getString();
+    buzzerDismissedResp.replace("\"", "");
+    buzzerDismissedState = (buzzerDismissedResp == "true");
+  }
+  httpBuzzerDismissed.end();
+  Serial.println("🔕 BUZZER DISMISSED: " + String(buzzerDismissedState ? "YES" : "NO"));
+  
+  // If buzzer is dismissed, override the buzzer state to OFF
+  if (buzzerDismissedState && buzzerState) {
+    buzzerState = false;
+    Serial.println("🔕 Buzzer overridden to OFF due to dismissal");
   }
   
-  // Update Firebase with correct buzzer state
-  updateBuzzerInFirebase(deviceId, actualBuzzerState);
+  // 5. Send control command to slave
+  String controlMsg = "CMD," + String(buzzerState ? "1" : "0") + "," + 
+                      String(solenoidState ? "1" : "0") + "," +
+                      String(buzzerDismissedState ? "1" : "0");
+  
+  Serial.println("\n📨 SENDING TO SLAVE: " + controlMsg);
+  delay(2000);
+  sendControlSMS(phoneNumber, controlMsg);
+  
+  // Always track devices that communicate with us
+  updateActiveDevice(deviceId, phoneNumber, buzzerState, buzzerDismissedState, solenoidState);
 }
 
 // Extracts the text part (after first CRLF) from CMGR response
@@ -443,12 +543,11 @@ String csvToFirebaseJson(const String &csv) {
   // Boot count (not in SMS, default to 1)
   json += "\"bootCount\":1,";
   
-  // Don't determine buzzer state here - it will be set based on location check
-  // Just report current buzzer state from the wake reason for now
-  bool isLockBreach = (tokens[15].indexOf("LOCK BREACH") != -1);
+  // Don't set buzzer state here - it will be determined by geofencing logic
+  // Set to false initially, will be updated after location check
   
   // Only include buzzerIsActive, NOT buzzerDismissed (that's in dismissAlert)
-  json += "\"buzzerIsActive\":" + String(isLockBreach ? "true" : "false") + ",";
+  json += "\"buzzerIsActive\":false,";
   
   // Coarse fix (assume true if no GPS)
   json += "\"coarseFix\":" + String(!gpsValid ? "true" : "false") + ",";
@@ -492,20 +591,47 @@ String csvToFirebaseJson(const String &csv) {
 // ---------------------------------------------------------------------
 
 bool connectToWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  DBG_FB("Connecting to WiFi …");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(300);
-    Serial.print('.');
+  // Stage 1: Try quick connection with saved credentials first
+  if (WiFi.SSID().length() > 0) {
+    Serial.println("Attempting quick WiFi connection to saved network: " + WiFi.SSID());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(); // Uses saved SSID and password
+    
+    // Wait maximum 15 seconds for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      DBG_FB("✓ WiFi connected: " + WiFi.localIP().toString());
+      return true;
+    } else {
+      Serial.println("✗ Quick connection failed - saved network not available");
+    }
   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    DBG_FB("✓ WiFi connected: " + WiFi.localIP().toString());
+  
+  // Stage 2: Use WiFiManager for new network configuration or if no saved credentials
+  Serial.println("Starting WiFiManager for network configuration...");
+  
+  // Set shorter timeouts for faster access point creation
+  wifiManager.setConfigPortalTimeout(30); // 30 seconds for portal
+  wifiManager.setConnectTimeout(15); // 15 seconds for connection attempts
+  
+  // Set custom IP for configuration portal
+  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  
+  // Try to connect or show configuration portal
+  if (wifiManager.autoConnect("ProxyServer-Setup")) {
+    DBG_FB("✓ WiFi connected via WiFiManager: " + WiFi.localIP().toString());
     return true;
+  } else {
+    DBG_FB("✗ WiFi connection failed or configuration portal timeout");
+    return false;
   }
-  DBG_FB("✗ WiFi connection failed");
-  return false;
 }
 
 void sendJsonToFirebase(const String &json, const String &deviceId, const String &phoneNumber) {
@@ -530,13 +656,10 @@ void sendJsonToFirebase(const String &json, const String &deviceId, const String
     DBG_FB("✗ Firebase sensorData PUT failed, code " + String(code));
   }
   http.end();
-  
-  // After sending data to Firebase, check control states and send back to slave
-  checkAndSendControlStates(deviceId, phoneNumber);
 }
 
 // ---------------------------------------------------------------------
-// CONTROL STATE MANAGEMENT
+// HELPER FUNCTIONS
 // ---------------------------------------------------------------------
 
 // Extract phone number from CMGR response
@@ -560,81 +683,6 @@ String extractPhoneNumberFromCMGR(const String &resp) {
   return resp.substring(thirdQuote + 1, fourthQuote);
 }
 
-// Check Firebase for control flags and send SMS back to slave device
-void checkAndSendControlStates(const String &deviceId, const String &phoneNumber) {
-  if (WiFi.status() != WL_CONNECTED) {
-    DBG_FB("✗ Cannot check control states – WiFi unavailable");
-    return;
-  }
-
-  // Get buzzer state that was just calculated and stored
-  String buzzerUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerIsActive.json?auth=" + FIREBASE_AUTH;
-  HTTPClient httpBuzzer;
-  httpBuzzer.begin(buzzerUrl);
-  int buzzerCode = httpBuzzer.GET();
-  String buzzerState = "0";
-  if (buzzerCode == 200) {
-    buzzerState = httpBuzzer.getString();
-    DBG_FB("Raw buzzer state from Firebase: " + buzzerState);
-    buzzerState.replace("\"", "");
-    buzzerState.replace("true", "1");
-    buzzerState.replace("false", "0");
-    buzzerState.trim();
-  } else {
-    DBG_FB("Failed to get buzzer state, HTTP code: " + String(buzzerCode));
-  }
-  httpBuzzer.end();
-
-  // Get solenoid state
-  String solenoidUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/solenoid.json?auth=" + FIREBASE_AUTH;
-  HTTPClient httpSolenoid;
-  httpSolenoid.begin(solenoidUrl);
-  int solenoidCode = httpSolenoid.GET();
-  String solenoidState = "0";
-  if (solenoidCode == 200) {
-    solenoidState = httpSolenoid.getString();
-    DBG_FB("Raw solenoid state from Firebase: " + solenoidState);
-    solenoidState.replace("\"", "");
-    solenoidState.replace("true", "1");
-    solenoidState.replace("false", "0");
-    solenoidState.trim();
-  } else {
-    DBG_FB("Failed to get solenoid state, HTTP code: " + String(solenoidCode));
-  }
-  httpSolenoid.end();
-
-  // Get dismiss state from dismissAlert node
-  String dismissUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
-  HTTPClient httpDismiss;
-  httpDismiss.begin(dismissUrl);
-  int dismissCode = httpDismiss.GET();
-  String dismissState = "0";
-  if (dismissCode == 200) {
-    dismissState = httpDismiss.getString();
-    DBG_FB("Raw dismiss state from Firebase dismissAlert: " + dismissState);
-    dismissState.replace("\"", "");
-    dismissState.replace("true", "1");
-    dismissState.replace("false", "0");
-    dismissState.trim();
-  } else {
-    DBG_FB("Failed to get dismiss state, HTTP code: " + String(dismissCode));
-    // If dismissAlert doesn't exist, assume not dismissed
-    dismissState = "0";
-  }
-  httpDismiss.end();
-
-  // Format control message: CMD,buzzer,solenoid,dismiss
-  String controlMsg = "CMD," + buzzerState + "," + solenoidState + "," + dismissState;
-  
-  DBG_FB("Control states from Firebase: " + controlMsg);
-  
-  // Send control SMS back to the slave device that sent the sensor data
-  if (phoneNumber.length() > 0) {
-    sendControlSMS(phoneNumber, controlMsg);
-  } else {
-    DBG_FB("❌ No phone number available to send control SMS");
-  }
-}
 
 // Send control SMS to slave device
 void sendControlSMS(const String &phoneNumber, const String &message) {
@@ -683,8 +731,10 @@ void sendControlSMS(const String &phoneNumber, const String &message) {
   String response = readModem();
   if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
     DBG_FB("✓ Control SMS sent successfully");
+    DBG_FB("✓ Message content: " + message);
   } else {
     DBG_FB("❌ Failed to send control SMS");
+    DBG_FB("Response: " + response);
   }
 }
 
@@ -860,6 +910,7 @@ void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive) {
   http.end();
 }
 
+
 // Update dismissAlert in Firebase
 void updateDismissAlert(const String &deviceId, bool dismissed) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -890,35 +941,204 @@ void updateDismissAlert(const String &deviceId, bool dismissed) {
   http.end();
 }
 
-// Notify package delivery to Firebase
-void notifyPackageDelivery(const String &deviceId, float lat, float lon) {
-  if (WiFi.status() != WL_CONNECTED) {
-    DBG_FB("✗ Cannot notify package delivery – WiFi unavailable");
+
+
+// Send setLocation to device via SMS
+void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId) {
+  // Get setLocation from Firebase
+  String setLocation = getSetLocationFromFirebase(deviceId);
+  
+  if (setLocation.length() == 0) {
+    DBG_FB("No setLocation found for " + deviceId);
     return;
   }
   
-  // Create delivery notification in Firebase - same path as website expects
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/delivery.json?auth=" + FIREBASE_AUTH;
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  
-  // Create JSON with delivery info matching website format
-  String json = "{";
-  json += "\"delivered\":true,";
-  json += "\"awaitingSolenoid\":true,";
-  json += "\"deliveryLocation\":\"" + String(lat, 6) + ", " + String(lon, 6) + "\",";
-  json += "\"deliveryTime\":" + String(millis()) + ",";
-  json += "\"message\":\"Package delivered successfully. Security lock awaiting activation.\"";
-  json += "}";
-  
-  DBG_FB("Package delivery notification: " + json);
-  
-  int code = http.PUT(json);
-  if (code > 0 && code < 400) {
-    DBG_FB("✓ Package delivery notification sent, code " + String(code));
-  } else {
-    DBG_FB("✗ Package delivery notification failed, code " + String(code));
+  // Format message: SETLOC,deviceId,lat,lon
+  float lat, lon;
+  if (!parseCoordinates(setLocation, lat, lon)) {
+    DBG_FB("Failed to parse setLocation coordinates");
+    return;
   }
-  http.end();
-} 
+  
+  String message = "SETLOC," + deviceId + "," + String(lat, 6) + "," + String(lon, 6);
+  
+  DBG_FB("Sending setLocation SMS to " + phoneNumber + ": " + message);
+  
+  // Send SMS
+  sendAT("AT+CMGF=1", 500);
+  sendAT("AT+CSCS=\"GSM\"", 500);
+  
+  sim7600.print("AT+CMGS=\"");
+  sim7600.print(phoneNumber);
+  sim7600.println("\"");
+  delay(1000);
+  
+  // Wait for prompt
+  unsigned long timeout = millis() + 10000;
+  bool promptFound = false;
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      char c = sim7600.read();
+      if (c == '>') {
+        promptFound = true;
+        break;
+      }
+    }
+  }
+  
+  if (!promptFound) {
+    DBG_FB("❌ Failed to get SMS prompt for setLocation");
+    return;
+  }
+  
+  // Send message content
+  sim7600.print(message);
+  delay(500);
+  
+  // Send Ctrl+Z
+  sim7600.write(26);
+  delay(3000);
+  
+  // Check response
+  String response = readModem();
+  if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
+    DBG_FB("✓ SetLocation SMS sent successfully");
+  } else {
+    DBG_FB("❌ Failed to send setLocation SMS");
+  }
+}
+
+// Update or add active device to tracking list
+void updateActiveDevice(const String &deviceId, const String &phoneNumber, bool buzzerActive, bool buzzerDismissed, bool solenoidActive) {
+  // Find existing device or add new one
+  int index = -1;
+  for (int i = 0; i < activeDeviceCount; i++) {
+    if (activeDevices[i].deviceId == deviceId) {
+      index = i;
+      break;
+    }
+  }
+  
+  if (index == -1 && activeDeviceCount < MAX_DEVICES) {
+    // Add new device
+    index = activeDeviceCount++;
+  }
+  
+  if (index != -1) {
+    activeDevices[index].deviceId = deviceId;
+    activeDevices[index].phoneNumber = phoneNumber;
+    activeDevices[index].buzzerActive = buzzerActive;
+    activeDevices[index].buzzerDismissed = buzzerDismissed;
+    activeDevices[index].solenoidActive = solenoidActive;
+    activeDevices[index].lastChecked = millis();
+    DBG_FB("Updated active device: " + deviceId + " (buzzer=" + String(buzzerActive) + ", dismissed=" + String(buzzerDismissed) + ", solenoid=" + String(solenoidActive) + ")");
+  }
+}
+
+// Check all active devices for control state changes (buzzerDismissed and solenoid)
+void checkActiveDevicesForDismissal() {
+  if (activeDeviceCount == 0) return;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!connectToWiFi()) {
+      return;
+    }
+  }
+  
+  DBG_FB("\n🔍 Checking " + String(activeDeviceCount) + " active devices for control state changes...");
+  
+  for (int i = 0; i < activeDeviceCount; i++) {
+    String deviceId = activeDevices[i].deviceId;
+    DBG_FB("Checking device: " + deviceId);
+    bool needsUpdate = false;
+    bool currentBuzzerState = activeDevices[i].buzzerActive;
+    bool currentBuzzerDismissed = activeDevices[i].buzzerDismissed;
+    bool currentSolenoidState = activeDevices[i].solenoidActive;
+    
+    // 1. Check buzzerDismissed state from Firebase (only if buzzer is active)
+    if (activeDevices[i].buzzerActive) {
+      String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+      HTTPClient httpBuzzerDismissed;
+      httpBuzzerDismissed.begin(buzzerDismissedUrl);
+      int buzzerDismissedCode = httpBuzzerDismissed.GET();
+      bool newDismissedState = false;
+      
+      if (buzzerDismissedCode == 200) {
+        String buzzerDismissedResp = httpBuzzerDismissed.getString();
+        buzzerDismissedResp.replace("\"", "");
+        newDismissedState = (buzzerDismissedResp == "true");
+      }
+      httpBuzzerDismissed.end();
+      
+      // Check if dismissed state has changed
+      if (newDismissedState != currentBuzzerDismissed) {
+        DBG_FB("📱 Device " + deviceId + " dismissal state changed: " + 
+               String(currentBuzzerDismissed) + " → " + String(newDismissedState));
+        currentBuzzerDismissed = newDismissedState;
+        needsUpdate = true;
+        
+        // If now dismissed, turn off buzzer
+        if (newDismissedState) {
+          currentBuzzerState = false;
+          updateBuzzerInFirebase(deviceId, false);
+        }
+      }
+    }
+    
+    // 2. Check solenoid state from Firebase
+    String solenoidUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/solenoid.json?auth=" + FIREBASE_AUTH;
+    HTTPClient httpSolenoid;
+    httpSolenoid.begin(solenoidUrl);
+    int solenoidCode = httpSolenoid.GET();
+    bool newSolenoidState = false;
+    
+    if (solenoidCode == 200) {
+      String solenoidResp = httpSolenoid.getString();
+      DBG_FB("Checking solenoid for " + deviceId + ": " + solenoidResp);
+      solenoidResp.replace("\"", "");
+      solenoidResp.trim();
+      newSolenoidState = (solenoidResp == "true");
+      DBG_FB("Parsed solenoid state: " + String(newSolenoidState) + " (was: " + String(currentSolenoidState) + ")");
+    } else {
+      DBG_FB("Failed to get solenoid state for " + deviceId + ", HTTP code: " + String(solenoidCode));
+    }
+    httpSolenoid.end();
+    
+    // Check if solenoid state has changed
+    if (newSolenoidState != currentSolenoidState) {
+      DBG_FB("🔐 Device " + deviceId + " solenoid state changed: " + 
+             String(currentSolenoidState) + " → " + String(newSolenoidState));
+      currentSolenoidState = newSolenoidState;
+      needsUpdate = true;
+    }
+    
+    // 3. Send updated control command if any state changed
+    if (needsUpdate) {
+      String controlMsg = "CMD," + String(currentBuzzerState ? "1" : "0") + "," + 
+                          String(currentSolenoidState ? "1" : "0") + "," +
+                          String(currentBuzzerDismissed ? "1" : "0");
+      DBG_FB("📨 Sending updated control to " + activeDevices[i].phoneNumber + ": " + controlMsg);
+      sendControlSMS(activeDevices[i].phoneNumber, controlMsg);
+      
+      // Update our tracking
+      activeDevices[i].buzzerActive = currentBuzzerState;
+      activeDevices[i].buzzerDismissed = currentBuzzerDismissed;
+      activeDevices[i].solenoidActive = currentSolenoidState;
+    }
+    
+    activeDevices[i].lastChecked = millis();
+  }
+  
+  // Remove inactive devices (haven't been updated in 5 minutes)
+  unsigned long timeout = 5 * 60 * 1000; // 5 minutes
+  for (int i = activeDeviceCount - 1; i >= 0; i--) {
+    if (millis() - activeDevices[i].lastChecked > timeout) {
+      DBG_FB("Removing inactive device: " + activeDevices[i].deviceId);
+      // Shift remaining devices
+      for (int j = i; j < activeDeviceCount - 1; j++) {
+        activeDevices[j] = activeDevices[j + 1];
+      }
+      activeDeviceCount--;
+    }
+  }
+}

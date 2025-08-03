@@ -54,6 +54,7 @@
 // Note: TinyGSM includes removed as cellular data transmission is no longer used
 // Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
+#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
 #define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
 
 // =====================================================================
@@ -99,11 +100,12 @@
 // =====================================================================
 // NETWORK & FIREBASE CONFIGURATION
 // =====================================================================
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
 const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
+
+// WiFiManager instance
+WiFiManager wifiManager;
 
 // SMS FALLBACK CONFIGURATION
 // Configure the phone number of the Master device that will receive SMS
@@ -137,9 +139,20 @@ RTC_DATA_ATTR char rtcDeviceSetLocation[64] = "Unknown";
 RTC_DATA_ATTR char rtcDeviceName[64] = "Unknown";
 RTC_DATA_ATTR bool rtcDeviceDetailsValid = false;
 
+// RTC memory to store buzzer state
+RTC_DATA_ATTR bool rtcBuzzerActive = false;
+RTC_DATA_ATTR bool rtcBuzzerDismissed = false;
+
+// RTC memory to store solenoid state
+RTC_DATA_ATTR bool rtcSolenoidActive = false;
+RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
+
+// RTC memory for SMS cleanup timing
+RTC_DATA_ATTR uint32_t rtcSMSCleanupCounter = 0;
+
 // SMS cleanup timing
 unsigned long lastSMSCleanup = 0;
-const unsigned long SMS_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+const unsigned long SMS_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 // --------------------------------------------------------------
 // GEO HELPERS
@@ -283,6 +296,9 @@ void setup() {
   delay(1000);
   Serial.println("\n===== WAKING UP =====");
 
+  // Optional: Reset WiFi settings - uncomment to force WiFi reconfiguration
+  // wifiManager.resetSettings();
+
   // Increment persistent boot counter
   rtcBootCount++;
   currentData.bootCount = rtcBootCount;
@@ -351,9 +367,31 @@ void setup() {
     // Initialize hardware
     initializeAllHardware();
     
-    // Clean up SMS memory on first entry to SMS mode
-    cleanupSMSMemory();
-    lastSMSCleanup = millis();
+    // Clean up SMS memory every 10 minutes (excluding first boot)
+    // Since device wakes every 15 minutes, check if we've passed the 10-minute mark
+    // rtcBootCount > 1 ensures we skip cleanup on first boot
+    if (rtcBootCount > 1) {
+      // Calculate approximate elapsed time based on boot count and sleep cycles
+      // Each cycle is ~15 minutes, so after first boot:
+      // Boot 2 = 15 min, Boot 3 = 30 min, etc.
+      unsigned long elapsedMinutes = (rtcBootCount - 1) * 15;
+      
+      // Clean up every 10 minutes (approximately every cycle after first)
+      if (elapsedMinutes >= 10) {
+        Serial.println("🧹 Cleaning up SMS memory (10+ minutes since boot)");
+        cleanupSMSMemory();
+        lastSMSCleanup = millis();
+      }
+    }
+    
+    // Check for control SMS from Master (skip on first boot - no data sent yet)
+    if (rtcBootCount > 1) {
+      Serial.println("📨 Checking for pending control SMS from Master...");
+      delay(2000); // Small delay to ensure any pending SMS are received
+      checkForControlSMS();
+    } else {
+      Serial.println("📨 Skipping SMS check on first boot");
+    }
     
     // Restore device details from RTC memory if available
     if (rtcDeviceDetailsValid) {
@@ -369,17 +407,89 @@ void setup() {
     // Collect sensor data for SMS transmission
     collectSensorReading();
     
-    // In SMS mode, we need to evaluate lock breach locally
-    evaluateLockBreach();
+    // In SMS mode, we don't evaluate lock breach - Master decides everything
+    // Just collect sensor data and send to Master
     
     // Attempt to send data via SMS
     if (sendSensorDataViaSMS()) {
       Serial.println("✅ Sensor data sent via SMS to Master device.");
       
-      // If buzzer is active, monitor for control SMS
-      if (currentData.buzzerIsActive) {
-        Serial.println("🚨 Buzzer active in SMS mode - monitoring for control commands...");
+      // CRITICAL: If buzzer OR solenoid is active, DO NOT SLEEP
+      if (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
+        Serial.println("\n⚠️ ACTIVE CONTROL - STAYING AWAKE");
+        
+        if (currentData.buzzerIsActive || rtcBuzzerActive) {
+          Serial.println("🚨 BUZZER ACTIVE - monitoring for dismiss");
+        }
+        if (currentData.solenoidActive || rtcSolenoidActive) {
+          Serial.println("🔓 SOLENOID ACTIVE - running lock cycle");
+        }
+        
+        // Keep monitoring while either is active
+        unsigned long lastCheck = millis();
+        const unsigned long CHECK_INTERVAL = 5000; // Check every 5 seconds
+        unsigned long solenoidRunTime = 0;
+        
+        // If solenoid just activated, record start time
+        if ((currentData.solenoidActive || rtcSolenoidActive) && rtcSolenoidStartTime == 0) {
+          rtcSolenoidStartTime = millis();
+          digitalWrite(SOLENOID_PIN, HIGH); // Activate solenoid
+          Serial.println("🔓 Solenoid activated at " + String(rtcSolenoidStartTime));
+        }
+        
+        // Display QR code immediately when entering active control mode
+        if (!rtcBuzzerActive && !rtcSolenoidActive) {
+          showOfflineQRCode();
+        }
+        
+        while (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
+          // Handle buzzer
+          if (currentData.buzzerIsActive || rtcBuzzerActive) {
+            digitalWrite(BUZZER_PIN, HIGH);
+          }
+          
+          // Handle solenoid (10-second activation)
+          if (currentData.solenoidActive || rtcSolenoidActive) {
+            solenoidRunTime = millis() - rtcSolenoidStartTime;
+            
+            if (solenoidRunTime >= 10000) { // 10 seconds elapsed
+              Serial.println("🔒 Solenoid deactivating after 10 seconds");
+              digitalWrite(SOLENOID_PIN, LOW);
+              currentData.solenoidActive = false;
+              rtcSolenoidActive = false;
+              rtcSolenoidStartTime = 0;
+              
+              // Notify Master that solenoid cycle is complete
+              // Master will update Firebase
+            } else {
+              // Keep solenoid active
+              digitalWrite(SOLENOID_PIN, HIGH);
+              Serial.println("🔓 Solenoid active for " + String(solenoidRunTime / 1000) + " seconds");
+            }
+          }
+          
+          // Check for new control commands
+          if (millis() - lastCheck >= CHECK_INTERVAL) {
+            lastCheck = millis();
+            Serial.println("📨 Checking for control commands...");
+            
+            // Check for control SMS from Master
+            checkForControlSMS();
+            
+            // If both are deactivated, exit loop
+            if (!currentData.buzzerIsActive && !rtcBuzzerActive && 
+                !currentData.solenoidActive && !rtcSolenoidActive) {
+              Serial.println("✅ All controls deactivated - preparing for sleep");
+              break;
+            }
+          }
+          
+          delay(100); // Small delay to prevent busy waiting
+        }
       }
+      
+      // Update display with QR code to help users configure WiFi
+      showOfflineQRCode();
       
       Serial.println("Cycle complete → deep sleep (SMS mode).");
     } else {
@@ -388,6 +498,10 @@ void setup() {
       Serial.println("Cycle complete → deep sleep (offline mode).");
     }
     
+    // CRITICAL: Set buzzer to correct state before deep sleep
+    digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
+    
+    // Only sleep after buzzer is properly handled
     prepareForDeepSleep();
     esp_deep_sleep_start();
   }
@@ -434,7 +548,7 @@ void sendSensorDataToFirebase() {
   accelerometer["y"] = currentData.accelY;
   accelerometer["z"] = currentData.accelZ;
   
-  if (currentData.gpsFixValid) {
+  if (currentData.gpsFixValid || currentData.coarseFix) {
     JsonObject location = doc.createNestedObject("location");
     location["lat"] = currentData.latitude;
     location["lng"] = currentData.longitude;
@@ -626,6 +740,7 @@ void evaluateLockBreach() {
     Serial.println("Activating buzzer...");
     currentData.wakeUpReason   = "LOCK BREACH";
     currentData.buzzerIsActive = true;
+    rtcBuzzerActive = true;  // Save to RTC memory
     digitalWrite(BUZZER_PIN, HIGH);  // Sound buzzer continuously
   } else {
     // If no breach or already dismissed, ensure buzzer is off.
@@ -634,6 +749,7 @@ void evaluateLockBreach() {
     Serial.println("  Buzzer dismissed: " + String(currentData.buzzerDismissed));
     Serial.println("  Within safe zone: " + String(isWithinSafeZone));
     currentData.buzzerIsActive = false;
+    rtcBuzzerActive = false;  // Save to RTC memory
     digitalWrite(BUZZER_PIN, LOW);
   }
   Serial.println("=== END LOCK BREACH EVALUATION ===");
@@ -647,17 +763,39 @@ void handleBuzzerMonitoring() {
   
   // Stay in this loop as long as the buzzer is active, polling for dismissal
   while (currentData.buzzerIsActive) {
+    // Keep buzzer sounding
+    digitalWrite(BUZZER_PIN, HIGH);
+    
     if (millis() - lastPoll > 5000) { // Poll every 5 seconds
       lastPoll = millis();
-      if (checkDismissCommand()) {
-        Serial.println("🔕 Dismiss command received – stopping buzzer.");
-        digitalWrite(BUZZER_PIN, LOW);
-        currentData.buzzerIsActive = false;
-        currentData.buzzerDismissed = true; // Flag that it was dismissed
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("📡 Checking Firebase for dismiss command...");
+        if (checkDismissCommand()) {
+          Serial.println("🔕 Dismiss command received – stopping buzzer.");
+          digitalWrite(BUZZER_PIN, LOW);
+          currentData.buzzerIsActive = false;
+          currentData.buzzerDismissed = true; // Flag that it was dismissed
+          rtcBuzzerActive = false;  // Save to RTC memory
+          rtcBuzzerDismissed = true;
+          
+          // Send final state update to Firebase before sleeping
+          updateBuzzerStateInFirebase(false, true);
+          break; // Exit monitoring loop and proceed to deep sleep
+        } else {
+          Serial.println("⏳ No dismiss command yet, continuing to monitor...");
+        }
+      } else {
+        // SMS mode - check for control commands from Master
+        Serial.println("📨 Checking for control commands...");
+        checkForControlSMS();
         
-        // Send final state update to Firebase before sleeping
-        updateBuzzerStateInFirebase(false, true);
-        break; // Exit monitoring loop and proceed to deep sleep
+        // Check if buzzer was turned off by Master command
+        if (!currentData.buzzerIsActive || currentData.buzzerDismissed) {
+          Serial.println("🔕 Buzzer turned off by Master command.");
+          digitalWrite(BUZZER_PIN, LOW);
+          break; // Exit monitoring loop
+        }
       }
     }
     delay(100); // Small delay to prevent busy-waiting
@@ -761,7 +899,7 @@ void collectSensorReading() {
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   currentData.limitSwitchPressed = !digitalRead(LIMIT_SWITCH_PIN);
 
-  if (currentData.gpsFixValid) {
+  if (currentData.gpsFixValid || currentData.coarseFix) {
     currentData.currentLocation = String(currentData.latitude, 4) + ", " + String(currentData.longitude, 4);
   } else {
     currentData.currentLocation = "GPS Initializing. Please Wait. . .";
@@ -934,7 +1072,11 @@ bool readCellLocation() {
 // =====================================================================
 bool initializeAllHardware() {
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  // Restore buzzer state from RTC memory
+  digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
+  if (rtcBuzzerActive) {
+    Serial.println("🔔 Restoring buzzer state: ON");
+  }
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   pinMode(SOLENOID_PIN, OUTPUT); // Initialize solenoid pin
   digitalWrite(SOLENOID_PIN, LOW); // Ensure solenoid is off initially
@@ -1019,22 +1161,63 @@ void writeLSM6DSLRegister(uint8_t reg, uint8_t value) {
 // WIFI & FIREBASE COMMUNICATION
 // =====================================================================
 bool connectToWiFi() {
-  Serial.println("Connecting to WiFi network...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  int connectionAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && connectionAttempts < 30) {
-    delay(500);
-    Serial.print(".");
-    connectionAttempts++;
+  // Stage 1: Try quick connection with saved credentials first
+  if (WiFi.SSID().length() > 0) {
+    Serial.println("Attempting quick WiFi connection to saved network: " + WiFi.SSID());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(); // Uses saved SSID and password
+    
+    // Wait maximum 15 seconds for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("✓ WiFi connected successfully");
+      Serial.println("IP Address: " + WiFi.localIP().toString());
+      
+      // Configure SNTP to get current epoch time
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      struct tm timeinfo;
+      for (uint8_t i = 0; i < 10; ++i) {   // wait up to ~5 s
+        if (getLocalTime(&timeinfo, 500)) break;
+      }
+      if (timeinfo.tm_year > 120) {
+        Serial.printf("✓ Time synced: %04d-%02d-%02d %02d:%02d\n",
+                      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                      timeinfo.tm_hour, timeinfo.tm_min);
+      } else {
+        Serial.println("⚠ Time sync failed – falling back to millis()");
+      }
+      return true;
+    } else {
+      Serial.println("✗ Quick connection failed - saved network not available");
+    }
   }
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("");
-    Serial.println("✓ WiFi connected successfully");
+  // Stage 2: Use WiFiManager for new network configuration or if no saved credentials
+  Serial.println("Starting WiFiManager for network configuration...");
+  
+  // Set shorter timeouts for faster fallback
+  wifiManager.setConfigPortalTimeout(30); // 30 seconds for portal
+  wifiManager.setConnectTimeout(15); // 15 seconds for connection attempts
+  
+  // Set custom IP for configuration portal
+  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  
+  // Create client-specific AP name based on device ID
+  String apName = "Client-" + DEVICE_ID + "-Setup";
+  
+  // Try to connect or show configuration portal
+  if (wifiManager.autoConnect(apName.c_str())) {
+    Serial.println("✓ WiFi connected successfully via WiFiManager");
     Serial.println("IP Address: " + WiFi.localIP().toString());
 
-    // -------- Configure SNTP to get current epoch time --------
+    // Configure SNTP to get current epoch time
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     struct tm timeinfo;
     for (uint8_t i = 0; i < 10; ++i) {   // wait up to ~5 s
@@ -1050,7 +1233,7 @@ bool connectToWiFi() {
     return true;
   } else {
     Serial.println("");
-    Serial.println("✗ WiFi connection failed");
+    Serial.println("✗ WiFi connection failed - falling back to SMS mode");
     return false;
   }
 }
@@ -1345,15 +1528,22 @@ void showOfflineQRCode() {
 // ===================================================================== 
 
 bool checkDismissCommand() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected, cannot check dismiss command");
+    return false;
+  }
   HTTPClient http;
   String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
   http.begin(url);
   int code = http.GET();
+  Serial.println("🌐 Checking dismissAlert at: " + url);
   if (code == HTTP_CODE_OK) {
     String payload = http.getString();
+    Serial.println("📥 Firebase response: " + payload);
     http.end();
     return payload == "true";
+  } else {
+    Serial.println("❌ HTTP error code: " + String(code));
   }
   http.end();
   return false;
@@ -1455,9 +1645,9 @@ bool sendSensorDataViaSMS() {
   bool success = sendSMS(MASTER_PHONE_NUMBER, smsMessage);
   
   if (success) {
-    // After sending, check for any control commands from Master
-    Serial.println("Waiting 20 seconds for control SMS from Master...");
-    delay(10000); // Give Master more time to process and respond
+    // After sending, wait for control commands from Master
+    Serial.println("Waiting 15 seconds for updated control SMS from Master...");
+    delay(15000); // Give Master more time to process and respond
     checkForControlSMS();
   }
   
@@ -1583,13 +1773,64 @@ void checkForControlSMS() {
   sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");  // Use SIM storage
   delay(500);
   
-  // List unread messages
-  sim7600.println("AT+CMGL=\"REC UNREAD\"");
-  delay(2000);
+  // Try multiple times to catch all messages
+  bool cmdFound = false;
+  int attempts = 0;
   
-  if (sim7600.available()) {
-    String response = sim7600.readString();
-    Serial.println("SMS Response: " + response);
+  while (!cmdFound && attempts < 3) {
+    attempts++;
+    
+    // List unread messages
+    sim7600.println("AT+CMGL=\"REC UNREAD\"");
+    delay(1000); // Reduced from 2000ms
+    
+    if (sim7600.available()) {
+      String response = sim7600.readString();
+      if (attempts == 1) {
+        Serial.println("SMS Response: " + response);
+      }
+    
+    // Look for SETLOC messages first
+    int setlocIndex = response.indexOf("SETLOC,");
+    if (setlocIndex != -1) {
+      // Extract the SETLOC message
+      int endIndex = response.indexOf('\r', setlocIndex);
+      if (endIndex == -1) endIndex = response.indexOf('\n', setlocIndex);
+      if (endIndex == -1) endIndex = response.length();
+      
+      String setlocMsg = response.substring(setlocIndex, endIndex);
+      Serial.println("SETLOC message received: " + setlocMsg);
+      
+      // Parse SETLOC,deviceId,lat,lon
+      if (setlocMsg.startsWith("SETLOC,")) {
+        setlocMsg = setlocMsg.substring(7); // Remove "SETLOC,"
+        int comma1 = setlocMsg.indexOf(',');
+        int comma2 = setlocMsg.indexOf(',', comma1 + 1);
+        
+        if (comma1 != -1 && comma2 != -1) {
+          String deviceId = setlocMsg.substring(0, comma1);
+          String latStr = setlocMsg.substring(comma1 + 1, comma2);
+          String lonStr = setlocMsg.substring(comma2 + 1);
+          
+          // Update setLocation in memory
+          currentData.deviceSetLocation = latStr + ", " + lonStr;
+          strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
+          rtcDeviceDetailsValid = true;
+          
+          Serial.println("✅ Updated setLocation: " + currentData.deviceSetLocation);
+        }
+      }
+      
+      // Find and delete this SMS
+      int msgIndexStart = response.lastIndexOf("+CMGL: ", setlocIndex);
+      if (msgIndexStart != -1) {
+        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
+        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
+        sim7600.print("AT+CMGD=");
+        sim7600.println(smsIndex);
+        delay(500);
+      }
+    }
     
     // Look for control messages starting with "CMD,"
     int cmdIndex = response.indexOf("CMD,");
@@ -1623,12 +1864,28 @@ void checkForControlSMS() {
         } else {
           Serial.println("❌ Failed to delete control SMS");
         }
+        cmdFound = true; // Mark that we found and processed the CMD
       }
-    } else {
+    }
+    
+    if (!cmdFound && attempts == 1) {
       Serial.println("No control SMS found in response.");
     }
+    
+    // If no CMD found, wait a bit before next attempt
+    if (!cmdFound && attempts < 3) {
+      Serial.println("Waiting for CMD message... (attempt " + String(attempts) + "/3)");
+      delay(1000); // Reduced from 3 seconds
+    }
   } else {
-    Serial.println("No SMS response received from modem.");
+    if (attempts == 1) {
+      Serial.println("No SMS response received from modem.");
+    }
+  }
+  } // End of while loop
+  
+  if (!cmdFound) {
+    Serial.println("No CMD control message received after 3 attempts.");
   }
 }
 
@@ -1661,34 +1918,48 @@ void parseControlSMS(String smsContent) {
     // Update dismiss state first
     currentData.buzzerDismissed = newDismissState;
     
-    // If dismissed, turn off buzzer regardless of buzzer state
-    if (newDismissState) {
-      Serial.println("🔕 Buzzer DISMISSED via SMS control");
-      currentData.buzzerIsActive = false;
-      digitalWrite(BUZZER_PIN, LOW);
+    // CRITICAL: Apply Master's decision strictly
+    Serial.println("\n=== APPLYING MASTER'S CONTROL COMMAND ===");
+    
+    // Update dismiss state
+    currentData.buzzerDismissed = newDismissState;
+    rtcBuzzerDismissed = newDismissState;
+    
+    // Apply buzzer state from Master (Master has already done all calculations)
+    currentData.buzzerIsActive = newBuzzerState;
+    rtcBuzzerActive = newBuzzerState;
+    digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
+    
+    if (newBuzzerState) {
+      Serial.println("🔔 BUZZER ACTIVATED by Master command!");
+      Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to HIGH");
     } else {
-      // Update buzzer based on control command
-      if (newBuzzerState != currentData.buzzerIsActive) {
-        currentData.buzzerIsActive = newBuzzerState;
-        digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
-        Serial.println(newBuzzerState ? "🔔 Buzzer activated via SMS" : "🔕 Buzzer deactivated via SMS");
+      Serial.println("🔕 Buzzer turned OFF by Master command");
+      Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to LOW");
+    }
+    
+    // Apply solenoid state from Master
+    if (newSolenoidState != currentData.solenoidActive) {
+      currentData.solenoidActive = newSolenoidState;
+      rtcSolenoidActive = newSolenoidState;
+      
+      if (newSolenoidState) {
+        // Starting new solenoid activation
+        rtcSolenoidStartTime = 0; // Will be set in the monitoring loop
+        Serial.println("🔓 Solenoid activation requested by Master");
+      } else {
+        // Solenoid deactivation
+        digitalWrite(SOLENOID_PIN, LOW);
+        rtcSolenoidStartTime = 0;
+        Serial.println("🔒 Solenoid deactivated by Master");
       }
     }
     
-    // Handle solenoid activation
-    if (newSolenoidState && !currentData.solenoidActive) {
-      currentData.solenoidActive = true;
-      Serial.println("🔓 Solenoid activation requested via SMS");
-      
-      // Activate solenoid immediately
-      pinMode(SOLENOID_PIN, OUTPUT);
-      digitalWrite(SOLENOID_PIN, HIGH);
-      delay(10000);  // Hold for 10 seconds
-      digitalWrite(SOLENOID_PIN, LOW);
-      currentData.solenoidActive = false;
-      
-      Serial.println("🔒 Solenoid cycle complete (SMS triggered)");
-    }
+    Serial.println("Control states applied:");
+    Serial.println("  Buzzer: " + String(newBuzzerState ? "ON" : "OFF"));
+    Serial.println("  Solenoid: " + String(newSolenoidState ? "ON" : "OFF"));
+    Serial.println("  Dismiss: " + String(newDismissState ? "DISMISSED" : "NOT DISMISSED"));
+    Serial.println("=================================");
   }
 }
 
@@ -1705,29 +1976,24 @@ void cleanupSMSMemory() {
   // Delete all messages (read, unread, sent, unsent)
   // AT+CMGD=1,4 deletes all messages
   sim7600.println("AT+CMGD=1,4");
-  delay(5000);
   
-  String response = waitForGPSResponse(5000);
+  // Wait for response (reduced from 10 seconds total to 3 seconds)
+  String response = waitForGPSResponse(3000);
   
   if (response.indexOf("OK") != -1) {
     Serial.println("✅ SMS memory cleaned successfully");
   } else {
-    Serial.println("❌ Failed to clean SMS memory");
+    Serial.println("❌ Primary cleanup failed, trying alternative method...");
     
-    // Alternative: Try deleting by type
-    Serial.println("Trying alternative deletion method...");
+    // Alternative: Try deleting by type (faster with shorter delays)
+    sim7600.println("AT+CMGD=1,1"); // Delete read messages
+    delay(1000);
     
-    // Delete all read messages
-    sim7600.println("AT+CMGD=1,1");
-    delay(2000);
+    sim7600.println("AT+CMGD=1,2"); // Delete sent messages
+    delay(1000);
     
-    // Delete all sent messages  
-    sim7600.println("AT+CMGD=1,2");
-    delay(2000);
-    
-    // Delete all unsent messages
-    sim7600.println("AT+CMGD=1,3");
-    delay(2000);
+    sim7600.println("AT+CMGD=1,3"); // Delete unsent messages
+    delay(1000);
   }
   
   // Show SMS storage status

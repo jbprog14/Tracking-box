@@ -433,10 +433,19 @@ export default function Home() {
     setIsDismissing(boxId);
 
     try {
+      // Update BOTH paths to support WiFi and SMS modes
+      // 1. For WiFi mode: Update dismissAlert path
+      const dismissAlertRef = ref(db, `tracking_box/${boxId}/dismissAlert`);
+      await set(dismissAlertRef, {
+        dismissed: true,
+        timestamp: Date.now()
+      });
+
+      // 2. For SMS mode: Update sensorData flags
       const sensorDataRef = ref(db, `tracking_box/${boxId}/sensorData`);
       await update(sensorDataRef, {
         buzzerIsActive: false,
-        buzzerDismissed: true, // Mark as dismissed; device will acknowledge
+        buzzerDismissed: true, // Mark as dismissed for SMS mode
       });
 
       toast.success(`Alarm for ${boxId} dismissed successfully.`, {
