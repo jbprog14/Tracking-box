@@ -370,6 +370,7 @@ void readSMS(int index) {
   
   // GEOFENCING LOGIC - Determine if buzzer should be active
   bool shouldBuzzerBeActive = false;
+  bool shouldAutoActivateSolenoid = false; // Flag for auto-activating solenoid in safe zone
   bool lidOpen = (debugTokens[9] == "0"); // Limit switch NOT pressed means lid is open
   bool securityBreachActive = (debugTokens[17] == "1"); // Security breach flag from device
   float currentLat = debugTokens[4].toFloat();
@@ -418,6 +419,9 @@ void readSMS(int index) {
       Serial.println("🔐 Security breach detected but device is within safe zone");
       Serial.println("🔕 Buzzer NOT activated - device in safe zone");
       shouldBuzzerBeActive = false;
+      // AUTO-ACTIVATE SOLENOID when lock breach occurs in safe zone
+      shouldAutoActivateSolenoid = true;
+      Serial.println("🔓 Will AUTO-ACTIVATE SOLENOID - Lock breach within safe zone");
     }
   } else if (lidOpen) {
     // Lid is currently open but security breach not yet marked
@@ -449,6 +453,9 @@ void readSMS(int index) {
     } else {
       Serial.println("🔕 Buzzer NOT activated - lid open within safe zone");
       shouldBuzzerBeActive = false;
+      // AUTO-ACTIVATE SOLENOID when lid opens in safe zone
+      shouldAutoActivateSolenoid = true;
+      Serial.println("🔓 Will AUTO-ACTIVATE SOLENOID - Lid open within safe zone");
     }
   } else {
     // Lid is closed - check if there's still an active security breach
@@ -554,7 +561,14 @@ void readSMS(int index) {
     }
   }
   httpSolenoid.end();
-  Serial.println("🔐 SOLENOID: " + String(solenoidState ? "ACTIVATE" : "OFF"));
+  
+  // Override solenoid state if auto-activation is needed (lock breach in safe zone)
+  if (shouldAutoActivateSolenoid) {
+    solenoidState = true;
+    Serial.println("🔓 SOLENOID: AUTO-ACTIVATED (lock breach in safe zone)");
+  } else {
+    Serial.println("🔐 SOLENOID: " + String(solenoidState ? "ACTIVATE" : "OFF"));
+  }
   
   // 3. Use calculated buzzer state (from geofencing logic above)
   bool buzzerState = shouldBuzzerBeActive;

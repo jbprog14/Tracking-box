@@ -70,7 +70,6 @@ export default function Home() {
   const [dataError, setDataError] = useState<string | null>(null);
   const [isDismissing, setIsDismissing] = useState<string | null>(null);
   const prevTrackingDataRef = useRef<TrackingData>({});
-  const [isActivatingLock, setIsActivatingLock] = useState<string | null>(null);
 
   // ------------------------------------------------------------------
   // Reverse-geocoding (lat,lon → human readable)
@@ -548,20 +547,6 @@ export default function Home() {
     }
   };
 
-  // Trigger solenoid activation in Firebase
-  const handleActivateLock = async (boxId: string) => {
-    setIsActivatingLock(boxId);
-    try {
-      const lockRef = ref(db, `tracking_box/${boxId}/solenoid`);
-      await set(lockRef, true);
-      toast.success(`Lock activated for ${boxId}`, { position: "top-right" });
-    } catch (error) {
-      console.error("Error activating lock:", error);
-      toast.error(`Failed to activate lock for ${boxId}`);
-    } finally {
-      setIsActivatingLock(null);
-    }
-  };
 
   if (!isOnline) {
     return <QRLinkPage />;
@@ -745,27 +730,12 @@ export default function Home() {
                           </button>
                         </td>
                         <td className="px-6 py-2 text-sm text-gray-500">
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => handleEditClick(boxId)}
-                              className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
-                            >
-                              Edit Info
-                            </button>
-                            <button
-                              onClick={() => handleActivateLock(boxId)}
-                              disabled={isActivatingLock === boxId}
-                              className={`bg-red-600 hover:bg-red-700 text-white font-bold py-1 px-3 rounded-md border-2 border-red-700 transition duration-300 text-sm ${
-                                isActivatingLock === boxId
-                                  ? "opacity-50 cursor-not-allowed"
-                                  : ""
-                              }`}
-                            >
-                              {isActivatingLock === boxId
-                                ? "Activating..."
-                                : "Activate Lock"}
-                            </button>
-                          </div>
+                          <button
+                            onClick={() => handleEditClick(boxId)}
+                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
+                          >
+                            Edit Info
+                          </button>
                         </td>
                       </tr>
                     );
