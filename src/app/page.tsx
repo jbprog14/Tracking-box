@@ -216,6 +216,12 @@ export default function Home() {
                     setLocationLabel: box.details?.setLocationLabel || "",
                     description: box.details?.description || "",
                     referenceCode: box.details?.referenceCode || "",
+                    // Package Information Fields
+                    packDate: box.details?.packDate || "",
+                    packWeight: box.details?.packWeight || "",
+                    productFrom: box.details?.productFrom || "",
+                    packerShipper: box.details?.packerShipper || "",
+                    supplierIdTracking: box.details?.supplierIdTracking || "",
                   },
                   sensorData: {
                     temp: box.sensorData?.temp || 0,
