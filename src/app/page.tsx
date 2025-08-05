@@ -534,7 +534,7 @@ export default function Home() {
       const boxRef = ref(db, `tracking_box/${boxId}/details`);
       
       // Prepare update data
-      const updateData: any = {
+      const updateData: Record<string, string> = {
         setLocation: coordString,
         setLocationLabel: label,
         name: name,
