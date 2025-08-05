@@ -14,6 +14,13 @@ interface TrackingBoxDetails {
   setLocationLabel?: string; // human-friendly address
   description?: string;
   referenceCode?: string; // Unique 10-character reference code
+  
+  // Package Information Fields
+  packDate?: string; // ISO date string
+  packWeight?: string; // Weight with unit (e.g., "5.2 kg")
+  productFrom?: string; // Origin/source of product
+  packerShipper?: string; // Name of packer or shipper
+  supplierIdTracking?: string; // Supplier ID or tracking number
 }
 
 interface SensorData {
@@ -512,18 +519,38 @@ export default function Home() {
     coords: string,
     name: string,
     label: string,
-    description: string
+    description: string,
+    packageInfo?: {
+      packDate: string;
+      packWeight: string;
+      productFrom: string;
+      packerShipper: string;
+      supplierIdTracking: string;
+    }
   ) => {
     try {
       const coordString = coords || (await forwardGeocode(label)) || label;
 
       const boxRef = ref(db, `tracking_box/${boxId}/details`);
-      await update(boxRef, {
+      
+      // Prepare update data
+      const updateData: any = {
         setLocation: coordString,
         setLocationLabel: label,
         name: name,
         description: description,
-      });
+      };
+      
+      // Add package info if provided
+      if (packageInfo) {
+        updateData.packDate = packageInfo.packDate;
+        updateData.packWeight = packageInfo.packWeight;
+        updateData.productFrom = packageInfo.productFrom;
+        updateData.packerShipper = packageInfo.packerShipper;
+        updateData.supplierIdTracking = packageInfo.supplierIdTracking;
+      }
+      
+      await update(boxRef, updateData);
 
       // Update local state as well
       setTrackingData((prev) => ({
@@ -536,6 +563,13 @@ export default function Home() {
             setLocationLabel: label,
             name: name,
             description: description,
+            ...(packageInfo && {
+              packDate: packageInfo.packDate,
+              packWeight: packageInfo.packWeight,
+              productFrom: packageInfo.productFrom,
+              packerShipper: packageInfo.packerShipper,
+              supplierIdTracking: packageInfo.supplierIdTracking,
+            }),
           },
         },
       }));
@@ -780,6 +814,31 @@ export default function Home() {
             referenceCode={
               selectedEditBoxId
                 ? trackingData[selectedEditBoxId]?.details?.referenceCode || ""
+                : ""
+            }
+            currentPackDate={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.packDate || ""
+                : ""
+            }
+            currentPackWeight={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.packWeight || ""
+                : ""
+            }
+            currentProductFrom={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.productFrom || ""
+                : ""
+            }
+            currentPackerShipper={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.packerShipper || ""
+                : ""
+            }
+            currentSupplierIdTracking={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.supplierIdTracking || ""
                 : ""
             }
             onSave={handleSaveInfo}

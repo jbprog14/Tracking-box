@@ -11,6 +11,13 @@ interface DeviceDetails {
   setLocationLabel?: string;
   description?: string;
   referenceCode?: string;
+  
+  // Package Information Fields
+  packDate?: string;
+  packWeight?: string;
+  productFrom?: string;
+  packerShipper?: string;
+  supplierIdTracking?: string;
 }
 
 interface SensorData {
@@ -83,6 +90,11 @@ export default function QRDevicePage() {
                   setLocationLabel: data.details?.setLocationLabel || "",
                   description: data.details?.description || "",
                   referenceCode: data.details?.referenceCode || "",
+                  packDate: data.details?.packDate || "",
+                  packWeight: data.details?.packWeight || "",
+                  productFrom: data.details?.productFrom || "",
+                  packerShipper: data.details?.packerShipper || "",
+                  supplierIdTracking: data.details?.supplierIdTracking || "",
                 },
                 sensorData: {
                   temp: data.sensorData?.temp || 0,
@@ -305,6 +317,89 @@ export default function QRDevicePage() {
                 </div>
               </div>
             </div>
+
+            {/* Package Information Section */}
+            {(deviceData.details.packDate || deviceData.details.packWeight || 
+              deviceData.details.productFrom || deviceData.details.packerShipper || 
+              deviceData.details.supplierIdTracking) && (
+              <div className="bg-gradient-to-br from-orange-50 to-amber-50 rounded-xl shadow-lg p-6 border border-orange-200">
+                <h2 className="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+                  <svg className="h-6 w-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                  </svg>
+                  Package Information
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {deviceData.details.packDate && (
+                    <div className="bg-white bg-opacity-80 p-4 rounded-lg border border-orange-200">
+                      <p className="text-sm text-gray-600 flex items-center gap-1">
+                        <svg className="h-4 w-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                        Pack Date
+                      </p>
+                      <p className="font-semibold text-gray-900">
+                        {new Date(deviceData.details.packDate).toLocaleDateString()}
+                      </p>
+                    </div>
+                  )}
+                  {deviceData.details.packWeight && (
+                    <div className="bg-white bg-opacity-80 p-4 rounded-lg border border-orange-200">
+                      <p className="text-sm text-gray-600 flex items-center gap-1">
+                        <svg className="h-4 w-4 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 6l3 1m0 0l-3 9a5.002 5.002 0 006.001 0M6 7l3 9M6 7l6-2m6 2l3-1m-3 1l-3 9a5.002 5.002 0 006.001 0M18 7l3 9m-3-9l-6-2m0-2v2m0 16V5m0 16H9m3 0h3" />
+                        </svg>
+                        Pack Weight
+                      </p>
+                      <p className="font-semibold text-gray-900">
+                        {deviceData.details.packWeight}
+                      </p>
+                    </div>
+                  )}
+                  {deviceData.details.productFrom && (
+                    <div className="bg-white bg-opacity-80 p-4 rounded-lg border border-orange-200">
+                      <p className="text-sm text-gray-600 flex items-center gap-1">
+                        <svg className="h-4 w-4 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        Product From
+                      </p>
+                      <p className="font-semibold text-gray-900">
+                        {deviceData.details.productFrom}
+                      </p>
+                    </div>
+                  )}
+                  {deviceData.details.packerShipper && (
+                    <div className="bg-white bg-opacity-80 p-4 rounded-lg border border-orange-200">
+                      <p className="text-sm text-gray-600 flex items-center gap-1">
+                        <svg className="h-4 w-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path d="M9 17a2 2 0 11-4 0 2 2 0 014 0zM19 17a2 2 0 11-4 0 2 2 0 014 0z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16V6a1 1 0 00-1-1H4a1 1 0 00-1 1v10a1 1 0 001 1h1m8-1a1 1 0 01-1 1H9m4-1V8a1 1 0 011-1h2.586a1 1 0 01.707.293l3.414 3.414a1 1 0 01.293.707V16a1 1 0 01-1 1h-1m-6-1a1 1 0 001 1h1M5 17a2 2 0 104 0m-4 0a2 2 0 114 0m6 0a2 2 0 104 0m-4 0a2 2 0 114 0" />
+                        </svg>
+                        Packer / Shipper
+                      </p>
+                      <p className="font-semibold text-gray-900">
+                        {deviceData.details.packerShipper}
+                      </p>
+                    </div>
+                  )}
+                  {deviceData.details.supplierIdTracking && (
+                    <div className="bg-white bg-opacity-80 p-4 rounded-lg border border-orange-200">
+                      <p className="text-sm text-gray-600 flex items-center gap-1">
+                        <svg className="h-4 w-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14" />
+                        </svg>
+                        Supplier ID / Tracking #
+                      </p>
+                      <p className="font-semibold text-gray-900 font-mono text-sm">
+                        {deviceData.details.supplierIdTracking}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
 
             <div className="bg-white rounded-xl shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-900 mb-4">

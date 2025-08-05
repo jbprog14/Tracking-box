@@ -18,6 +18,11 @@ import {
   Zap,
   Shield,
   AlertTriangle,
+  Package,
+  Calendar,
+  Weight,
+  Truck,
+  Hash,
 } from "lucide-react";
 import TrackingBoxMap from "./TrackingBoxMap";
 import {
@@ -36,6 +41,14 @@ interface TrackingBoxDetails {
   setLocation: string; // coords
   setLocationLabel?: string; // human readable
   description?: string;
+  referenceCode?: string;
+  
+  // Package Information Fields
+  packDate?: string;
+  packWeight?: string;
+  productFrom?: string;
+  packerShipper?: string;
+  supplierIdTracking?: string;
 }
 
 interface SensorData {
@@ -311,6 +324,75 @@ export default function TrackingBoxModal({
                   </div>
                 </div>
               </div>
+
+              {/* Package Information */}
+              {(deviceDetails.packDate || deviceDetails.packWeight || 
+                deviceDetails.productFrom || deviceDetails.packerShipper || 
+                deviceDetails.supplierIdTracking) && (
+                <div className="bg-gradient-to-br from-orange-50 to-amber-50 rounded-xl shadow-lg border border-orange-200 p-6 space-y-4">
+                  <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                    <Package className="h-5 w-5 text-orange-600" />
+                    Package Information
+                  </h3>
+                  <div className="space-y-3">
+                    {deviceDetails.packDate && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600 flex items-center gap-2">
+                          <Calendar className="h-4 w-4 text-green-600" />
+                          Pack Date
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          {new Date(deviceDetails.packDate).toLocaleDateString()}
+                        </span>
+                      </div>
+                    )}
+                    {deviceDetails.packWeight && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600 flex items-center gap-2">
+                          <Weight className="h-4 w-4 text-yellow-600" />
+                          Pack Weight
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          {deviceDetails.packWeight}
+                        </span>
+                      </div>
+                    )}
+                    {deviceDetails.productFrom && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600 flex items-center gap-2">
+                          <MapPin className="h-4 w-4 text-red-600" />
+                          Product From
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          {deviceDetails.productFrom}
+                        </span>
+                      </div>
+                    )}
+                    {deviceDetails.packerShipper && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600 flex items-center gap-2">
+                          <Truck className="h-4 w-4 text-indigo-600" />
+                          Packer / Shipper
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          {deviceDetails.packerShipper}
+                        </span>
+                      </div>
+                    )}
+                    {deviceDetails.supplierIdTracking && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600 flex items-center gap-2">
+                          <Hash className="h-4 w-4 text-purple-600" />
+                          Supplier ID / Tracking #
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          {deviceDetails.supplierIdTracking}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Realtime Sensor Charts */}

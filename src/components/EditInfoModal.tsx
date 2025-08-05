@@ -9,7 +9,8 @@ import {
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { MapPin, User, Save, X, FileText } from "lucide-react";
+import { MapPin, User, Save, X, FileText, Package, Calendar, Weight, Truck, Hash } from "lucide-react";
+import { toast } from "react-hot-toast";
 
 interface EditInfoModalProps {
   isOpen: boolean;
@@ -19,12 +20,27 @@ interface EditInfoModalProps {
   currentOwner: string;
   currentDescription?: string;
   referenceCode?: string;
+  
+  // Package Information
+  currentPackDate?: string;
+  currentPackWeight?: string;
+  currentProductFrom?: string;
+  currentPackerShipper?: string;
+  currentSupplierIdTracking?: string;
+  
   onSave: (
     boxId: string,
     coords: string,
     owner: string,
     label: string,
-    description: string
+    description: string,
+    packageInfo: {
+      packDate: string;
+      packWeight: string;
+      productFrom: string;
+      packerShipper: string;
+      supplierIdTracking: string;
+    }
   ) => void;
 }
 
@@ -36,11 +52,24 @@ export default function EditInfoModal({
   currentOwner,
   currentDescription,
   referenceCode,
+  currentPackDate,
+  currentPackWeight,
+  currentProductFrom,
+  currentPackerShipper,
+  currentSupplierIdTracking,
   onSave,
 }: EditInfoModalProps) {
   const [address, setAddress] = useState("");
   const [owner, setOwner] = useState("");
   const [description, setDescription] = useState("");
+  
+  // Package Information States
+  const [packDate, setPackDate] = useState("");
+  const [packWeight, setPackWeight] = useState("");
+  const [productFrom, setProductFrom] = useState("");
+  const [packerShipper, setPackerShipper] = useState("");
+  const [supplierIdTracking, setSupplierIdTracking] = useState("");
+  
   const [isSaving, setIsSaving] = useState(false);
   const [geoError, setGeoError] = useState("");
 
@@ -50,8 +79,17 @@ export default function EditInfoModal({
       setAddress(currentAddress || "");
       setOwner(currentOwner || "");
       setDescription(currentDescription || "");
+      
+      // Initialize package information
+      setPackDate(currentPackDate || "");
+      setPackWeight(currentPackWeight || "");
+      setProductFrom(currentProductFrom || "");
+      setPackerShipper(currentPackerShipper || "");
+      setSupplierIdTracking(currentSupplierIdTracking || "");
     }
-  }, [isOpen, currentAddress, currentOwner, currentDescription]);
+  }, [isOpen, currentAddress, currentOwner, currentDescription, 
+      currentPackDate, currentPackWeight, currentProductFrom, 
+      currentPackerShipper, currentSupplierIdTracking]);
 
   // --- Geocoding helper (tries multiple services) ---
   const geocodeAddress = async (
@@ -95,7 +133,13 @@ export default function EditInfoModal({
   };
 
   const handleSave = async () => {
-    if (!boxId || !address.trim() || !owner.trim()) return;
+    // Validate required fields
+    if (!boxId || !address.trim() || !owner.trim() || 
+        !packDate.trim() || !packWeight.trim() || !productFrom.trim() ||
+        !packerShipper.trim() || !supplierIdTracking.trim()) {
+      toast.error("Please fill in all required fields");
+      return;
+    }
 
     setIsSaving(true);
     setGeoError("");
@@ -111,12 +155,23 @@ export default function EditInfoModal({
       }
 
       const finalAddress = `${coords.lat}, ${coords.lon}`;
+      
+      // Package info object
+      const packageInfo = {
+        packDate: packDate.trim(),
+        packWeight: packWeight.trim(),
+        productFrom: productFrom.trim(),
+        packerShipper: packerShipper.trim(),
+        supplierIdTracking: supplierIdTracking.trim()
+      };
+      
       onSave(
         boxId,
         finalAddress,
         owner.trim(),
         address.trim(),
-        description.trim()
+        description.trim(),
+        packageInfo
       );
       onClose();
     } catch (error) {
@@ -131,6 +186,11 @@ export default function EditInfoModal({
     setAddress(currentAddress || "");
     setOwner(currentOwner || "");
     setDescription(currentDescription || "");
+    setPackDate(currentPackDate || "");
+    setPackWeight(currentPackWeight || "");
+    setProductFrom(currentProductFrom || "");
+    setPackerShipper(currentPackerShipper || "");
+    setSupplierIdTracking(currentSupplierIdTracking || "");
     onClose();
   };
 
@@ -220,6 +280,101 @@ export default function EditInfoModal({
                 </div>
               )}
             </div>
+
+            {/* Package Information Section */}
+            <div className="space-y-4 border-t-2 border-gray-200 pt-4 mt-6">
+              <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                <Package className="h-5 w-5 text-orange-600" />
+                Package Information
+              </h3>
+              
+              {/* Pack Date Field */}
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Calendar className="h-4 w-4 text-green-600" />
+                  Pack Date <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={packDate}
+                  onChange={(e) => setPackDate(e.target.value)}
+                  className="w-full p-3 border-2 border-gray-300 rounded-md text-sm"
+                  required
+                />
+              </div>
+
+              {/* Pack Weight Field */}
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Weight className="h-4 w-4 text-yellow-600" />
+                  Pack Weight <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={packWeight}
+                  onChange={(e) => setPackWeight(e.target.value)}
+                  placeholder="e.g., 5.2 kg, 10 lbs"
+                  className="w-full p-3 border-2 border-gray-300 rounded-md text-sm"
+                  maxLength={50}
+                  required
+                />
+                <div className="text-xs text-gray-400">{packWeight.length}/50</div>
+              </div>
+
+              {/* Product From Field */}
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <MapPin className="h-4 w-4 text-red-600" />
+                  Product From <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={productFrom}
+                  onChange={(e) => setProductFrom(e.target.value)}
+                  placeholder="Origin or source location"
+                  className="w-full p-3 border-2 border-gray-300 rounded-md text-sm"
+                  maxLength={100}
+                  required
+                />
+                <div className="text-xs text-gray-400">{productFrom.length}/100</div>
+              </div>
+
+              {/* Packer/Shipper Field */}
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Truck className="h-4 w-4 text-indigo-600" />
+                  Packer / Shipper <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={packerShipper}
+                  onChange={(e) => setPackerShipper(e.target.value)}
+                  placeholder="Name of packer or shipping company"
+                  className="w-full p-3 border-2 border-gray-300 rounded-md text-sm"
+                  maxLength={100}
+                  required
+                />
+                <div className="text-xs text-gray-400">{packerShipper.length}/100</div>
+              </div>
+
+              {/* Supplier ID/Tracking Field */}
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Hash className="h-4 w-4 text-purple-600" />
+                  Supplier ID# / Tracking # <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={supplierIdTracking}
+                  onChange={(e) => setSupplierIdTracking(e.target.value)}
+                  placeholder="Supplier ID or tracking number"
+                  className="w-full p-3 border-2 border-gray-300 rounded-md text-sm"
+                  maxLength={100}
+                  required
+                />
+                <div className="text-xs text-gray-400">{supplierIdTracking.length}/100</div>
+              </div>
+            </div>
           </div>
         </ScrollArea>
 
@@ -236,7 +391,9 @@ export default function EditInfoModal({
             </Button>
             <Button
               onClick={handleSave}
-              disabled={!address.trim() || !owner.trim() || isSaving}
+              disabled={!address.trim() || !owner.trim() || !packDate.trim() || 
+                       !packWeight.trim() || !productFrom.trim() || !packerShipper.trim() || 
+                       !supplierIdTracking.trim() || isSaving}
               className="flex-1 flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white border-2 border-blue-700 rounded-md disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-400 disabled:border-gray-500"
             >
               {isSaving ? (
