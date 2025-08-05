@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 // NOTE: We load Firebase dynamically *only* in the browser to keep the
 // Cloudflare Pages / Edge bundle free of Node-specific polyfills.
 
@@ -10,6 +10,7 @@ interface DeviceDetails {
   setLocation: string;
   setLocationLabel?: string;
   description?: string;
+  referenceCode?: string;
 }
 
 interface SensorData {
@@ -31,6 +32,7 @@ interface DeviceData {
   sensorData: SensorData;
 }
 
+
 // Next.js route runtime configuration
 export const runtime = "nodejs";
 
@@ -38,13 +40,19 @@ export default function QRDevicePage() {
   const params = useParams();
   const deviceId = params.deviceId as string;
 
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
   const [deviceData, setDeviceData] = useState<DeviceData | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   const [dataError, setDataError] = useState<string | null>(null);
+  const [currentLocationText, setCurrentLocationText] = useState<string>("");
+  const [setLocationText, setSetLocationText] = useState<string>("");
+  const [accessTime, setAccessTime] = useState<string>("");
+  const geocodeCache = useRef<Record<string, string>>({});
+
+
+  // Set access time on client side only
+  useEffect(() => {
+    setAccessTime(new Date().toLocaleString());
+  }, []);
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
@@ -74,6 +82,7 @@ export default function QRDevicePage() {
                   setLocation: data.details?.setLocation || "",
                   setLocationLabel: data.details?.setLocationLabel || "",
                   description: data.details?.description || "",
+                  referenceCode: data.details?.referenceCode || "",
                 },
                 sensorData: {
                   temp: data.sensorData?.temp || 0,
@@ -122,7 +131,7 @@ export default function QRDevicePage() {
       );
     };
 
-    if (isAuthenticated && deviceId && typeof window !== "undefined") {
+    if (deviceId && typeof window !== "undefined") {
       setIsLoading(true);
       initRealtime().catch((err) => {
         console.error("Firebase init error", err);
@@ -134,17 +143,81 @@ export default function QRDevicePage() {
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [isAuthenticated, deviceId]);
+  }, [deviceId]);
 
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (username === "Admin123" && password === "123123123a") {
-      setIsAuthenticated(true);
-      setError("");
-    } else {
-      setError("Invalid username or password");
+  // Convert coordinates to human-readable addresses
+  const parseCoordinates = (raw: string): [number, number] | null => {
+    if (!raw || raw === "No GPS Fix" || raw === "GPS Initializing. Please Wait. . .") return null;
+    
+    // Try to parse decimal coordinates
+    const match = raw.match(/(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/);
+    if (match) {
+      return [parseFloat(match[1]), parseFloat(match[2])];
+    }
+    return null;
+  };
+
+  const fetchReverseGeocode = async (lat: number, lon: number): Promise<string> => {
+    const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+    if (geocodeCache.current[key]) return geocodeCache.current[key];
+
+    try {
+      const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=14&addressdetails=1`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": "tracking-box-dashboard" },
+      });
+      const json = await res.json();
+      
+      let human = json.display_name || `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+      if (json.address) {
+        const a = json.address;
+        human = [
+          a.road,
+          a.suburb || a.village || a.town,
+          a.city || a.municipality,
+          a.state,
+          a.country,
+        ]
+          .filter(Boolean)
+          .join(", ");
+      }
+      geocodeCache.current[key] = human;
+      return human;
+    } catch (e) {
+      console.warn("Reverse-geocode failed", e);
+      return `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
     }
   };
+
+  // Update location texts whenever device data changes
+  useEffect(() => {
+    if (!deviceData) return;
+
+    const updateLocationTexts = async () => {
+      // Convert current location
+      const currentCoords = parseCoordinates(deviceData.sensorData.currentLocation);
+      if (currentCoords) {
+        const [lat, lon] = currentCoords;
+        const address = await fetchReverseGeocode(lat, lon);
+        setCurrentLocationText(address);
+      } else {
+        setCurrentLocationText(deviceData.sensorData.currentLocation);
+      }
+
+      // Convert set location
+      const setCoords = parseCoordinates(deviceData.details.setLocation);
+      if (setCoords) {
+        const [lat, lon] = setCoords;
+        const address = await fetchReverseGeocode(lat, lon);
+        setSetLocationText(address);
+      } else {
+        setSetLocationText(deviceData.details.setLocation);
+      }
+    };
+
+    updateLocationTexts();
+  }, [deviceData]);
+
 
   const getStatusColor = (status: string | boolean) => {
     if (typeof status === "boolean") {
@@ -153,101 +226,6 @@ export default function QRDevicePage() {
     return status === "NORMAL" ? "text-green-600" : "text-red-600";
   };
 
-  if (!isAuthenticated) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-md">
-          <div className="text-center mb-8">
-            <div className="mx-auto w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center mb-4">
-              <svg
-                className="w-8 h-8 text-white"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
-                />
-              </svg>
-            </div>
-            <h1 className="text-2xl font-bold text-gray-900 mb-2">
-              Device Access
-            </h1>
-            <p className="text-gray-600">
-              Viewing details for device:{" "}
-              <span className="font-mono font-semibold">
-                {deviceId?.toUpperCase()}
-              </span>
-            </p>
-            <p className="text-sm text-gray-500 mt-2">
-              Please authenticate to access device information
-            </p>
-          </div>
-
-          <form onSubmit={handleLogin} className="space-y-6">
-            <div>
-              <label
-                htmlFor="username"
-                className="block text-sm font-medium text-gray-700 mb-2"
-              >
-                Username
-              </label>
-              <input
-                type="text"
-                id="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200"
-                placeholder="Enter username"
-                required
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="password"
-                className="block text-sm font-medium text-gray-700 mb-2"
-              >
-                Password
-              </label>
-              <input
-                type="password"
-                id="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200"
-                placeholder="Enter password"
-                required
-              />
-            </div>
-
-            {error && (
-              <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                <p className="text-red-700 text-sm">{error}</p>
-              </div>
-            )}
-
-            <button
-              type="submit"
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300 transform hover:scale-105"
-            >
-              Access Device Data
-            </button>
-          </form>
-
-          <div className="mt-6 text-center">
-            <p className="text-xs text-gray-500">
-              This page provides offline access to device information when
-              scanned from the device QR code.
-            </p>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
@@ -263,16 +241,12 @@ export default function QRDevicePage() {
             <div className="flex items-center gap-4">
               <div className="text-right">
                 <p className="text-sm text-gray-500">Accessed via QR Code</p>
-                <p className="text-xs text-gray-400">
-                  {new Date().toLocaleString()}
-                </p>
+                {accessTime && (
+                  <p className="text-xs text-gray-400">
+                    {accessTime}
+                  </p>
+                )}
               </div>
-              <button
-                onClick={() => setIsAuthenticated(false)}
-                className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg transition-colors"
-              >
-                Logout
-              </button>
             </div>
           </div>
         </div>
@@ -305,7 +279,7 @@ export default function QRDevicePage() {
               <h2 className="text-xl font-bold text-gray-900 mb-4">
                 Device Information
               </h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="bg-gray-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Device Name</p>
                   <p className="font-semibold text-gray-900">
@@ -313,10 +287,21 @@ export default function QRDevicePage() {
                   </p>
                 </div>
                 <div className="bg-gray-50 p-4 rounded-lg">
+                  <p className="text-sm text-gray-600">Reference Code</p>
+                  <p className="font-semibold text-gray-900 font-mono">
+                    {deviceData.details.referenceCode || "Not Set"}
+                  </p>
+                </div>
+                <div className="bg-gray-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Set Location</p>
                   <p className="font-semibold text-gray-900">
-                    {deviceData.details.setLocation || "Not Set"}
+                    {setLocationText || deviceData.details.setLocation || "Not Set"}
                   </p>
+                  {setLocationText && deviceData.details.setLocation && (
+                    <p className="text-xs text-gray-500 mt-1">
+                      {deviceData.details.setLocation}
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
@@ -347,8 +332,13 @@ export default function QRDevicePage() {
                 <div className="bg-purple-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Current Location</p>
                   <p className="font-semibold text-purple-600">
-                    {deviceData.sensorData.currentLocation}
+                    {currentLocationText || deviceData.sensorData.currentLocation}
                   </p>
+                  {currentLocationText && deviceData.sensorData.currentLocation !== "No GPS Fix" && (
+                    <p className="text-xs text-purple-500 mt-1">
+                      {deviceData.sensorData.currentLocation}
+                    </p>
+                  )}
                 </div>
                 <div className="bg-orange-50 p-4 rounded-lg">
                   <p className="text-sm text-gray-600">Motion Status</p>

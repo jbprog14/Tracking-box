@@ -1,11 +1,20 @@
 /*
  * =====================================================================
- * MASTER SMS RECEIVER - DEBUG TOOL
+ * MASTER SMS RECEIVER - CONTROL HUB
  * =====================================================================
  * 
- * This sketch acts as a simple Master device that only receives and
- * displays SMS messages from any sender. It does not parse the
- * content or communicate with Firebase.
+ * ARCHITECTURE: Client → Master → Firebase → Master → Client
+ * 
+ * This Master device acts as the central control hub:
+ * 1. Receives sensor data from Client devices via SMS
+ * 2. Updates ALL data to Firebase database
+ * 3. Reads control states from Firebase (solenoid, dismissals)
+ * 4. Makes ALL control decisions (buzzer activation logic)
+ * 5. Sends control commands back to Client devices
+ * 
+ * The Client devices are "dumb" - they only:
+ * - Send sensor data to Master
+ * - Execute whatever the Master commands
  *
  * This is useful for debugging the SMS sending functionality of the
  * TrackingBoxMain.ino sketch.
@@ -60,10 +69,8 @@ const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 WiFiManager wifiManager;
 
 
-// ---------------------------------------------------------------------
-// DEBUG HELPER FOR FIREBASE ONLY
-// ---------------------------------------------------------------------
-const bool DEBUG_FB = true;
+// Debug helper for Firebase
+const bool DEBUG_FB = false;  // Set to true for Firebase debugging
 inline void DBG_FB(const String &msg) { if (DEBUG_FB) Serial.println(msg); }
 
 
@@ -93,6 +100,7 @@ void updateDismissAlert(const String &deviceId, bool dismissed);
 void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId);
 void updateActiveDevice(const String &deviceId, const String &phoneNumber, bool buzzerActive, bool buzzerDismissed, bool solenoidActive);
 void checkActiveDevicesForDismissal();
+void sendReferenceCodeToFirebase(const String &deviceId, const String &referenceCode);
 
 // =====================================================================
 // SETUP
@@ -283,16 +291,18 @@ void readSMS(int index) {
   tempDeviceId.replace("§", "_");
   tempDeviceId.replace("\xA7", "_");
   
-  // Send setLocation to slave first
-  Serial.println("\n📍 SENDING SETLOCATION TO SLAVE DEVICE...");
+  // Send device details to slave first
+  Serial.println("\n📍 SENDING DEVICE DETAILS TO SLAVE DEVICE...");
+  sendDeviceNameToDevice(phoneNumber, tempDeviceId);
+  delay(2000); // Give time for slave to receive and process
   sendSetLocationToDevice(phoneNumber, tempDeviceId);
   delay(3000); // Give time for slave to receive and process
   
   // Debug: Print each field
-  Serial.println("\n=== PARSING SMS DATA ===");
-  String debugTokens[16];
+  // Parsing SMS data
+  String debugTokens[18];  // Now 18 fields with reference code and security breach
   int debugStart = 0;
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < 18; i++) {
     int comma = smsBody.indexOf(',', debugStart);
     if (comma == -1) {
       debugTokens[i] = smsBody.substring(debugStart);
@@ -318,6 +328,8 @@ void readSMS(int index) {
   Serial.println("Accel Z: " + debugTokens[13] + "g");
   Serial.println("Battery: " + debugTokens[14] + "V");
   Serial.println("Wake reason: " + debugTokens[15]);
+  Serial.println("Reference Code: " + debugTokens[16]);
+  Serial.println("Security breach: " + String(debugTokens[17] == "1" ? "ACTIVE" : "CLEARED"));
   Serial.println("======================");
 
   // Convert CSV to JSON for Firebase
@@ -346,6 +358,12 @@ void readSMS(int index) {
   // Send solenoid state separately
   sendSolenoidToFirebase(deviceId, solenoidStateFromSMS == "1");
   
+  // Send reference code to Firebase details
+  String referenceCode = debugTokens[16];
+  if (referenceCode.length() > 0) {
+    sendReferenceCodeToFirebase(deviceId, referenceCode);
+  }
+  
   // Get setLocation from Firebase for geofencing info
   String setLocation = getSetLocationFromFirebase(deviceId);
   Serial.println("Set location: " + setLocation);
@@ -353,52 +371,162 @@ void readSMS(int index) {
   // GEOFENCING LOGIC - Determine if buzzer should be active
   bool shouldBuzzerBeActive = false;
   bool lidOpen = (debugTokens[9] == "0"); // Limit switch NOT pressed means lid is open
+  bool securityBreachActive = (debugTokens[17] == "1"); // Security breach flag from device
   float currentLat = debugTokens[4].toFloat();
   float currentLon = debugTokens[5].toFloat();
   
-  if (lidOpen) {
-    Serial.println("\n=== GEOFENCING CHECK ===");
-    Serial.println("Lid is OPEN - checking location...");
+  // If security breach is active (lid was opened at any point), check location first
+  if (securityBreachActive) {
+    
+    // Check if device is within safe zone
+    bool inSafeZone = false;
+    float distance = 0.0;
     
     if (currentLat != 0.0 && currentLon != 0.0 && setLocation.length() > 0) {
       float setLat, setLon;
       if (parseCoordinates(setLocation, setLat, setLon)) {
-        float distance = calculateDistance(currentLat, currentLon, setLat, setLon);
+        distance = calculateDistance(currentLat, currentLon, setLat, setLon);
         Serial.println("Current location: " + String(currentLat, 6) + ", " + String(currentLon, 6));
         Serial.println("Set location: " + String(setLat, 6) + ", " + String(setLon, 6));
         Serial.println("Distance: " + String(distance, 1) + " meters");
         
-        if (distance > 50.0) {
-          shouldBuzzerBeActive = true;
-          Serial.println("🚨 OUTSIDE SAFE ZONE - BUZZER SHOULD ACTIVATE!");
+        if (distance <= 100.0) {
+          inSafeZone = true;
+          Serial.println("✅ Device is WITHIN SAFE ZONE (100m)");
         } else {
-          Serial.println("✅ Within safe zone - buzzer remains off");
+          Serial.println("⚠️ Device is OUTSIDE SAFE ZONE!");
         }
+      } else {
+        Serial.println("❌ Failed to parse setLocation coordinates");
       }
     } else {
-      // If GPS not ready or no setLocation, activate buzzer as safety measure
+      Serial.println("❌ Cannot check safe zone:");
       if (currentLat == 0.0 || currentLon == 0.0) {
-        Serial.println("⚠️ GPS not ready - activating buzzer as safety measure");
-        shouldBuzzerBeActive = true;
+        Serial.println("   - No valid GPS fix (lat=" + String(currentLat) + ", lon=" + String(currentLon) + ")");
       }
       if (setLocation.length() == 0) {
-        Serial.println("⚠️ No setLocation defined - activating buzzer");
-        shouldBuzzerBeActive = true;
+        Serial.println("   - No setLocation configured in Firebase");
       }
     }
+    
+    // Only activate buzzer if device is outside safe zone
+    if (!inSafeZone) {
+      Serial.println("🚨 SECURITY BREACH DETECTED AND DEVICE OUTSIDE SAFE ZONE!");
+      Serial.println("🔔 BUZZER ACTIVATED!");
+      shouldBuzzerBeActive = true;
+    } else {
+      Serial.println("🔐 Security breach detected but device is within safe zone");
+      Serial.println("🔕 Buzzer NOT activated - device in safe zone");
+      shouldBuzzerBeActive = false;
+    }
+  } else if (lidOpen) {
+    // Lid is currently open but security breach not yet marked
+    Serial.println("Lid is OPEN - checking location before activating buzzer");
+    
+    // Check if device is in safe zone
+    bool inSafeZone = true;
+    float distance = 0.0;
+    
+    if (currentLat != 0.0 && currentLon != 0.0 && setLocation.length() > 0) {
+      float setLat, setLon;
+      if (parseCoordinates(setLocation, setLat, setLon)) {
+        distance = calculateDistance(currentLat, currentLon, setLat, setLon);
+        Serial.println("Distance from safe zone: " + String(distance, 1) + " meters");
+        
+        if (distance <= 100.0) {
+          Serial.println("✅ Device is WITHIN SAFE ZONE (100m)");
+        } else {
+          inSafeZone = false;
+          Serial.println("⚠️ Device is OUTSIDE SAFE ZONE!");
+        }
+      }
+    }
+    
+    // Only activate buzzer if outside safe zone
+    if (!inSafeZone) {
+      Serial.println("🔔 BUZZER ACTIVATED - lid open outside safe zone!");
+      shouldBuzzerBeActive = true;
+    } else {
+      Serial.println("🔕 Buzzer NOT activated - lid open within safe zone");
+      shouldBuzzerBeActive = false;
+    }
   } else {
-    Serial.println("Lid is CLOSED - buzzer not needed");
+    // Lid is closed - check if there's still an active security breach
+    if (securityBreachActive) {
+      
+      // Check if we should clear the security breach flag
+      // This happens when lid is closed AND device is back in safe zone
+      
+      // Check if device is back in safe zone
+      bool inSafeZone = true;
+      if (currentLat != 0.0 && currentLon != 0.0 && setLocation.length() > 0) {
+        float setLat, setLon;
+        if (parseCoordinates(setLocation, setLat, setLon)) {
+          float distance = calculateDistance(currentLat, currentLon, setLat, setLon);
+          Serial.println("Distance from safe zone: " + String(distance, 1) + " meters");
+          
+          if (distance > 100.0) {
+            inSafeZone = false;
+            Serial.println("❌ Device still outside safe zone - security breach remains active");
+          } else {
+            Serial.println("✅ Device is back in safe zone");
+          }
+        }
+      }
+      
+      // If device is secured (lid closed) and in safe zone, we can clear the breach
+      // Note: Master will send a command to clear the breach flag on the device
+      if (inSafeZone) {
+        Serial.println("✅ Security conditions met - breach will be cleared");
+        shouldBuzzerBeActive = false;  // Ensure buzzer is off when breach is cleared
+        // We'll send a special flag in the control command to clear the breach
+      } else {
+        // Device is still outside safe zone - keep buzzer active
+        Serial.println("🚨 BREACH PERSISTS - Device still outside safe zone!");
+        Serial.println("🔔 BUZZER REMAINS ACTIVE!");
+        shouldBuzzerBeActive = true;
+      }
+    } else {
+      // No security breach
+      Serial.println("✅ No security breach - all secure");
+      shouldBuzzerBeActive = false;
+    }
   }
   
-  // Update buzzer state in Firebase if it needs to change
-  if (shouldBuzzerBeActive) {
-    updateBuzzerInFirebase(deviceId, true);
+  // Update buzzer state in Firebase based on calculated state
+  updateBuzzerInFirebase(deviceId, shouldBuzzerBeActive);
+  Serial.println("📡 Updated Firebase buzzer state to: " + String(shouldBuzzerBeActive));
+  
+  // Track if we should clear the security breach
+  bool shouldClearSecurityBreach = false;
+  if (securityBreachActive && !lidOpen) {
+    // Check if device is back in safe zone
+    bool inSafeZone = true;
+    if (currentLat != 0.0 && currentLon != 0.0 && setLocation.length() > 0) {
+      float setLat, setLon;
+      if (parseCoordinates(setLocation, setLat, setLon)) {
+        float distance = calculateDistance(currentLat, currentLon, setLat, setLon);
+        if (distance > 100.0) {
+          inSafeZone = false;
+        }
+      }
+    }
+    if (inSafeZone) {
+      shouldClearSecurityBreach = true;
+    }
   }
   
   // Fetch and relay Firebase control states
-  Serial.println("\n=== FETCHING FIREBASE CONTROL STATES ===");
+  // Fetching Firebase control states
   
-  // 1. setLocation already fetched above, just send it to slave
+  // 1. Send device details to slave (name and location)
+  String deviceName = getDeviceNameFromFirebase(deviceId);
+  if (deviceName.length() > 0) {
+    Serial.println("📝 SENDING DEVICE NAME TO SLAVE: " + deviceName);
+    sendDeviceNameToDevice(phoneNumber, deviceId);
+    delay(2000);
+  }
+  
   if (setLocation.length() > 0) {
     Serial.println("📍 SENDING SETLOCATION TO SLAVE: " + setLocation);
     sendSetLocationToDevice(phoneNumber, deviceId);
@@ -430,36 +558,99 @@ void readSMS(int index) {
   
   // 3. Use calculated buzzer state (from geofencing logic above)
   bool buzzerState = shouldBuzzerBeActive;
-  Serial.println("🔔 BUZZER: " + String(buzzerState ? "ACTIVATE" : "OFF"));
+  // Preparing control command
+  Serial.println("🔔 BUZZER STATE CALCULATED: " + String(buzzerState ? "ACTIVATE" : "OFF"));
+  Serial.println("   shouldBuzzerBeActive = " + String(shouldBuzzerBeActive));
+  Serial.println("   securityBreachActive = " + String(securityBreachActive));
+  Serial.println("   lidOpen = " + String(lidOpen));
   
-  // 4. Get BUZZER DISMISSED state
-  String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
-  HTTPClient httpBuzzerDismissed;
-  httpBuzzerDismissed.begin(buzzerDismissedUrl);
-  int buzzerDismissedCode = httpBuzzerDismissed.GET();
+  // 4. Get BUZZER DISMISSED state - check BOTH paths
   bool buzzerDismissedState = false;
-  if (buzzerDismissedCode == 200) {
-    String buzzerDismissedResp = httpBuzzerDismissed.getString();
-    buzzerDismissedResp.replace("\"", "");
-    buzzerDismissedState = (buzzerDismissedResp == "true");
+  
+  // First check dismissAlert path (primary method from website)
+  String dismissAlertUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
+  HTTPClient httpDismissAlert;
+  httpDismissAlert.begin(dismissAlertUrl);
+  int dismissAlertCode = httpDismissAlert.GET();
+  if (dismissAlertCode == 200) {
+    String dismissAlertResp = httpDismissAlert.getString();
+    dismissAlertResp.replace("\"", "");
+    buzzerDismissedState = (dismissAlertResp == "true");
+    Serial.println("dismissAlert/dismissed = " + String(buzzerDismissedState));
   }
-  httpBuzzerDismissed.end();
+  httpDismissAlert.end();
+  
+  // Also check sensorData/buzzerDismissed as fallback
+  if (!buzzerDismissedState) {
+    String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+    HTTPClient httpBuzzerDismissed;
+    httpBuzzerDismissed.begin(buzzerDismissedUrl);
+    int buzzerDismissedCode = httpBuzzerDismissed.GET();
+    if (buzzerDismissedCode == 200) {
+      String buzzerDismissedResp = httpBuzzerDismissed.getString();
+      buzzerDismissedResp.replace("\"", "");
+      buzzerDismissedState = (buzzerDismissedResp == "true");
+      Serial.println("sensorData/buzzerDismissed = " + String(buzzerDismissedState));
+    }
+    httpBuzzerDismissed.end();
+  }
+  
   Serial.println("🔕 BUZZER DISMISSED: " + String(buzzerDismissedState ? "YES" : "NO"));
   
-  // If buzzer is dismissed, override the buzzer state to OFF
+  // If buzzer is dismissed, check if we should respect it
   if (buzzerDismissedState && buzzerState) {
-    buzzerState = false;
-    Serial.println("🔕 Buzzer overridden to OFF due to dismissal");
+    Serial.println("⚠️ Buzzer dismissal flag is set, but buzzer should be active");
+    
+    // Check if this is a NEW breach (lid is currently open)
+    if (lidOpen && securityBreachActive) {
+      Serial.println("🚨 NEW BREACH DETECTED - Ignoring old dismissal!");
+      Serial.println("🚨 Clearing dismissal flags to allow buzzer activation");
+      
+      // Clear the dismissal flags
+      buzzerDismissedState = false;
+      updateDismissAlert(deviceId, false);
+      
+      // Also clear in sensorData
+      String clearUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+      HTTPClient httpClear;
+      httpClear.begin(clearUrl);
+      httpClear.addHeader("Content-Type", "application/json");
+      httpClear.PUT("false");
+      httpClear.end();
+      
+      // Keep buzzer active for new breach
+      Serial.println("🔔 Buzzer remains ACTIVE for new breach");
+    } else {
+      // This is an ongoing breach that was already dismissed
+      buzzerState = false;
+      Serial.println("🔕 Buzzer overridden to OFF due to dismissal");
+      Serial.println("   (Ongoing breach already acknowledged by user)");
+    }
   }
   
   // 5. Send control command to slave
+  // Format: CMD,buzzer,solenoid,dismiss,clearBreach
   String controlMsg = "CMD," + String(buzzerState ? "1" : "0") + "," + 
                       String(solenoidState ? "1" : "0") + "," +
-                      String(buzzerDismissedState ? "1" : "0");
+                      String(buzzerDismissedState ? "1" : "0") + "," +
+                      String(shouldClearSecurityBreach ? "1" : "0");
   
-  Serial.println("\n📨 SENDING TO SLAVE: " + controlMsg);
+  Serial.println("\n📨 FINAL CONTROL COMMAND TO SLAVE: " + controlMsg);
+  Serial.println("   Buzzer: " + String(buzzerState ? "ON" : "OFF"));
+  Serial.println("   Solenoid: " + String(solenoidState ? "ON" : "OFF"));
+  Serial.println("   Dismissed: " + String(buzzerDismissedState ? "YES" : "NO"));
+  if (shouldClearSecurityBreach) {
+    Serial.println("   🔓 Clear Security Breach: YES");
+  }
   delay(2000);
   sendControlSMS(phoneNumber, controlMsg);
+  
+  // If solenoid was activated, reset it in Firebase after sending command
+  // This prevents repeated activation commands
+  if (solenoidState) {
+    Serial.println("🔐 Resetting solenoid state in Firebase after sending command");
+    sendSolenoidToFirebase(deviceId, false);
+  }
   
   // Always track devices that communicate with us
   updateActiveDevice(deviceId, phoneNumber, buzzerState, buzzerDismissedState, solenoidState);
@@ -494,7 +685,7 @@ String extractSMSContent(const String &resp) {
 
 // Converts CSV string from TrackingBoxMain to Firebase-ready JSON
 String csvToFirebaseJson(const String &csv) {
-  const int FIELD_COUNT = 16;  // Updated to 16 fields
+  const int FIELD_COUNT = 18;  // Updated to 18 fields (includes reference code and security breach)
   String tokens[FIELD_COUNT];
   int start = 0;
   for (int i = 0; i < FIELD_COUNT; i++) {
@@ -580,7 +771,10 @@ String csvToFirebaseJson(const String &csv) {
   json += "\"usingCGPS\":true,";
   
   // Wake up reason
-  json += "\"wakeUpReason\":\"" + tokens[15] + "\"";
+  json += "\"wakeUpReason\":\"" + tokens[15] + "\",";
+  
+  // Security breach active
+  json += "\"securityBreachActive\":" + String(tokens[17] == "1" ? "true" : "false");
   
   json += "}";
   return json;
@@ -788,6 +982,30 @@ void sendSolenoidToFirebase(const String &deviceId, bool state) {
   http.end();
 }
 
+// Send reference code to Firebase details
+void sendReferenceCodeToFirebase(const String &deviceId, const String &referenceCode) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_FB("✗ Cannot send reference code – WiFi unavailable");
+    return;
+  }
+  
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/details/referenceCode.json?auth=" + FIREBASE_AUTH;
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  String payload = "\"" + referenceCode + "\"";
+  DBG_FB("Sending reference code: " + payload + " to: " + url);
+  
+  int code = http.PUT(payload);
+  if (code > 0 && code < 400) {
+    DBG_FB("✓ Firebase reference code PUT success, code " + String(code));
+  } else {
+    DBG_FB("✗ Firebase reference code PUT failed, code " + String(code));
+  }
+  http.end();
+}
+
 // ---------------------------------------------------------------------
 // SMS MEMORY CLEANUP
 // ---------------------------------------------------------------------
@@ -911,6 +1129,7 @@ void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive) {
 }
 
 
+
 // Update dismissAlert in Firebase
 void updateDismissAlert(const String &deviceId, bool dismissed) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -942,6 +1161,92 @@ void updateDismissAlert(const String &deviceId, bool dismissed) {
 }
 
 
+
+// Get device name from Firebase
+String getDeviceNameFromFirebase(const String &deviceId) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_FB("✗ Cannot get device name – WiFi unavailable");
+    return "";
+  }
+  
+  String url = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/details/name.json?auth=" + FIREBASE_AUTH;
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  String deviceName = "";
+  
+  if (code == 200) {
+    deviceName = http.getString();
+    DBG_FB("Raw device name from Firebase: " + deviceName);
+    deviceName.replace("\"", "");
+    deviceName.trim();
+    DBG_FB("Cleaned device name: " + deviceName);
+  } else {
+    DBG_FB("Failed to get device name, HTTP code: " + String(code));
+  }
+  http.end();
+  
+  return deviceName;
+}
+
+// Send device name to device via SMS
+void sendDeviceNameToDevice(const String &phoneNumber, const String &deviceId) {
+  // Get device name from Firebase
+  String deviceName = getDeviceNameFromFirebase(deviceId);
+  
+  if (deviceName.length() == 0) {
+    DBG_FB("No device name found for " + deviceId);
+    return;
+  }
+  
+  // Format message: SETNAME,deviceId,name
+  String message = "SETNAME," + deviceId + "," + deviceName;
+  
+  DBG_FB("Sending device name SMS to " + phoneNumber + ": " + message);
+  
+  // Send SMS
+  sendAT("AT+CMGF=1", 500);
+  sendAT("AT+CSCS=\"GSM\"", 500);
+  
+  sim7600.print("AT+CMGS=\"");
+  sim7600.print(phoneNumber);
+  sim7600.println("\"");
+  delay(1000);
+  
+  // Wait for prompt
+  unsigned long timeout = millis() + 10000;
+  bool promptFound = false;
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      char c = sim7600.read();
+      if (c == '>') {
+        promptFound = true;
+        break;
+      }
+    }
+  }
+  
+  if (!promptFound) {
+    DBG_FB("❌ Failed to get SMS prompt for device name");
+    return;
+  }
+  
+  // Send message content
+  sim7600.print(message);
+  delay(500);
+  
+  // Send Ctrl+Z
+  sim7600.write(26);
+  delay(3000);
+  
+  // Check response
+  String response = readModem();
+  if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
+    DBG_FB("✓ Device name SMS sent successfully");
+  } else {
+    DBG_FB("❌ Failed to send device name SMS");
+  }
+}
 
 // Send setLocation to device via SMS
 void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId) {
@@ -1057,18 +1362,36 @@ void checkActiveDevicesForDismissal() {
     
     // 1. Check buzzerDismissed state from Firebase (only if buzzer is active)
     if (activeDevices[i].buzzerActive) {
-      String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
-      HTTPClient httpBuzzerDismissed;
-      httpBuzzerDismissed.begin(buzzerDismissedUrl);
-      int buzzerDismissedCode = httpBuzzerDismissed.GET();
+      // First check the dismissAlert path (primary method from website)
+      String dismissAlertUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
+      HTTPClient httpDismissAlert;
+      httpDismissAlert.begin(dismissAlertUrl);
+      int dismissAlertCode = httpDismissAlert.GET();
       bool newDismissedState = false;
       
-      if (buzzerDismissedCode == 200) {
-        String buzzerDismissedResp = httpBuzzerDismissed.getString();
-        buzzerDismissedResp.replace("\"", "");
-        newDismissedState = (buzzerDismissedResp == "true");
+      if (dismissAlertCode == 200) {
+        String dismissAlertResp = httpDismissAlert.getString();
+        dismissAlertResp.replace("\"", "");
+        newDismissedState = (dismissAlertResp == "true");
+        DBG_FB("dismissAlert/dismissed = " + String(newDismissedState));
       }
-      httpBuzzerDismissed.end();
+      httpDismissAlert.end();
+      
+      // Also check sensorData/buzzerDismissed as fallback
+      if (!newDismissedState) {
+        String buzzerDismissedUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/sensorData/buzzerDismissed.json?auth=" + FIREBASE_AUTH;
+        HTTPClient httpBuzzerDismissed;
+        httpBuzzerDismissed.begin(buzzerDismissedUrl);
+        int buzzerDismissedCode = httpBuzzerDismissed.GET();
+        
+        if (buzzerDismissedCode == 200) {
+          String buzzerDismissedResp = httpBuzzerDismissed.getString();
+          buzzerDismissedResp.replace("\"", "");
+          newDismissedState = (buzzerDismissedResp == "true");
+          DBG_FB("sensorData/buzzerDismissed = " + String(newDismissedState));
+        }
+        httpBuzzerDismissed.end();
+      }
       
       // Check if dismissed state has changed
       if (newDismissedState != currentBuzzerDismissed) {
@@ -1114,11 +1437,18 @@ void checkActiveDevicesForDismissal() {
     
     // 3. Send updated control command if any state changed
     if (needsUpdate) {
+      // For periodic checks, we don't clear security breach (that's only done when processing SMS)
       String controlMsg = "CMD," + String(currentBuzzerState ? "1" : "0") + "," + 
                           String(currentSolenoidState ? "1" : "0") + "," +
-                          String(currentBuzzerDismissed ? "1" : "0");
+                          String(currentBuzzerDismissed ? "1" : "0") + ",0";
       DBG_FB("📨 Sending updated control to " + activeDevices[i].phoneNumber + ": " + controlMsg);
       sendControlSMS(activeDevices[i].phoneNumber, controlMsg);
+      
+      // If solenoid was activated, reset it in Firebase after sending command
+      if (currentSolenoidState && !activeDevices[i].solenoidActive) {
+        DBG_FB("🔐 Resetting solenoid state in Firebase after sending activation command");
+        sendSolenoidToFirebase(deviceId, false);
+      }
       
       // Update our tracking
       activeDevices[i].buzzerActive = currentBuzzerState;

@@ -13,6 +13,7 @@ interface TrackingBoxDetails {
   setLocation: string; // coordinates
   setLocationLabel?: string; // human-friendly address
   description?: string;
+  referenceCode?: string; // Unique 10-character reference code
 }
 
 interface SensorData {
@@ -47,6 +48,7 @@ interface TrackingBox {
 interface TrackingData {
   [key: string]: TrackingBox;
 }
+
 
 export default function Home() {
   const [username, setUsername] = useState("");
@@ -183,6 +185,7 @@ export default function Home() {
     prevTrackingDataRef.current = trackingData;
   });
 
+
   useEffect(() => {
     const trackingBoxRef = ref(db, "tracking_box");
 
@@ -206,6 +209,7 @@ export default function Home() {
                     setLocation: box.details?.setLocation || "",
                     setLocationLabel: box.details?.setLocationLabel || "",
                     description: box.details?.description || "",
+                    referenceCode: box.details?.referenceCode || "",
                   },
                   sensorData: {
                     temp: box.sensorData?.temp || 0,
@@ -240,43 +244,28 @@ export default function Home() {
               const currentBox = validatedData[boxId];
               const prevBox = prevData ? prevData[boxId] : null;
 
-              // Check for delivery notification
-              const rawBox = rawData[boxId];
-              if (rawBox && rawBox.delivery) {
-                const delivery = rawBox.delivery;
-                const prevDelivery = prevData && prevData[boxId] && rawData[boxId] ? rawData[boxId].delivery : null;
+              // Check for motion detection wake up
+              if (currentBox && prevBox) {
+                const currentWakeReason = currentBox.sensorData.wakeUpReason || "";
+                const prevWakeReason = prevBox.sensorData.wakeUpReason || "";
                 
-                // Show toast if delivery is new or just updated
-                if (delivery.delivered && delivery.awaitingSolenoid && 
-                    (!prevDelivery || !prevDelivery.delivered)) {
-                  toast.success(
-                    (t) => (
-                      <div className="flex flex-col gap-2">
-                        <span className="font-bold text-lg">
-                          📦 PACKAGE DELIVERED!
-                        </span>
-                        <span>
-                          {currentBox.details.name || boxId} has been successfully delivered at the destination.
-                        </span>
-                        <span className="text-sm text-gray-600">
-                          Location: {delivery.deliveryLocation || currentBox.sensorData.currentLocation}
-                        </span>
-                        <span className="text-sm font-semibold text-green-700">
-                          Security lock is awaiting activation.
-                        </span>
-                        <button
-                          onClick={() => toast.dismiss(t.id)}
-                          className="mt-2 bg-green-600 text-white font-semibold py-1 px-2 rounded-md hover:bg-green-700 transition-colors"
-                        >
-                          OK
-                        </button>
-                      </div>
-                    ),
+                // Check if wake reason changed to motion detection
+                if (currentWakeReason.toLowerCase().includes("motion") && 
+                    !prevWakeReason.toLowerCase().includes("motion")) {
+                  toast(
+                    `🏃 Motion detected on ${currentBox.details.name || boxId}`,
                     {
-                      id: `delivery-toast-${boxId}`,
-                      duration: 10000, // Show for 10 seconds
+                      id: `motion-toast-${boxId}-${Date.now()}`,
+                      duration: 15000, // Changed from 5000ms (5 seconds) to 15000ms (15 seconds)
+                      position: "top-right",
                       style: {
-                        maxWidth: '400px',
+                        background: "#FEF3C7",
+                        color: "#92400E",
+                        border: "1px solid #F59E0B",
+                      },
+                      iconTheme: {
+                        primary: "#F59E0B",
+                        secondary: "#FFFFFF",
                       },
                     }
                   );
@@ -285,17 +274,15 @@ export default function Home() {
 
               const isNowCritical =
                 currentBox &&
-                !currentBox.sensorData.limitSwitchPressed &&
-                currentBox.sensorData.currentLocation !==
-                  currentBox.details.setLocation &&
-                currentBox.sensorData.buzzerIsActive;
+                currentBox.sensorData.securityBreachActive &&
+                currentBox.sensorData.buzzerIsActive &&
+                !currentBox.sensorData.buzzerDismissed;
 
               const wasPreviouslyCritical =
                 prevBox &&
-                !prevBox.sensorData.limitSwitchPressed &&
-                prevBox.sensorData.currentLocation !==
-                  prevBox.details.setLocation &&
-                prevBox.sensorData.buzzerIsActive;
+                prevBox.sensorData.securityBreachActive &&
+                prevBox.sensorData.buzzerIsActive &&
+                !prevBox.sensorData.buzzerDismissed;
 
               if (isNowCritical && !wasPreviouslyCritical) {
                 toast.error(
@@ -525,7 +512,8 @@ export default function Home() {
     boxId: string,
     coords: string,
     name: string,
-    label: string
+    label: string,
+    description: string
   ) => {
     try {
       const coordString = coords || (await forwardGeocode(label)) || label;
@@ -535,6 +523,7 @@ export default function Home() {
         setLocation: coordString,
         setLocationLabel: label,
         name: name,
+        description: description,
       });
 
       // Update local state as well
@@ -547,6 +536,7 @@ export default function Home() {
             setLocation: coordString,
             setLocationLabel: label,
             name: name,
+            description: description,
           },
         },
       }));
@@ -727,8 +717,13 @@ export default function Home() {
                     const item = trackingData[boxId];
                     return (
                       <tr key={boxId} className="hover:bg-gray-100">
-                        <td className="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-900">
-                          {boxId.toUpperCase()}
+                        <td className="px-6 py-2 whitespace-nowrap text-sm">
+                          <div className="flex flex-col">
+                            <span className="font-medium text-gray-900">{boxId.toUpperCase()}</span>
+                            {item.details.referenceCode && (
+                              <span className="text-xs text-gray-500 font-mono">[{item.details.referenceCode}]</span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-6 py-2 text-sm text-gray-500 max-w-xs">
                           <div className="whitespace-normal break-words">
@@ -805,6 +800,16 @@ export default function Home() {
             currentOwner={
               selectedEditBoxId
                 ? trackingData[selectedEditBoxId]?.details?.name || ""
+                : ""
+            }
+            currentDescription={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.description || ""
+                : ""
+            }
+            referenceCode={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.referenceCode || ""
                 : ""
             }
             onSave={handleSaveInfo}

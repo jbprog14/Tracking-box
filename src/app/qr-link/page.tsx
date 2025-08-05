@@ -4,7 +4,9 @@ import React from "react";
 import QRCode from "react-qr-code";
 
 const QRLinkPage = () => {
-  const url = "https://tracking-box.pages.dev/qr/box_001/";
+  // Default to box_001, but this could be made dynamic based on URL params or props
+  const deviceId = "box_001";
+  const url = `https://tracking-box.vercel.app/qr/${deviceId}/`;
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center bg-gray-100 p-24">

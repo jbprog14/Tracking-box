@@ -1,8 +1,6 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { ref, update } from "firebase/database";
-import { db } from "@/app/firebase";
 import {
   Dialog,
   DialogContent,
@@ -18,10 +16,6 @@ import {
   Droplets,
   MapPin,
   Zap,
-  Edit3,
-  Save,
-  X,
-  FileText,
   Shield,
   AlertTriangle,
 } from "lucide-react";
@@ -83,10 +77,6 @@ export default function TrackingBoxModal({
   boxId,
   trackingData,
 }: TrackingBoxModalProps) {
-  const [isEditingDescription, setIsEditingDescription] = useState(false);
-  const [description, setDescription] = useState("");
-  const [originalDescription, setOriginalDescription] = useState("");
-
   // Realtime chart data state (keep last 30 points)
   const [chartData, setChartData] = useState<
     {
@@ -99,14 +89,6 @@ export default function TrackingBoxModal({
       accelZ: number;
     }[]
   >([]);
-
-  useEffect(() => {
-    if (isOpen && trackingData?.details) {
-      const desc = trackingData.details.description || "";
-      setDescription(desc);
-      setOriginalDescription(desc);
-    }
-  }, [trackingData, isOpen]);
 
   // Push new point whenever a new timestamp arrives
   useEffect(() => {
@@ -136,26 +118,6 @@ export default function TrackingBoxModal({
       return updated;
     });
   }, [trackingData?.sensorData.timestamp]);
-
-  const handleSaveDescription = async () => {
-    if (!boxId) return;
-
-    try {
-      const updates = {
-        [`tracking_box/${boxId}/details/description`]: description,
-      };
-      await update(ref(db), updates);
-      setOriginalDescription(description);
-      setIsEditingDescription(false);
-    } catch (error) {
-      console.error("Error updating description:", error);
-    }
-  };
-
-  const handleCancelEdit = () => {
-    setDescription(originalDescription);
-    setIsEditingDescription(false);
-  };
 
   if (!boxId || !trackingData) return null;
 
@@ -237,66 +199,6 @@ export default function TrackingBoxModal({
           </DialogHeader>
 
           <div className="p-6 space-y-6">
-            {/* Editable Description Section - Positioned at the top */}
-            <div className="bg-gradient-to-br from-slate-50 to-slate-100 rounded-xl p-6 border border-slate-200">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
-                  <FileText className="h-5 w-5" />
-                  Item Description
-                </h3>
-                {!isEditingDescription && (
-                  <button
-                    onClick={() => setIsEditingDescription(true)}
-                    className="flex items-center gap-2 px-3 py-1 text-sm bg-blue-500 text-white rounded-md hover:bg-blue-600 transition-colors"
-                  >
-                    <Edit3 className="h-4 w-4" />
-                    Edit
-                  </button>
-                )}
-              </div>
-
-              {isEditingDescription ? (
-                <div className="space-y-3">
-                  <textarea
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Add a description for this tracking box..."
-                    className="w-full min-h-[100px] p-3 border border-slate-300 rounded-lg resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    maxLength={500}
-                  />
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-500">
-                      {description.length}/500 characters
-                    </span>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={handleCancelEdit}
-                        className="flex items-center gap-2 px-3 py-1 text-sm bg-slate-500 text-white rounded-md hover:bg-slate-600 transition-colors"
-                      >
-                        <X className="h-4 w-4" />
-                        Cancel
-                      </button>
-                      <button
-                        onClick={handleSaveDescription}
-                        className="flex items-center gap-2 px-3 py-1 text-sm bg-green-500 text-white rounded-md hover:bg-green-600 transition-colors"
-                      >
-                        <Save className="h-4 w-4" />
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="text-slate-700">
-                  {description || (
-                    <span className="text-slate-400 italic">
-                      No description set. Click &apos;Edit&apos; to add one.
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-
             {/* Info Cards */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               {/* Temperature */}
@@ -357,6 +259,18 @@ export default function TrackingBoxModal({
                   <MapPin className="h-5 w-5 text-blue-600" />
                   Location Details
                 </h3>
+                <div className="flex items-center gap-4 mb-3 text-sm">
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 bg-blue-500 rounded-full"></div>
+                    <span className="text-gray-600">Drop-off Location</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 bg-red-500 rounded-full"></div>
+                    <span className="text-gray-600">
+                      Current Package Location
+                    </span>
+                  </div>
+                </div>
                 <div className="h-[400px] rounded-lg overflow-hidden">
                   <TrackingBoxMap
                     setLocation={deviceDetails.setLocation}

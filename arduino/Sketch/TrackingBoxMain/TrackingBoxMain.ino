@@ -1,34 +1,27 @@
 /*
  * =====================================================================
- * TRACKING BOX DEVICE - FINALIZED FIRMWARE WITH SMS FALLBACK
+ * TRACKING BOX DEVICE - SMS-ONLY FIRMWARE
  * =====================================================================
  * 
  * This sketch implements a streamlined, single-cycle operation for the
- * tracking device with simplified communication fallback system.
+ * tracking device using SMS communication exclusively.
  * 
  * On every wake-up, it performs the following:
  * 1. Initialize all hardware.
  * 2. Gather a full set of sensor readings.
- * 3. Attempt communication via WiFi → Cellular → SMS (fallback chain)
- * 4. Send sensor data using the first available communication method.
- * 5. Fetch the latest device details from Firebase (WiFi/Cellular only).
- * 6. Update the E-Ink display with all data.
- * 7. Enter deep sleep until next wake trigger.
+ * 3. Send sensor data via SMS to Master device.
+ * 4. Check for control commands from Master via SMS.
+ * 5. Update the E-Ink display with all data.
+ * 6. Enter deep sleep until next wake trigger.
  * 
- * COMMUNICATION FALLBACK CHAIN:
- * 1. WiFi + Firebase (Preferred - full functionality)
- * 2. SMS to Master Device (Fallback when WiFi fails)
- * 3. Offline mode with QR code (No connectivity available)
- * 
- * SMS SLAVE MODE:
- * When WiFi connection fails, the device acts as a "Slave" and sends
- * compiled sensor data via SMS to a Master device for Firebase forwarding.
+ * SMS COMMUNICATION:
+ * The device operates as a "Slave" and sends compiled sensor data via
+ * SMS to a Master device for Firebase forwarding.
  * SMS format: comma-separated values matching Firebase schema.
  * 
  * CELLULAR LOCATION SERVICES:
  * SIM7600 cellular module is used for GNSS/GPS tracking and CLBS (Cell Location
- * Based Services) as a fallback when GPS signal is unavailable, but cellular
- * data transmission has been removed in favor of SMS communication.
+ * Based Services) as a fallback when GPS signal is unavailable.
  * 
  * The device wakes from deep sleep based on three triggers:
  * - A 15-minute timer.
@@ -38,23 +31,20 @@
  * =====================================================================
  */
 
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
 #include <Adafruit_LSM6DSL.h>
+#include <Preferences.h>  // For permanent storage
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "DEV_Config.h"
 #include "EPD.h"
 #include "GUI_Paint.h"
-#include "qrcode.h"   // NEW – small QR code generator
+#include "qrcode.h"   // QR code generator for display
 #include <math.h>  // for haversine
-// Note: TinyGSM includes removed as cellular data transmission is no longer used
 // Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
-#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
 #define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
 
 // =====================================================================
@@ -98,28 +88,25 @@
 #define FALL_THRESHOLD_MAGNITUDE    1.1  // g – CHANGE in accel magnitude to trigger a shock event
 
 // =====================================================================
-// NETWORK & FIREBASE CONFIGURATION
+// DEVICE & SMS CONFIGURATION
 // =====================================================================
-const char* FIREBASE_HOST = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* FIREBASE_AUTH = "AIzaSyBQje281bPAt7MiJdK94ru1irAU8i3luzY";
 const String DEVICE_ID = "box_001";
 
-// WiFiManager instance
-WiFiManager wifiManager;
-
-// SMS FALLBACK CONFIGURATION
+// SMS CONFIGURATION
 // Configure the phone number of the Master device that will receive SMS
-// and forward data to Firebase when WiFi/Cellular connections fail
+// and forward data to Firebase
 const String MASTER_PHONE_NUMBER = "+639184652918"; // SMS Master device phone number
 
 // =====================================================================
 // GLOBAL OBJECTS & VARIABLES
 // =====================================================================
+volatile bool limitSwitchTriggered = false;  // Flag for interrupt handler
 #if ENABLE_SHT30_SENSOR
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
 HardwareSerial sim7600(1);
+Preferences preferences;  // For permanent storage
 // Note: TinyGSM objects removed as cellular data transmission is no longer used
 // SIM7600 module is still used for GNSS/GPS and CLBS location services
 uint8_t lsm6dsl_address = 0x6A;
@@ -147,12 +134,17 @@ RTC_DATA_ATTR bool rtcBuzzerDismissed = false;
 RTC_DATA_ATTR bool rtcSolenoidActive = false;
 RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
 
+// RTC memory for security breach tracking
+RTC_DATA_ATTR bool rtcSecurityBreachDetected = false;  // Tracks if limit switch was ever breached
+
 // RTC memory for SMS cleanup timing
 RTC_DATA_ATTR uint32_t rtcSMSCleanupCounter = 0;
 
-// SMS cleanup timing
-unsigned long lastSMSCleanup = 0;
-const unsigned long SMS_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutes in milliseconds
+// RTC memory for unique reference code
+RTC_DATA_ATTR char rtcReferenceCode[11] = ""; // 10 chars + null terminator
+RTC_DATA_ATTR bool rtcReferenceCodeGenerated = false;
+
+// SMS cleanup timing removed - now handled based on storage usage before deep sleep
 
 // --------------------------------------------------------------
 // GEO HELPERS
@@ -266,15 +258,26 @@ struct TrackerData {
   bool buzzerIsActive = false;
   bool buzzerDismissed = false;
   bool solenoidActive = false; // NEW: current requested state from Firebase
+  bool securityBreachActive = false;  // Tracks if security has been breached (limit switch opened)
   uint32_t bootCount = 0;   // number of wake-ups since power-on
   bool coarseFix = false;   // true if only CLBS/IP based fix available
+  String referenceCode = "";  // Unique 10-character reference code
 };
 
 TrackerData currentData;
 
 // Flag to request a restart after solenoid operation completes
 bool restartAfterSolenoid = false;
-bool awaitSolenoid = false; // lid open within safe zone waiting for lock release
+
+// =====================================================================
+// INTERRUPT HANDLER
+// =====================================================================
+// Interrupt handler for limit switch - triggers immediate reset
+void IRAM_ATTR limitSwitchISR() {
+  limitSwitchTriggered = true;
+  // Force immediate restart when limit switch is triggered
+  ESP.restart();
+}
 
 // Forward declaration
 void determineWakeUpReason();
@@ -286,7 +289,8 @@ String formatSensorDataForSMS(const TrackerData &data);
 void checkForControlSMS();
 void parseControlSMS(String smsContent);
 void cleanupSMSMemory();
-void notifyPackageDelivery();
+bool isSMSMemoryNearlyFull();
+void generateReferenceCode();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -294,217 +298,162 @@ void notifyPackageDelivery();
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n===== WAKING UP =====");
-
-  // Optional: Reset WiFi settings - uncomment to force WiFi reconfiguration
-  // wifiManager.resetSettings();
+  Serial.println("WAKE");
 
   // Increment persistent boot counter
   rtcBootCount++;
   currentData.bootCount = rtcBootCount;
 
+  // Load or generate reference code from permanent storage
+  preferences.begin("tracking", false);  // Open in read/write mode
+  String storedRefCode = preferences.getString("refCode", "");
+  
+  if (storedRefCode.length() == 0) {
+    // No reference code exists in permanent storage, generate one
+    generateReferenceCode();
+    // Store it permanently
+    preferences.putString("refCode", String(rtcReferenceCode));
+    Serial.println("✓ Reference code saved to permanent storage");
+    Serial.println("⚠️ This reference code is PERMANENT and cannot be changed!");
+  } else {
+    // Load existing reference code from permanent storage
+    storedRefCode.toCharArray(rtcReferenceCode, sizeof(rtcReferenceCode));
+    rtcReferenceCodeGenerated = true;
+    Serial.println("✓ Loaded permanent reference code: " + storedRefCode);
+  }
+  preferences.end();
+  
+  currentData.referenceCode = String(rtcReferenceCode);
+
   determineWakeUpReason();
 
-  // Initialise sensors and peripherals early so wake-up sources remain active
+  // Initialize all hardware
   initializeAllHardware();
-
-  if (connectToWiFi()) {
-    Serial.println("✅ WiFi Connected.");
-    Serial.println("✅ Hardware Initialized.");
-    collectSensorReading();
-    Serial.println("✅ Sensor Readings Collected.");
-    fetchDeviceDetailsFromFirebase();
-    fetchBuzzerStateFromFirebase();
-    fetchSolenoidStateFromFirebase(); // NEW: read solenoid flag
-    evaluateLockBreach();
-    // If solenoid flag is set, activate the lock once
-    if (currentData.solenoidActive) {
-      activateSolenoidAndClearFlag();
-      restartAfterSolenoid = true; // request reboot after this cycle
-    }
-
-    // If lid is open in safe zone, wait for solenoid activation command
-    if (awaitSolenoid) {
-      waitForSolenoidActivation();
-    }
-    sendSensorDataToFirebase();
-    Serial.println("✅ Sensor Data Sent to Firebase.");
-
-    // --------------------------------------------------------------
-    // If buzzer alarm is active, wait for dismissal BEFORE refreshing
-    // the power-hungry E-Ink display. This keeps the device responsive.
-    // --------------------------------------------------------------
-    if (currentData.buzzerIsActive) {
-      handleBuzzerMonitoring();
-    }
-
-    // Only refresh the display when no alarm is sounding, not waiting for
-    // solenoid.
-    if (!currentData.buzzerIsActive && !awaitSolenoid) {
-      updateDisplay();
-    }
-
-    if (!currentData.buzzerIsActive) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-    }
-    // -------------------------------------------------------------
-    // If solenoid cycle finished, restart instead of deep sleep
-    // -------------------------------------------------------------
-    if (restartAfterSolenoid) {
-      Serial.println("Restarting MCU after solenoid activation …");
-      delay(500);
-      ESP.restart();
-    } else {
-      // Normal cycle end – enter deep sleep until next wake trigger
-      Serial.println("Cycle complete → deep sleep (Wi-Fi mode).");
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
+  Serial.println("✅ Hardware Initialized.");
+  
+  // SMS cleanup has been moved to before deep sleep to preserve control messages from Master
+  
+  // Check for control SMS from Master (skip on first boot - no data sent yet)
+  if (rtcBootCount > 1) {
+    Serial.println("📨 Checking for pending control SMS from Master...");
+    delay(2000); // Small delay to ensure any pending SMS are received
+    checkForControlSMS();
   } else {
-    Serial.println("❌ WiFi connection failed. Attempting SMS fallback ...");
-    
-    // Initialize hardware
-    initializeAllHardware();
-    
-    // Clean up SMS memory every 10 minutes (excluding first boot)
-    // Since device wakes every 15 minutes, check if we've passed the 10-minute mark
-    // rtcBootCount > 1 ensures we skip cleanup on first boot
-    if (rtcBootCount > 1) {
-      // Calculate approximate elapsed time based on boot count and sleep cycles
-      // Each cycle is ~15 minutes, so after first boot:
-      // Boot 2 = 15 min, Boot 3 = 30 min, etc.
-      unsigned long elapsedMinutes = (rtcBootCount - 1) * 15;
-      
-      // Clean up every 10 minutes (approximately every cycle after first)
-      if (elapsedMinutes >= 10) {
-        Serial.println("🧹 Cleaning up SMS memory (10+ minutes since boot)");
-        cleanupSMSMemory();
-        lastSMSCleanup = millis();
-      }
-    }
-    
-    // Check for control SMS from Master (skip on first boot - no data sent yet)
-    if (rtcBootCount > 1) {
-      Serial.println("📨 Checking for pending control SMS from Master...");
-      delay(2000); // Small delay to ensure any pending SMS are received
-      checkForControlSMS();
-    } else {
-      Serial.println("📨 Skipping SMS check on first boot");
-    }
-    
-    // Restore device details from RTC memory if available
-    if (rtcDeviceDetailsValid) {
-      currentData.deviceName = String(rtcDeviceName);
-      currentData.deviceSetLocation = String(rtcDeviceSetLocation);
-      Serial.println("✓ Restored device details from RTC memory:");
-      Serial.println("  Device name: " + currentData.deviceName);
-      Serial.println("  Set location: " + currentData.deviceSetLocation);
-    } else {
-      Serial.println("⚠️ No device details in RTC memory - using defaults");
-    }
-    
-    // Collect sensor data for SMS transmission
-    collectSensorReading();
-    
-    // In SMS mode, we don't evaluate lock breach - Master decides everything
-    // Just collect sensor data and send to Master
-    
-    // Attempt to send data via SMS
-    if (sendSensorDataViaSMS()) {
-      Serial.println("✅ Sensor data sent via SMS to Master device.");
-      
-      // CRITICAL: If buzzer OR solenoid is active, DO NOT SLEEP
-      if (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
-        Serial.println("\n⚠️ ACTIVE CONTROL - STAYING AWAKE");
-        
-        if (currentData.buzzerIsActive || rtcBuzzerActive) {
-          Serial.println("🚨 BUZZER ACTIVE - monitoring for dismiss");
-        }
-        if (currentData.solenoidActive || rtcSolenoidActive) {
-          Serial.println("🔓 SOLENOID ACTIVE - running lock cycle");
-        }
-        
-        // Keep monitoring while either is active
-        unsigned long lastCheck = millis();
-        const unsigned long CHECK_INTERVAL = 5000; // Check every 5 seconds
-        unsigned long solenoidRunTime = 0;
-        
-        // If solenoid just activated, record start time
-        if ((currentData.solenoidActive || rtcSolenoidActive) && rtcSolenoidStartTime == 0) {
-          rtcSolenoidStartTime = millis();
-          digitalWrite(SOLENOID_PIN, HIGH); // Activate solenoid
-          Serial.println("🔓 Solenoid activated at " + String(rtcSolenoidStartTime));
-        }
-        
-        // Display QR code immediately when entering active control mode
-        if (!rtcBuzzerActive && !rtcSolenoidActive) {
-          showOfflineQRCode();
-        }
-        
-        while (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
-          // Handle buzzer
-          if (currentData.buzzerIsActive || rtcBuzzerActive) {
-            digitalWrite(BUZZER_PIN, HIGH);
-          }
-          
-          // Handle solenoid (10-second activation)
-          if (currentData.solenoidActive || rtcSolenoidActive) {
-            solenoidRunTime = millis() - rtcSolenoidStartTime;
-            
-            if (solenoidRunTime >= 10000) { // 10 seconds elapsed
-              Serial.println("🔒 Solenoid deactivating after 10 seconds");
-              digitalWrite(SOLENOID_PIN, LOW);
-              currentData.solenoidActive = false;
-              rtcSolenoidActive = false;
-              rtcSolenoidStartTime = 0;
-              
-              // Notify Master that solenoid cycle is complete
-              // Master will update Firebase
-            } else {
-              // Keep solenoid active
-              digitalWrite(SOLENOID_PIN, HIGH);
-              Serial.println("🔓 Solenoid active for " + String(solenoidRunTime / 1000) + " seconds");
-            }
-          }
-          
-          // Check for new control commands
-          if (millis() - lastCheck >= CHECK_INTERVAL) {
-            lastCheck = millis();
-            Serial.println("📨 Checking for control commands...");
-            
-            // Check for control SMS from Master
-            checkForControlSMS();
-            
-            // If both are deactivated, exit loop
-            if (!currentData.buzzerIsActive && !rtcBuzzerActive && 
-                !currentData.solenoidActive && !rtcSolenoidActive) {
-              Serial.println("✅ All controls deactivated - preparing for sleep");
-              break;
-            }
-          }
-          
-          delay(100); // Small delay to prevent busy waiting
-        }
-      }
-      
-      // Update display with QR code to help users configure WiFi
-      showOfflineQRCode();
-      
-      Serial.println("Cycle complete → deep sleep (SMS mode).");
-    } else {
-      Serial.println("❌ SMS fallback also failed. All communication methods exhausted.");
-      showOfflineQRCode();
-      Serial.println("Cycle complete → deep sleep (offline mode).");
-    }
-    
-    // CRITICAL: Set buzzer to correct state before deep sleep
-    digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
-    
-    // Only sleep after buzzer is properly handled
-    prepareForDeepSleep();
-    esp_deep_sleep_start();
+    Serial.println("📨 Skipping SMS check on first boot");
   }
+  
+  // Restore device details from RTC memory if available
+  if (rtcDeviceDetailsValid) {
+    currentData.deviceName = String(rtcDeviceName);
+    currentData.deviceSetLocation = String(rtcDeviceSetLocation);
+    Serial.println("✓ Restored device details from RTC memory:");
+    Serial.println("  Device name: " + currentData.deviceName);
+    Serial.println("  Set location: " + currentData.deviceSetLocation);
+  } else {
+    Serial.println("⚠️ No device details in RTC memory - using defaults");
+  }
+  
+  // Collect sensor data for SMS transmission
+  collectSensorReading();
+  Serial.println("✅ Sensor Readings Collected.");
+  
+  // In SMS mode, we don't evaluate lock breach - Master decides everything
+  // Just collect sensor data and send to Master
+  
+  // Attempt to send data via SMS
+  if (sendSensorDataViaSMS()) {
+    Serial.println("✅ Sensor data sent via SMS to Master device.");
+    
+    // CRITICAL: If buzzer OR solenoid is active, DO NOT SLEEP
+    if (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
+      Serial.println("\n⚠️ ACTIVE CONTROL - STAYING AWAKE");
+      
+      if (currentData.buzzerIsActive || rtcBuzzerActive) {
+        Serial.println("🚨 BUZZER ACTIVE - monitoring for dismiss");
+      }
+      if (currentData.solenoidActive || rtcSolenoidActive) {
+        Serial.println("🔓 SOLENOID ACTIVE - running lock cycle");
+      }
+      
+      // Keep monitoring while either is active
+      unsigned long lastCheck = millis();
+      const unsigned long CHECK_INTERVAL = 5000; // Check every 5 seconds
+      unsigned long solenoidRunTime = 0;
+      
+      // If solenoid just activated, record start time
+      if ((currentData.solenoidActive || rtcSolenoidActive) && rtcSolenoidStartTime == 0) {
+        rtcSolenoidStartTime = millis();
+        digitalWrite(SOLENOID_PIN, HIGH); // Activate solenoid
+        Serial.println("🔓 Solenoid activated at " + String(rtcSolenoidStartTime));
+      }
+      
+      // Display QR code immediately when entering active control mode
+      if (!rtcBuzzerActive && !rtcSolenoidActive) {
+        showOfflineQRCode();
+      }
+      
+      while (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
+        // Handle buzzer
+        if (currentData.buzzerIsActive || rtcBuzzerActive) {
+          digitalWrite(BUZZER_PIN, HIGH);
+        }
+        
+        // Handle solenoid (60-second activation)
+        if (currentData.solenoidActive || rtcSolenoidActive) {
+          solenoidRunTime = millis() - rtcSolenoidStartTime;
+          
+          if (solenoidRunTime >= 60000) { // 60 seconds (1 minute) elapsed
+            Serial.println("🔒 Solenoid deactivating after 60 seconds");
+            digitalWrite(SOLENOID_PIN, LOW);
+            currentData.solenoidActive = false;
+            rtcSolenoidActive = false;
+            rtcSolenoidStartTime = 0;
+            
+            // Notify Master that solenoid cycle is complete
+            // Master will update Firebase
+          } else {
+            // Keep solenoid active
+            digitalWrite(SOLENOID_PIN, HIGH);
+            Serial.println("🔓 Solenoid active for " + String(solenoidRunTime / 1000) + " seconds");
+          }
+        }
+        
+        // Check for new control commands
+        if (millis() - lastCheck >= CHECK_INTERVAL) {
+          lastCheck = millis();
+          Serial.println("📨 Checking for control commands...");
+          
+          // Check for control SMS from Master
+          checkForControlSMS();
+          
+          // If both are deactivated, exit loop
+          if (!currentData.buzzerIsActive && !rtcBuzzerActive && 
+              !currentData.solenoidActive && !rtcSolenoidActive) {
+            Serial.println("✅ All controls deactivated - preparing for sleep");
+            break;
+          }
+        }
+        
+        delay(100); // Small delay to prevent busy waiting
+      }
+    }
+    
+    // Update display with QR code
+    showOfflineQRCode();
+    
+    Serial.println("Cycle complete → deep sleep (SMS mode).");
+  } else {
+    Serial.println("❌ SMS send failed. Operating in offline mode.");
+    showOfflineQRCode();
+    Serial.println("Cycle complete → deep sleep (offline mode).");
+  }
+  
+  // CRITICAL: Set buzzer to correct state before deep sleep
+  digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
+  
+  // Only sleep after buzzer is properly handled
+  prepareForDeepSleep();
+  esp_deep_sleep_start();
 }
 
 void loop() {
@@ -512,315 +461,20 @@ void loop() {
   // The device performs a single cycle in setup() and then deep sleeps.
 }
 
-void sendSensorDataToFirebase() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("✗ Cannot send data, WiFi not connected.");
-    return;
-  }
-
-  HTTPClient http;
-  // Use PUT to replace the sensorData node directly
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
-  // Create JSON document for the PUT request
-  DynamicJsonDocument doc(1024);
-  
-  time_t nowSec = time(nullptr);
-  uint64_t epochMs = (nowSec > 0 ? (uint64_t)nowSec * 1000ULL : (uint64_t)millis());
-  doc["timestamp"] = epochMs;
-  doc["bootCount"] = currentData.bootCount;
-  doc["temp"] = currentData.temperature;
-  doc["humidity"] = currentData.humidity;
-  doc["batteryVoltage"] = currentData.batteryVoltage;
-  doc["gpsFixValid"] = currentData.gpsFixValid;
-  doc["usingCGPS"] = currentData.usingCGPS; // NEW flag pushed to Firebase
-  doc["coarseFix"] = currentData.coarseFix;
-  doc["limitSwitchPressed"] = currentData.limitSwitchPressed;
-  doc["tiltDetected"] = currentData.tiltDetected;
-  doc["fallDetected"] = currentData.fallDetected;
-  doc["wakeUpReason"] = currentData.wakeUpReason;
-  doc["buzzerIsActive"] = currentData.buzzerIsActive;
-  
-  JsonObject accelerometer = doc.createNestedObject("accelerometer");
-  accelerometer["x"] = currentData.accelX;
-  accelerometer["y"] = currentData.accelY;
-  accelerometer["z"] = currentData.accelZ;
-  
-  if (currentData.gpsFixValid || currentData.coarseFix) {
-    JsonObject location = doc.createNestedObject("location");
-    location["lat"] = currentData.latitude;
-    location["lng"] = currentData.longitude;
-    location["alt"] = currentData.altitude;
-  }
-  
-  doc["currentLocation"] = currentData.currentLocation;
-  doc["coarseFix"] = currentData.coarseFix;
-
-  // Serialize JSON to string for sending
-  String jsonPayload;
-  serializeJson(doc, jsonPayload);
-  Serial.println("Sending to Firebase: " + jsonPayload);
-
-  // Send the PUT request
-  int httpResponseCode = http.PUT(jsonPayload);
-
-  if (httpResponseCode > 0) {
-    Serial.printf("✓ Firebase PUT successful, response code: %d\n", httpResponseCode);
-  } else {
-    Serial.printf("✗ Firebase PUT failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
-  }
-
-  http.end();
-}
-
-void fetchDeviceDetailsFromFirebase() {
-  HTTPClient http;
-  // Fetch only the 'details' node to be efficient
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/details.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  
-  int httpResponseCode = http.GET();
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String response = http.getString();
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, response);
-    
-    if (!error) {
-      currentData.deviceName = doc["name"] | "Unknown";
-      currentData.deviceSetLocation = doc["setLocation"] | "Unknown";
-      currentData.deviceSetLabel = doc["setLocationLabel"] | String("");
-      currentData.deviceDescription = doc["description"] | "No Description";
-      
-      // Store in RTC memory for SMS mode
-      strncpy(rtcDeviceName, currentData.deviceName.c_str(), sizeof(rtcDeviceName) - 1);
-      strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
-      rtcDeviceDetailsValid = true;
-      
-      Serial.println("✓ Fetched device details from Firebase.");
-      Serial.println("  Device name: " + currentData.deviceName);
-      Serial.println("  Set location: " + currentData.deviceSetLocation);
-    } else {
-      Serial.println("✗ Failed to parse device details JSON.");
-    }
-  } else {
-    Serial.printf("✗ Firebase details fetch failed, code: %d\n", httpResponseCode);
-  }
-  http.end();
-}
-
-void fetchBuzzerStateFromFirebase() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  // Fetch dismiss state from dismissAlert node
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  
-  int httpResponseCode = http.GET();
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String response = http.getString();
-    // Firebase returns a simple 'true' or 'false' for a boolean leaf, not a JSON object.
-    if (response == "true") {
-      currentData.buzzerDismissed = true;
-      Serial.println("✓ Buzzer state is DISMISSED (from dismissAlert).");
-    } else {
-      currentData.buzzerDismissed = false;
-      Serial.println("✓ Buzzer state is NOT dismissed (from dismissAlert).");
-    }
-  } else {
-    // If the fetch fails or the key doesn't exist, assume not dismissed.
-    currentData.buzzerDismissed = false;
-    Serial.println("⚠️ dismissAlert not found or fetch failed - assuming not dismissed.");
-  }
-  http.end();
-}
+// Firebase functions removed - SMS-only mode
 
 // ---------------------------------------------------------------------------
 // SOLENOID CONTROL
 // ---------------------------------------------------------------------------
-void fetchSolenoidStateFromFirebase() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/solenoid.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  int code = http.GET();
-  if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    currentData.solenoidActive = (payload == "true");
-  } else {
-    currentData.solenoidActive = false;
-  }
-  http.end();
-}
+// Solenoid state fetching removed - handled via SMS
 
-void activateSolenoidAndClearFlag() {
-  Serial.println("🔓 Activating solenoid lock …");
-  pinMode(SOLENOID_PIN, OUTPUT);
-  digitalWrite(SOLENOID_PIN, HIGH); // energise solenoid
-  delay(10000);                      // hold for 10 s (adjust as needed)
-  digitalWrite(SOLENOID_PIN, LOW);  // release
+// Solenoid activation removed - handled via SMS
 
-  // Clear the flag in Firebase so we don’t fire again next cycle
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/solenoid.json?auth=" + FIREBASE_AUTH;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    http.PUT("false");
-    http.end();
-  }
-  currentData.solenoidActive = false;
-  Serial.println("🔒 Solenoid cycle complete.");
-}
+// Lock breach evaluation removed - Master device handles all logic in SMS mode
 
-void evaluateLockBreach() {
-  // A lock breach occurs if the lid is open AND the device's physical location
-  // does not match its designated location from Firebase.
-  // Note: Limit switch is pressed (true) when the lid is CLOSED.
-  bool isLidOpen = !currentData.limitSwitchPressed;
-  
-  Serial.println("=== EVALUATING LOCK BREACH ===");
-  Serial.println("Lid status: " + String(isLidOpen ? "OPEN" : "CLOSED"));
-  Serial.println("Limit switch: " + String(currentData.limitSwitchPressed ? "PRESSED" : "NOT PRESSED"));
+// Buzzer monitoring removed - handled in main SMS loop
 
-  bool isWithinSafeZone = false; // assume outside safe zone until proven otherwise
-
-  // If we have a valid GPS fix and a parsable setLocation, compute distance
-  if (currentData.gpsFixValid && currentData.deviceSetLocation != "Unknown") {
-    double setLat, setLon;
-    Serial.println("GPS fix valid. Current location: " + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6));
-    Serial.println("Set location: " + currentData.deviceSetLocation);
-    
-    if (parseCoordPair(currentData.deviceSetLocation, setLat, setLon)) {
-      double distMeters = haversineMeters(currentData.latitude, currentData.longitude, setLat, setLon);
-      isWithinSafeZone = distMeters <= 50.0; // 50-m radius
-      Serial.printf("Distance to safe zone: %.1f m (threshold: 50m)\n", distMeters);
-      Serial.println("Within safe zone: " + String(isWithinSafeZone ? "YES" : "NO"));
-    } else {
-      Serial.println("Failed to parse set location coordinates!");
-    }
-  } else {
-    Serial.println("GPS fix not valid or setLocation unknown - assuming outside safe zone");
-  }
-
-  // Lock breach only happens when lid is open AND outside the safe zone
-  bool lockBreach = isLidOpen && !isWithinSafeZone;
-  Serial.println("Lock breach detected: " + String(lockBreach ? "YES" : "NO"));
-
-  // If lid is open but still within safe zone, we will await solenoid command
-  awaitSolenoid = isLidOpen && isWithinSafeZone;
-  
-  // Notify about package delivery when lid is opened within safe zone
-  static bool deliveryNotified = false;
-  if (awaitSolenoid && !deliveryNotified) {
-    Serial.println("📦 Package delivered! Lid open within safe zone - notifying Firebase");
-    notifyPackageDelivery();
-    deliveryNotified = true;
-  }
-  
-  // Reset notification flag when lid is closed
-  if (!isLidOpen) {
-    deliveryNotified = false;
-  }
-
-  // If a new breach is detected, but the device state has changed (lid reopened), 
-  // reset the dismissal flag
-  static bool lastLockBreachState = false;
-  if (lockBreach && !lastLockBreachState && currentData.buzzerDismissed) {
-    Serial.println("🔄 New lock breach detected (lid reopened). Resetting dismissal state.");
-    updateBuzzerStateInFirebase(false, false);
-    currentData.buzzerDismissed = false;
-  }
-  lastLockBreachState = lockBreach;
-  
-  // Activate the buzzer only if there is a breach and it has NOT been dismissed.
-  if (lockBreach && !currentData.buzzerDismissed) {
-    Serial.println("🚨 LOCK BREACH DETECTED!");
-    Serial.println("Activating buzzer...");
-    currentData.wakeUpReason   = "LOCK BREACH";
-    currentData.buzzerIsActive = true;
-    rtcBuzzerActive = true;  // Save to RTC memory
-    digitalWrite(BUZZER_PIN, HIGH);  // Sound buzzer continuously
-  } else {
-    // If no breach or already dismissed, ensure buzzer is off.
-    Serial.println("No lock breach OR already dismissed - buzzer OFF");
-    Serial.println("  Lock breach: " + String(lockBreach));
-    Serial.println("  Buzzer dismissed: " + String(currentData.buzzerDismissed));
-    Serial.println("  Within safe zone: " + String(isWithinSafeZone));
-    currentData.buzzerIsActive = false;
-    rtcBuzzerActive = false;  // Save to RTC memory
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-  Serial.println("=== END LOCK BREACH EVALUATION ===");
-}
-
-void handleBuzzerMonitoring() {
-  if (!currentData.buzzerIsActive) return;
-
-  Serial.println("🚨 LOCK BREACH active – monitoring Firebase for dismissal…");
-  unsigned long lastPoll = 0;
-  
-  // Stay in this loop as long as the buzzer is active, polling for dismissal
-  while (currentData.buzzerIsActive) {
-    // Keep buzzer sounding
-    digitalWrite(BUZZER_PIN, HIGH);
-    
-    if (millis() - lastPoll > 5000) { // Poll every 5 seconds
-      lastPoll = millis();
-      
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("📡 Checking Firebase for dismiss command...");
-        if (checkDismissCommand()) {
-          Serial.println("🔕 Dismiss command received – stopping buzzer.");
-          digitalWrite(BUZZER_PIN, LOW);
-          currentData.buzzerIsActive = false;
-          currentData.buzzerDismissed = true; // Flag that it was dismissed
-          rtcBuzzerActive = false;  // Save to RTC memory
-          rtcBuzzerDismissed = true;
-          
-          // Send final state update to Firebase before sleeping
-          updateBuzzerStateInFirebase(false, true);
-          break; // Exit monitoring loop and proceed to deep sleep
-        } else {
-          Serial.println("⏳ No dismiss command yet, continuing to monitor...");
-        }
-      } else {
-        // SMS mode - check for control commands from Master
-        Serial.println("📨 Checking for control commands...");
-        checkForControlSMS();
-        
-        // Check if buzzer was turned off by Master command
-        if (!currentData.buzzerIsActive || currentData.buzzerDismissed) {
-          Serial.println("🔕 Buzzer turned off by Master command.");
-          digitalWrite(BUZZER_PIN, LOW);
-          break; // Exit monitoring loop
-        }
-      }
-    }
-    delay(100); // Small delay to prevent busy-waiting
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Wait for solenoid activation when lid open in safe zone
-// ---------------------------------------------------------------------------
-void waitForSolenoidActivation() {
-  Serial.println("🔓 Lid open within safe distance – awaiting solenoid activation …");
-  unsigned long lastPoll = 0;
-  while (true) {
-    if (millis() - lastPoll > 5000) {
-      lastPoll = millis();
-      fetchSolenoidStateFromFirebase();
-      if (currentData.solenoidActive) {
-        activateSolenoidAndClearFlag();
-        restartAfterSolenoid = true;
-        break;
-      }
-    }
-    delay(100);
-  }
-}
+// Solenoid activation wait removed - handled by Master in SMS mode
 
 // =====================================================================
 // SENSOR READING FUNCTIONS
@@ -898,6 +552,32 @@ void collectSensorReading() {
 
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   currentData.limitSwitchPressed = !digitalRead(LIMIT_SWITCH_PIN);
+  
+  // Attach interrupt to limit switch for immediate wake/reset
+  // Trigger on FALLING edge (HIGH to LOW) when lid is opened
+  attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
+  
+  // Track security breach - once breached, it stays breached until physically resolved
+  if (!currentData.limitSwitchPressed) {
+    // Lid is open - security breach!
+    if (!rtcSecurityBreachDetected) {
+      rtcSecurityBreachDetected = true;
+      // When a new breach is detected, clear any previous dismissal
+      rtcBuzzerDismissed = false;
+      currentData.buzzerDismissed = false;
+      Serial.println("🚨 NEW SECURITY BREACH DETECTED - Lid opened!");
+      Serial.println("🚨 Clearing any previous dismissal flags");
+    }
+  } else {
+    // Lid is closed - check if we can clear the security breach
+    if (rtcSecurityBreachDetected) {
+      Serial.println("🔒 Lid is now closed, but security breach remains active until location is verified safe");
+      // Note: Security breach will only be cleared by Master when both:
+      // 1. Lid is closed (limitSwitchPressed = true)
+      // 2. Device is back in safe zone OR user dismisses the alert
+    }
+  }
+  currentData.securityBreachActive = rtcSecurityBreachDetected;
 
   if (currentData.gpsFixValid || currentData.coarseFix) {
     currentData.currentLocation = String(currentData.latitude, 4) + ", " + String(currentData.longitude, 4);
@@ -974,8 +654,8 @@ void readGPSLocation() {
 
   // Enable unsolicited CGPSINFO while we wait so we can observe sentences
   sendAT("AT+CGPSINFOCFG=1,31", 2000);
-  Serial.println("\nWaiting 30 seconds for GPS to get signal...");
-  delay(0.5 * 60 * 1000UL); // 30 seconds blocking to acquire fix
+  Serial.println("\nWaiting 10 seconds for GPS to get signal...");
+  delay(10 * 1000UL); // 30 seconds blocking to acquire fix
   sendAT("AT+CGPSINFOCFG=0,31", 2000);
   // Power-mode and NMEA configuration diagnostics
   sendAT("AT+CGPSPMD?", 2000);
@@ -1078,6 +758,9 @@ bool initializeAllHardware() {
     Serial.println("🔔 Restoring buzzer state: ON");
   }
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  // Attach interrupt for immediate wake/reset when limit switch is triggered
+  attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
+  
   pinMode(SOLENOID_PIN, OUTPUT); // Initialize solenoid pin
   digitalWrite(SOLENOID_PIN, LOW); // Ensure solenoid is off initially
 
@@ -1158,85 +841,8 @@ void writeLSM6DSLRegister(uint8_t reg, uint8_t value) {
 }
 
 // =====================================================================
-// WIFI & FIREBASE COMMUNICATION
+// SMS-ONLY COMMUNICATION - WiFi removed
 // =====================================================================
-bool connectToWiFi() {
-  // Stage 1: Try quick connection with saved credentials first
-  if (WiFi.SSID().length() > 0) {
-    Serial.println("Attempting quick WiFi connection to saved network: " + WiFi.SSID());
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(); // Uses saved SSID and password
-    
-    // Wait maximum 15 seconds for connection
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-    Serial.println();
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("✓ WiFi connected successfully");
-      Serial.println("IP Address: " + WiFi.localIP().toString());
-      
-      // Configure SNTP to get current epoch time
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      struct tm timeinfo;
-      for (uint8_t i = 0; i < 10; ++i) {   // wait up to ~5 s
-        if (getLocalTime(&timeinfo, 500)) break;
-      }
-      if (timeinfo.tm_year > 120) {
-        Serial.printf("✓ Time synced: %04d-%02d-%02d %02d:%02d\n",
-                      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-                      timeinfo.tm_hour, timeinfo.tm_min);
-      } else {
-        Serial.println("⚠ Time sync failed – falling back to millis()");
-      }
-      return true;
-    } else {
-      Serial.println("✗ Quick connection failed - saved network not available");
-    }
-  }
-  
-  // Stage 2: Use WiFiManager for new network configuration or if no saved credentials
-  Serial.println("Starting WiFiManager for network configuration...");
-  
-  // Set shorter timeouts for faster fallback
-  wifiManager.setConfigPortalTimeout(30); // 30 seconds for portal
-  wifiManager.setConnectTimeout(15); // 15 seconds for connection attempts
-  
-  // Set custom IP for configuration portal
-  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  
-  // Create client-specific AP name based on device ID
-  String apName = "Client-" + DEVICE_ID + "-Setup";
-  
-  // Try to connect or show configuration portal
-  if (wifiManager.autoConnect(apName.c_str())) {
-    Serial.println("✓ WiFi connected successfully via WiFiManager");
-    Serial.println("IP Address: " + WiFi.localIP().toString());
-
-    // Configure SNTP to get current epoch time
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    struct tm timeinfo;
-    for (uint8_t i = 0; i < 10; ++i) {   // wait up to ~5 s
-      if (getLocalTime(&timeinfo, 500)) break;
-    }
-    if (timeinfo.tm_year > 120) {
-      Serial.printf("✓ Time synced: %04d-%02d-%02d %02d:%02d\n",
-                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-                    timeinfo.tm_hour, timeinfo.tm_min);
-    } else {
-      Serial.println("⚠ Time sync failed – falling back to millis()");
-    }
-    return true;
-  } else {
-    Serial.println("");
-    Serial.println("✗ WiFi connection failed - falling back to SMS mode");
-    return false;
-  }
-}
 
 // ---------------------------------------------------------------------------
 void determineWakeUpReason() {
@@ -1358,18 +964,23 @@ double convertToDecimalDegrees(String coordinate, String direction) {
 void prepareForDeepSleep() {
   Serial.println("Configuring deep sleep triggers...");
 
+  // Check if SMS memory is nearly full and clean up if needed
+  if (isSMSMemoryNearlyFull()) {
+    Serial.println("⚠️ SMS memory is nearly full (>80%), cleaning up before sleep...");
+    cleanupSMSMemory();
+  } else {
+    Serial.println("✅ SMS memory has sufficient space, no cleanup needed");
+  }
+
   // Wake up on timer
   esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
-  Serial.println("  - Timer wakeup enabled for 15 minutes.");
 
   // Wake up on motion (LSM6DSL INT1 is on GPIO34)
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 1); // RTC_GPIO 0, wake on HIGH
-  Serial.println("  - Motion wakeup (EXT0) on GPIO 34 enabled.");
 
   // Wake up on limit switch (lid open - pin is LOW when open)
   uint64_t limitSwitchMask = 1ULL << LIMIT_SWITCH_PIN;
   esp_sleep_enable_ext1_wakeup(limitSwitchMask, ESP_EXT1_WAKEUP_ANY_HIGH); // should be ALL_LOW if switch pulls to gnd when open
-  Serial.println("  - Limit switch wakeup (EXT1) on GPIO 33 enabled.");
   
   // Isolate GPIO12 pin from external circuits during deep sleep to prevent flash issues.
   rtc_gpio_isolate(GPIO_NUM_12);
@@ -1380,14 +991,14 @@ void prepareForDeepSleep() {
 // E-PAPER DISPLAY – Waveshare 7.3" 800×400 (7-color) helper
 // =====================================================================
 void updateDisplay() {
-  Serial.println("Updating E-Ink display …");
+  Serial.println("Updating E-Ink display with combined layout...");
 
-  // Basic initialisation – safe to call each cycle
+  // Basic initialisation
   DEV_Module_Init();
   EPD_7IN3F_Init();
   EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
 
-  // Allocate a quarter-frame buffer (800×200) like the Waveshare demo
+  // Allocate a quarter-frame buffer (800×200)
   UBYTE *imgBuf;
   UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * (EPD_7IN3F_HEIGHT / 2);
   imgBuf = (UBYTE *)malloc(imgSize);
@@ -1402,218 +1013,128 @@ void updateDisplay() {
   Paint_Clear(EPD_7IN3F_WHITE);
 
   // ------------------------------
-  // Compose display content
+  // LEFT SIDE: Device Details (using smaller font)
   // ------------------------------
   uint16_t y = 5;  // Start Y-coord
-  const uint16_t lineGap = 28;
+  const uint16_t lineGap = 20;  // Reduced line gap for smaller font
+  const uint16_t leftMargin = 10;
+  const uint16_t leftWidth = 500;  // Use 500px for left side
 
-   // Details
-  Paint_DrawString_EN(10, y, String("DETAILS").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
-  y += lineGap + 6;
+  // Title
+  Paint_DrawString_EN(leftMargin, y, "TRACKING DETAILS", &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
+  y += lineGap + 5;
 
-  // Device name (large font)
+  // Reference Code (in bold/larger font)
   char buf[64];
-  snprintf(buf, sizeof(buf), "PACKAGE OWNER: %s", currentData.deviceName.c_str());
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  snprintf(buf, sizeof(buf), "TRACKING REFERENCE CODE: %s", currentData.referenceCode.c_str());
+  Paint_DrawString_EN(leftMargin, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLUE);
+  y += lineGap + 5;
+
+  // Owner
+  snprintf(buf, sizeof(buf), "Owner: %s", currentData.deviceName.c_str());
+  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   y += lineGap;
 
-  // Current Location
-  snprintf(buf, sizeof(buf), "CURRENT LOCATION: %s", currentData.currentLocation.c_str());
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
+  // Current Location (truncate if too long)
+  String currLoc = currentData.currentLocation;
+  if (currLoc.length() > 35) currLoc = currLoc.substring(0, 32) + "...";
+  snprintf(buf, sizeof(buf), "Current: %s", currLoc.c_str());
+  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   y += lineGap;
 
-  // Item Description
-  snprintf(buf, sizeof(buf), "DROP-OFF LOCATION: %s", currentData.deviceSetLocation.c_str());
-  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  y += lineGap;
+  // Drop-off Location (truncate if too long)
+  String dropLoc = currentData.deviceSetLocation;
+  if (dropLoc.length() > 35) dropLoc = dropLoc.substring(0, 32) + "...";
+  snprintf(buf, sizeof(buf), "Drop-off: %s", dropLoc.c_str());
+  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += lineGap * 2;  // Extra space since we removed sensor data
 
-
-  y += 6;
-
-  // Sensor Readings
-  Paint_DrawString_EN(10, y, String("PRIORITY MAIL | HANDLE WITH CARE").c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_RED );
-  y += lineGap + 10;
-
-  // // Temperature | Accel
-  // snprintf(buf, sizeof(buf), "TEMPERATURE: %.1fC | ACCELEROMETER: X=%.2fg  Y=%.2fg  Z=%.2fg", currentData.temperature, currentData.accelX, currentData.accelY, currentData.accelZ);
-  // Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  // y += lineGap;
-
-  // // Humidity | Battery
-  // snprintf(buf, sizeof(buf), "HUMIDITY: %.1f%% | BATTERY (V): %.2fV", currentData.humidity, currentData.batteryVoltage);
-  //  Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  //  y += lineGap;
-
-  // // wake-up reason
-  // snprintf(buf, sizeof(buf), "LAST WAKE-UP REASON: %s", currentData.wakeUpReason.c_str());
-  // Paint_DrawString_EN(10, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK );
-  // y += lineGap;
+  // Bottom message
+  Paint_DrawString_EN(leftMargin, y, "PRIORITY MAIL - HANDLE WITH CARE", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
 
   // ------------------------------
-  // Push buffer to display and sleep
+  // Draw vertical separator line
+  // ------------------------------
+  Paint_DrawLine(leftWidth, 0, leftWidth, 200, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
+
+  // ------------------------------
+  // RIGHT SIDE: QR Code
+  // ------------------------------
+  String dynamicUrl = "https://tracking-box.vercel.app/qr/" + DEVICE_ID + "/";
+  const char *url = dynamicUrl.c_str();
+  
+  // Generate QR code
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  QRCode qrcode;
+  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
+
+  // Position QR code in the right section
+  const int scale = 5;  // Slightly smaller to fit better
+  const int qrSize = qrcode.size;
+  const int qrPix = qrSize * scale;
+  const int rightSectionStart = leftWidth + 10;
+  const int rightSectionWidth = EPD_7IN3F_WIDTH - rightSectionStart;
+  const int qrOffsetX = rightSectionStart + (rightSectionWidth - qrPix) / 2;
+  const int qrOffsetY = 20;
+
+  // Draw QR code
+  for (int y = 0; y < qrSize; y++) {
+    for (int x = 0; x < qrSize; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        Paint_DrawRectangle(qrOffsetX + x * scale,
+                            qrOffsetY + y * scale,
+                            qrOffsetX + (x + 1) * scale,
+                            qrOffsetY + (y + 1) * scale,
+                            EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+      }
+    }
+  }
+
+  // QR code caption - centered under QR code
+  // Calculate text positions for centering
+  const char* scanText = "Scan for live tracking";
+  const char* urlText = "tracking-box.vercel.app";
+  
+  // Approximate character widths: Font12 ~7px, Font8 ~5px
+  int scanTextWidth = strlen(scanText) * 7;  // Font12 width estimation
+  int urlTextWidth = strlen(urlText) * 5;    // Font8 width estimation
+  
+  // Center the text under the QR code
+  int scanTextX = qrOffsetX + (qrPix - scanTextWidth) / 2;
+  int urlTextX = qrOffsetX + (qrPix - urlTextWidth) / 2;
+  
+  Paint_DrawString_EN(scanTextX, qrOffsetY + qrPix + 10,
+                      scanText, &Font12,
+                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  Paint_DrawString_EN(urlTextX, qrOffsetY + qrPix + 30,
+                      urlText, &Font8,
+                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+
+  // ------------------------------
+  // Push buffer to display
   // ------------------------------
   EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
   EPD_7IN3F_Sleep();
   free(imgBuf);
   imgBuf = nullptr;
 
-  Serial.println("✓ Display updated");
+  Serial.println("✓ Display updated with combined layout");
 }
 
 // ---------------------------------------------------------------------------
-// OFFLINE PAGE – render QR code to help user configure network
+// OFFLINE PAGE – Now just redirects to the combined display
 // ---------------------------------------------------------------------------
 void showOfflineQRCode() {
-  const char *url = "https://tracking-box.vercel.app/qr/box_001/";
-
-  // Generate QR (version-3 ⇒ 29×29)
-  uint8_t qrcodeData[qrcode_getBufferSize(3)];
-  QRCode qrcode;
-  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
-
-  // Init display
-  DEV_Module_Init();
-  EPD_7IN3F_Init();
-  EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
-
-  // Allocate half-height buffer (same as updateDisplay)
-  UBYTE *imgBuf;
-  UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * (EPD_7IN3F_HEIGHT / 2);
-  imgBuf = (UBYTE *)malloc(imgSize);
-  if (!imgBuf) return;
-
-  Paint_NewImage(imgBuf, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2, 0, EPD_7IN3F_WHITE);
-  Paint_SetScale(7);
-  Paint_SelectImage(imgBuf);
-  Paint_Clear(EPD_7IN3F_WHITE);
-
-  // Compute placement – center horizontally. Scale down so QR fits entirely within half-height buffer.
-  const int scale = 6;  // 29 modules * 6px = 174px (fits within 200px buffer)
-  const int qrSize = qrcode.size;
-  const int qrPix  = qrSize * scale;
-  const int offsetX = (EPD_7IN3F_WIDTH  - qrPix) / 2;
-  const int offsetY = 10; // top margin
-
-  for (int y = 0; y < qrSize; y++) {
-    for (int x = 0; x < qrSize; x++) {
-      if (qrcode_getModule(&qrcode, x, y)) {
-        Paint_DrawRectangle(offsetX + x * scale,
-                            offsetY + y * scale,
-                            offsetX + (x + 1) * scale,
-                            offsetY + (y + 1) * scale,
-                            EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-      }
-    }
-  }
-
-  // Caption beneath QR – center horizontally to align with QR
-  const char *caption = "Scan code to see package details: https://tracking-box.vercel.app/qr";
-  // Approximate character width for Font12 (7 px per char). Adjust if fonts differ.
-  int captionWidth = strlen(caption) * 7;
-  int captionX = (EPD_7IN3F_WIDTH - captionWidth) / 2;
-  if (captionX < 0) captionX = 0; // safety
-  Paint_DrawString_EN(captionX, offsetY + qrPix + 10,
-                       (char *)caption, &Font12,
-                       EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-
-  // Push to display
-  EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
-  EPD_7IN3F_Sleep();
-  free(imgBuf);
-  Serial.println("✓ Offline QR displayed");
+  // Since we're always in SMS mode, we always show the combined display
+  updateDisplay();
 }
 
 // =====================================================================
 // END OF TRACKING BOX MAIN FIRMWARE
 // ===================================================================== 
 
-bool checkDismissCommand() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi not connected, cannot check dismiss command");
-    return false;
-  }
-  HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert/dismissed.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  int code = http.GET();
-  Serial.println("🌐 Checking dismissAlert at: " + url);
-  if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    Serial.println("📥 Firebase response: " + payload);
-    http.end();
-    return payload == "true";
-  } else {
-    Serial.println("❌ HTTP error code: " + String(code));
-  }
-  http.end();
-  return false;
-}
-
-void updateBuzzerStateInFirebase(bool active, bool dismissed) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  
-  // Update buzzerIsActive in sensorData
-  HTTPClient httpSensor;
-  String sensorUrl = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/sensorData.json?auth=" + FIREBASE_AUTH;
-  httpSensor.begin(sensorUrl);
-  httpSensor.addHeader("Content-Type", "application/json");
-  DynamicJsonDocument sensorDoc(64);
-  sensorDoc["buzzerIsActive"] = active;
-  String sensorBody; 
-  serializeJson(sensorDoc, sensorBody);
-  httpSensor.PATCH(sensorBody);
-  httpSensor.end();
-  
-  // Update dismissAlert separately
-  HTTPClient httpDismiss;
-  String dismissUrl = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/dismissAlert.json?auth=" + FIREBASE_AUTH;
-  httpDismiss.begin(dismissUrl);
-  httpDismiss.addHeader("Content-Type", "application/json");
-  
-  // Create dismissAlert object with dismissed flag and timestamp
-  DynamicJsonDocument dismissDoc(128);
-  dismissDoc["dismissed"] = dismissed;
-  dismissDoc["timestamp"] = millis();
-  String dismissBody;
-  serializeJson(dismissDoc, dismissBody);
-  
-  httpDismiss.PUT(dismissBody);
-  httpDismiss.end();
-  
-  Serial.println("Updated Firebase - buzzerIsActive: " + String(active) + ", dismissed: " + String(dismissed));
-}
-
-// Notify Firebase about package delivery
-void notifyPackageDelivery() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠️ Cannot notify delivery - WiFi not connected");
-    return;
-  }
-  
-  HTTPClient http;
-  String url = String(FIREBASE_HOST) + "/tracking_box/" + DEVICE_ID + "/delivery.json?auth=" + FIREBASE_AUTH;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  
-  // Create delivery notification matching website format
-  DynamicJsonDocument doc(256);
-  doc["delivered"] = true;
-  doc["deliveryTime"] = millis();
-  doc["awaitingSolenoid"] = true;
-  doc["deliveryLocation"] = currentData.currentLocation;
-  doc["message"] = "Package delivered successfully. Security lock awaiting activation.";
-  
-  String body;
-  serializeJson(doc, body);
-  
-  int code = http.PUT(body);
-  if (code > 0 && code < 400) {
-    Serial.println("✓ Delivery notification sent to Firebase");
-  } else {
-    Serial.println("✗ Failed to send delivery notification, code: " + String(code));
-  }
-  http.end();
-}
+// Firebase functions removed - SMS-only mode
 
 // ---------------------------------------------------------------------------
 // CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
@@ -1624,19 +1145,14 @@ void notifyPackageDelivery() {
 // =====================================================================
 // SMS COMMUNICATION FUNCTIONS
 // =====================================================================
-// These functions implement the SMS fallback communication system.
-// When WiFi connection fails, the device sends sensor data via SMS
-// to a Master device that forwards it to Firebase.
-// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason"
+// These functions implement the SMS communication system.
+// The device sends sensor data via SMS to a Master device that forwards it to Firebase.
+// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason,referenceCode"
 // =====================================================================
 bool sendSensorDataViaSMS() {
   Serial.println("Attempting to send sensor data via SMS...");
   
-  // Check if it's time to clean up SMS memory
-  if (millis() - lastSMSCleanup > SMS_CLEANUP_INTERVAL) {
-    cleanupSMSMemory();
-    lastSMSCleanup = millis();
-  }
+  // SMS cleanup moved to before deep sleep to preserve control messages
   
   // Format and send sensor data matching MasterSMSToFirebase format
   String smsMessage = formatSensorDataForSMS(currentData);
@@ -1645,10 +1161,25 @@ bool sendSensorDataViaSMS() {
   bool success = sendSMS(MASTER_PHONE_NUMBER, smsMessage);
   
   if (success) {
-    // After sending, wait for control commands from Master
-    Serial.println("Waiting 15 seconds for updated control SMS from Master...");
-    delay(15000); // Give Master more time to process and respond
+    // After sending, check for control commands from Master multiple times
+    Serial.println("📱 Monitoring for control commands (3 checks, 5 seconds apart)...");
+    
+    // First check after 5 seconds
+    Serial.println("\n[Check 1/3]");
+    delay(5000);
     checkForControlSMS();
+    
+    // Second check after another 5 seconds
+    Serial.println("\n[Check 2/3]");
+    delay(5000);
+    checkForControlSMS();
+    
+    // Third check after another 5 seconds
+    Serial.println("\n[Check 3/3]");
+    delay(5000);
+    checkForControlSMS();
+    
+    Serial.println("\n✅ Control command monitoring complete");
   }
   
   return success;
@@ -1734,8 +1265,8 @@ bool waitForSMSPrompt() {
 }
 
 String formatSensorDataForSMS(const TrackerData &data) {
-  // Format matching MasterSMSToFirebase expectations (15 fields):
-  // DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
+  // Format matching MasterSMSToFirebase expectations (now 17 fields):
+  // DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason,referenceCode,securityBreach
   
   // Get current timestamp in milliseconds
   uint64_t timestamp = millis();
@@ -1755,7 +1286,9 @@ String formatSensorDataForSMS(const TrackerData &data) {
   message += String(data.accelY, 3) + ",";
   message += String(data.accelZ, 3) + ",";
   message += String(data.batteryVoltage, 2) + ",";
-  message += data.wakeUpReason;
+  message += data.wakeUpReason + ",";
+  message += data.referenceCode + ",";
+  message += String(data.securityBreachActive ? "1" : "0");
   
   return message;
 }
@@ -1790,7 +1323,47 @@ void checkForControlSMS() {
         Serial.println("SMS Response: " + response);
       }
     
-    // Look for SETLOC messages first
+    // Look for SETNAME messages first
+    int setnameIndex = response.indexOf("SETNAME,");
+    if (setnameIndex != -1) {
+      // Extract the SETNAME message
+      int endIndex = response.indexOf('\r', setnameIndex);
+      if (endIndex == -1) endIndex = response.indexOf('\n', setnameIndex);
+      if (endIndex == -1) endIndex = response.length();
+      
+      String setnameMsg = response.substring(setnameIndex, endIndex);
+      Serial.println("SETNAME message received: " + setnameMsg);
+      
+      // Parse SETNAME,deviceId,name
+      if (setnameMsg.startsWith("SETNAME,")) {
+        setnameMsg = setnameMsg.substring(8); // Remove "SETNAME,"
+        int comma1 = setnameMsg.indexOf(',');
+        
+        if (comma1 != -1) {
+          String deviceId = setnameMsg.substring(0, comma1);
+          String name = setnameMsg.substring(comma1 + 1);
+          
+          // Update device name in memory
+          currentData.deviceName = name;
+          strncpy(rtcDeviceName, currentData.deviceName.c_str(), sizeof(rtcDeviceName) - 1);
+          rtcDeviceDetailsValid = true;
+          
+          Serial.println("✅ Updated device name: " + currentData.deviceName);
+        }
+      }
+      
+      // Find and delete this SMS
+      int msgIndexStart = response.lastIndexOf("+CMGL: ", setnameIndex);
+      if (msgIndexStart != -1) {
+        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
+        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
+        sim7600.print("AT+CMGD=");
+        sim7600.println(smsIndex);
+        delay(500);
+      }
+    }
+    
+    // Look for SETLOC messages
     int setlocIndex = response.indexOf("SETLOC,");
     if (setlocIndex != -1) {
       // Extract the SETLOC message
@@ -1890,8 +1463,8 @@ void checkForControlSMS() {
 }
 
 void parseControlSMS(String smsContent) {
-  // Format: "CMD,buzzer,solenoid,dismiss"
-  // Example: "CMD,1,0,1" means buzzer on, solenoid off, dismissed true
+  // Format: "CMD,buzzer,solenoid,dismiss,clearBreach"
+  // Example: "CMD,1,0,1,0" means buzzer on, solenoid off, dismissed true, don't clear breach
   
   if (!smsContent.startsWith("CMD,")) return;
   
@@ -1901,29 +1474,48 @@ void parseControlSMS(String smsContent) {
   // Parse values
   int firstComma = smsContent.indexOf(',');
   int secondComma = smsContent.indexOf(',', firstComma + 1);
+  int thirdComma = smsContent.indexOf(',', secondComma + 1);
   
   if (firstComma != -1 && secondComma != -1) {
     String buzzerStr = smsContent.substring(0, firstComma);
     String solenoidStr = smsContent.substring(firstComma + 1, secondComma);
-    String dismissStr = smsContent.substring(secondComma + 1);
+    String dismissStr;
+    String clearBreachStr = "0"; // Default to not clearing breach
+    
+    if (thirdComma != -1) {
+      // New format with 4 fields
+      dismissStr = smsContent.substring(secondComma + 1, thirdComma);
+      clearBreachStr = smsContent.substring(thirdComma + 1);
+    } else {
+      // Old format with 3 fields (backward compatibility)
+      dismissStr = smsContent.substring(secondComma + 1);
+    }
     
     // Apply control states
     bool newBuzzerState = (buzzerStr == "1");
     bool newSolenoidState = (solenoidStr == "1");
     bool newDismissState = (dismissStr == "1");
+    bool clearBreach = (clearBreachStr == "1");
     
-    Serial.printf("Applying control: Buzzer=%d, Solenoid=%d, Dismiss=%d\n", 
-                  newBuzzerState, newSolenoidState, newDismissState);
-    
-    // Update dismiss state first
-    currentData.buzzerDismissed = newDismissState;
-    
-    // CRITICAL: Apply Master's decision strictly
-    Serial.println("\n=== APPLYING MASTER'S CONTROL COMMAND ===");
+    Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
+    Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d, ClearBreach=%d\n", 
+                  newBuzzerState, newSolenoidState, newDismissState, clearBreach);
     
     // Update dismiss state
     currentData.buzzerDismissed = newDismissState;
     rtcBuzzerDismissed = newDismissState;
+    
+    if (newDismissState) {
+      Serial.println("✅ Buzzer dismissed by user");
+    }
+    
+    // Clear security breach if Master instructs us to
+    // This happens when lid is closed AND device is back in safe zone
+    if (clearBreach && rtcSecurityBreachDetected) {
+      Serial.println("🔓 CLEARING SECURITY BREACH - Device is secured and in safe zone");
+      rtcSecurityBreachDetected = false;
+      currentData.securityBreachActive = false;
+    }
     
     // Apply buzzer state from Master (Master has already done all calculations)
     currentData.buzzerIsActive = newBuzzerState;
@@ -2007,4 +1599,66 @@ void showSMSStorageStatus() {
   delay(1000);
   String response = waitForGPSResponse(1000);
   Serial.println("SMS Storage Status: " + response);
+}
+
+// Check if SMS memory is nearly full (>80% used)
+bool isSMSMemoryNearlyFull() {
+  flushSIM7600Buffer();
+  sim7600.println("AT+CPMS?");
+  delay(1000);
+  String response = waitForGPSResponse(1000);
+  
+  // Response format: +CPMS: "SM",used,total,"SM",used,total,"SM",used,total
+  // Example: +CPMS: "SM",10,30,"SM",10,30,"SM",10,30
+  
+  if (response.indexOf("+CPMS:") != -1) {
+    // Find the first set of numbers after "SM"
+    int firstQuote = response.indexOf("\"SM\"");
+    if (firstQuote != -1) {
+      int firstComma = response.indexOf(",", firstQuote);
+      if (firstComma != -1) {
+        int secondComma = response.indexOf(",", firstComma + 1);
+        if (secondComma != -1) {
+          String usedStr = response.substring(firstComma + 1, secondComma);
+          int thirdComma = response.indexOf(",", secondComma + 1);
+          if (thirdComma != -1) {
+            String totalStr = response.substring(secondComma + 1, thirdComma);
+            
+            int used = usedStr.toInt();
+            int total = totalStr.toInt();
+            
+            if (total > 0) {
+              float percentUsed = (float)used / (float)total * 100.0;
+              Serial.println("SMS Memory: " + String(used) + "/" + String(total) + " (" + String(percentUsed, 1) + "% used)");
+              
+              // Return true if more than 80% full
+              return percentUsed > 80.0;
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // If we can't parse, assume it's not full
+  Serial.println("Could not parse SMS storage status");
+  return false;
+}
+
+// Generate a unique 10-character reference code
+void generateReferenceCode() {
+  const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const int charsetSize = 62;  // 26 uppercase + 26 lowercase + 10 digits
+  
+  // Initialize ESP32 hardware random number generator
+  randomSeed(esp_random());
+  
+  for (int i = 0; i < 10; i++) {
+    rtcReferenceCode[i] = charset[random(0, charsetSize)];
+  }
+  rtcReferenceCode[10] = '\0'; // Null terminator
+  
+  rtcReferenceCodeGenerated = true;
+  
+  Serial.println("✓ Generated unique reference code: " + String(rtcReferenceCode));
 }
