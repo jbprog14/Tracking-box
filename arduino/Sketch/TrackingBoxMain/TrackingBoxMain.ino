@@ -1251,45 +1251,19 @@ bool sendSensorDataViaSMS() {
     // After sending, check for control commands from Master multiple times
     Serial.println("📱 Monitoring for control commands (3 checks, 5 seconds apart)...");
     
-    // First check after 5 seconds (with interrupt checking)
+    // First check after 5 seconds
     Serial.println("\n[Check 1/3]");
-    for (int i = 0; i < 50; i++) { // 50 x 100ms = 5 seconds
-      if (shouldInterruptOperation()) {
-        Serial.println("💤 Entering deep sleep to handle interrupt...");
-        // Turn OFF LED before sleep
-        digitalWrite(LED_INDICATOR_PIN, LOW);
-        // Enter deep sleep immediately - will wake with proper reason
-        prepareForDeepSleep();
-        esp_deep_sleep_start();
-      }
-      delay(100);
-    }
+    delay(5000);
     checkForControlSMS();
     
     // Second check after another 5 seconds
     Serial.println("\n[Check 2/3]");
-    for (int i = 0; i < 50; i++) {
-      if (shouldInterruptOperation()) {
-        Serial.println("💤 Entering deep sleep to handle interrupt...");
-        digitalWrite(LED_INDICATOR_PIN, LOW);
-        prepareForDeepSleep();
-        esp_deep_sleep_start();
-      }
-      delay(100);
-    }
+    delay(5000);
     checkForControlSMS();
     
     // Third check after another 5 seconds
     Serial.println("\n[Check 3/3]");
-    for (int i = 0; i < 50; i++) {
-      if (shouldInterruptOperation()) {
-        Serial.println("💤 Entering deep sleep to handle interrupt...");
-        digitalWrite(LED_INDICATOR_PIN, LOW);
-        prepareForDeepSleep();
-        esp_deep_sleep_start();
-      }
-      delay(100);
-    }
+    delay(5000);
     checkForControlSMS();
     
     Serial.println("\n✅ Control command monitoring complete");
@@ -1301,70 +1275,29 @@ bool sendSensorDataViaSMS() {
 bool sendSMS(String phoneNumber, String message) {
   Serial.println("Sending SMS to: " + phoneNumber);
   
-  // Check for interrupts before starting
-  if (shouldInterruptOperation()) {
-    Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-    digitalWrite(LED_INDICATOR_PIN, LOW);
-    prepareForDeepSleep();
-    esp_deep_sleep_start();
-  }
-  
   // Ensure SIM7600 is initialized
   flushSIM7600Buffer();
   
-  // Set SMS mode with interrupt checking
+  // Set SMS mode - NO interrupt checking during critical AT commands
   sim7600.println("AT+CMGF=1");
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(1000); // Give adequate time for mode change
   
   // Set character set
   sim7600.println("AT+CSCS=\"GSM\"");
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(500);
   
   // Set SMS storage to SIM card
   sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(1000);
   
   // Set recipient
   sim7600.print("AT+CMGS=\"");
   sim7600.print(phoneNumber);
   sim7600.println("\"");
   
-  // Check for interrupts during 1 second wait
-  for (int i = 0; i < 10; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  // Wait for prompt - critical section, no interrupts
+  delay(2000); // Give time for prompt to appear
   
-  // Wait for prompt
   if (!waitForSMSPrompt()) {
     Serial.println("❌ Failed to get SMS prompt");
     return false;
@@ -1372,47 +1305,23 @@ bool sendSMS(String phoneNumber, String message) {
   
   // Send message content
   sim7600.print(message);
-  
-  // Check for interrupts during 500ms wait
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(500);
   
   // Send Ctrl+Z to finish SMS
   sim7600.write(26);
   
-  // Check for interrupts during 5 second wait
-  for (int i = 0; i < 50; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  // Wait for SMS to be sent - NO interruption during send
+  delay(5000);
   
-  // Check response with interrupt checking
+  // Check response
   String response = "";
-  unsigned long timeout = millis() + 15000; // 15 second timeout
+  unsigned long timeout = millis() + 10000; // 10 second timeout for response
   
   while (millis() < timeout) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
     if (sim7600.available()) {
       response += sim7600.readString();
     }
-    delay(50); // Small delay to prevent tight loop
+    delay(100);
   }
   
   Serial.println("SMS Response: " + response);
@@ -1430,28 +1339,26 @@ bool sendSMS(String phoneNumber, String message) {
 }
 
 bool waitForSMSPrompt() {
-  unsigned long timeout = millis() + 5000; // 5 second timeout
+  unsigned long timeout = millis() + 10000; // Increased to 10 second timeout
   String response = "";
   
+  Serial.println("Waiting for SMS prompt (>)...");
+  
   while (millis() < timeout) {
-    // Check for interrupts
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS prompt wait aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    
     if (sim7600.available()) {
       char c = sim7600.read();
       response += c;
-      if (response.indexOf(">") != -1) {
+      Serial.print(c); // Echo for debugging
+      
+      if (c == '>') {
+        Serial.println("\n✓ SMS prompt received");
         return true; // Found prompt
       }
     }
-    delay(50); // Small delay to prevent tight loop and allow interrupt checking
+    delay(10); // Shorter delay for faster response
   }
   
+  Serial.println("\n❌ Timeout waiting for SMS prompt. Response: " + response);
   return false;
 }
 
@@ -1493,25 +1400,10 @@ void checkForControlSMS() {
   
   // Configure to receive SMS
   sim7600.println("AT+CMGF=1");  // Text mode
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS check aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(500);
+  
   sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");  // Use SIM storage
-  for (int i = 0; i < 5; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 SMS check aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
-    delay(100);
-  }
+  delay(500);
   
   // Try multiple times to catch all messages
   bool cmdFound = false;
@@ -1522,15 +1414,7 @@ void checkForControlSMS() {
     
     // List unread messages
     sim7600.println("AT+CMGL=\"REC UNREAD\"");
-    for (int i = 0; i < 10; i++) {
-      if (shouldInterruptOperation()) {
-        Serial.println("💤 SMS check aborted - entering deep sleep to handle interrupt...");
-        digitalWrite(LED_INDICATOR_PIN, LOW);
-        prepareForDeepSleep();
-        esp_deep_sleep_start();
-      }
-      delay(100);
-    }
+    delay(1000);  // Give time for response
     
     if (sim7600.available()) {
       String response = sim7600.readString();
@@ -1574,15 +1458,7 @@ void checkForControlSMS() {
         int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
         sim7600.print("AT+CMGD=");
         sim7600.println(smsIndex);
-        for (int i = 0; i < 5; i++) {
-          if (shouldInterruptOperation()) {
-            Serial.println("💤 SMS delete aborted - entering deep sleep to handle interrupt...");
-            digitalWrite(LED_INDICATOR_PIN, LOW);
-            prepareForDeepSleep();
-            esp_deep_sleep_start();
-          }
-          delay(100);
-        }
+        delay(500);
       }
     }
     
@@ -1624,15 +1500,7 @@ void checkForControlSMS() {
         int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
         sim7600.print("AT+CMGD=");
         sim7600.println(smsIndex);
-        for (int i = 0; i < 5; i++) {
-          if (shouldInterruptOperation()) {
-            Serial.println("💤 SMS delete aborted - entering deep sleep to handle interrupt...");
-            digitalWrite(LED_INDICATOR_PIN, LOW);
-            prepareForDeepSleep();
-            esp_deep_sleep_start();
-          }
-          delay(100);
-        }
+        delay(500);
       }
     }
     
@@ -1659,15 +1527,7 @@ void checkForControlSMS() {
         // Delete the SMS
         sim7600.print("AT+CMGD=");
         sim7600.println(smsIndex);
-        for (int i = 0; i < 10; i++) {
-          if (shouldInterruptOperation()) {
-            Serial.println("💤 SMS delete aborted - entering deep sleep to handle interrupt...");
-            digitalWrite(LED_INDICATOR_PIN, LOW);
-            prepareForDeepSleep();
-            esp_deep_sleep_start();
-          }
-          delay(100);
-        }
+        delay(1000);
         
         // Verify deletion
         String delResponse = waitForGPSResponse(1000);
@@ -1687,15 +1547,7 @@ void checkForControlSMS() {
     // If no CMD found, wait a bit before next attempt
     if (!cmdFound && attempts < 3) {
       Serial.println("Waiting for CMD message... (attempt " + String(attempts) + "/3)");
-      for (int i = 0; i < 10; i++) {
-        if (shouldInterruptOperation()) {
-          Serial.println("💤 SMS wait aborted - entering deep sleep to handle interrupt...");
-          digitalWrite(LED_INDICATOR_PIN, LOW);
-          prepareForDeepSleep();
-          esp_deep_sleep_start();
-        }
-        delay(100);
-      }
+      delay(1000);
     }
   } else {
     if (attempts == 1) {
