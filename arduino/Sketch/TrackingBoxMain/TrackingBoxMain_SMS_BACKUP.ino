@@ -1,22 +1,23 @@
 /*
  * =====================================================================
- * TRACKING BOX DEVICE - DIRECT FIREBASE FIRMWARE
+ * TRACKING BOX DEVICE - SMS-ONLY FIRMWARE
  * =====================================================================
  * 
  * This sketch implements a streamlined, single-cycle operation for the
- * tracking device using direct Firebase communication via cellular data.
+ * tracking device using SMS communication exclusively.
  * 
  * On every wake-up, it performs the following:
  * 1. Initialize all hardware.
  * 2. Gather a full set of sensor readings.
- * 3. Send sensor data directly to Firebase via cellular HTTP.
- * 4. Check for control commands from Firebase.
+ * 3. Send sensor data via SMS to Master device.
+ * 4. Check for control commands from Master via SMS.
  * 5. Update the E-Ink display with all data.
  * 6. Enter deep sleep until next wake trigger.
  * 
- * FIREBASE COMMUNICATION:
- * The device communicates directly with Firebase Realtime Database
- * using the SIM7600G's cellular data connection via HTTP/HTTPS.
+ * SMS COMMUNICATION:
+ * The device operates as a "Slave" and sends compiled sensor data via
+ * SMS to a Master device for Firebase forwarding.
+ * SMS format: comma-separated values matching Firebase schema.
  * 
  * CELLULAR LOCATION SERVICES:
  * SIM7600 cellular module is used for GNSS/GPS tracking and CLBS (Cell Location
@@ -88,18 +89,14 @@
 #define FALL_THRESHOLD_MAGNITUDE    1.1  // g – CHANGE in accel magnitude to trigger a shock event
 
 // =====================================================================
-// DEVICE & FIREBASE CONFIGURATION
+// DEVICE & SMS CONFIGURATION
 // =====================================================================
-const String DEVICE_ID = "box_001";  // Base/preferred device ID
+const String DEVICE_ID = "box_001";
 
-// Device ID validation - auto-generates unique ID if base ID exists
-String actualDeviceID = "";  // Runtime device ID (either original or auto-generated)
-RTC_DATA_ATTR char rtcActualDeviceID[32] = "";  // Persist across deep sleep
-RTC_DATA_ATTR bool rtcDeviceIDValidated = false;  // Flag to track if ID was validated
-
-// FIREBASE CONFIGURATION
-const char* FIREBASE_URL = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* APN = "internet";  // Change to your carrier's APN
+// SMS CONFIGURATION
+// Configure the phone number of the Master device that will receive SMS
+// and forward data to Firebase
+const String MASTER_PHONE_NUMBER = "+639184652918"; // SMS Master device phone number
 
 // =====================================================================
 // GLOBAL OBJECTS & VARIABLES
@@ -112,7 +109,8 @@ Adafruit_SHT31 sht30 = Adafruit_SHT31();
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
 HardwareSerial sim7600(1);
 Preferences preferences;  // For permanent storage
-// SIM7600 module is used for both GNSS/GPS location services and cellular data for Firebase
+// Note: TinyGSM objects removed as cellular data transmission is no longer used
+// SIM7600 module is still used for GNSS/GPS and CLBS location services
 uint8_t lsm6dsl_address = 0x6A;
 // Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
 bool sht30_ok   = false;
@@ -125,7 +123,7 @@ RTC_DATA_ATTR bool rtcBaselineSet = false;
 RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
 RTC_DATA_ATTR uint32_t rtcBootCount = 0;     // persists across deep-sleep cycles
 
-// RTC memory to store device details
+// RTC memory to store device details for SMS mode
 RTC_DATA_ATTR char rtcDeviceSetLocation[64] = "Unknown";
 RTC_DATA_ATTR char rtcDeviceName[64] = "Unknown";
 RTC_DATA_ATTR bool rtcDeviceDetailsValid = false;
@@ -141,12 +139,14 @@ RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
 // RTC memory for security breach tracking
 RTC_DATA_ATTR bool rtcSecurityBreachDetected = false;  // Tracks if limit switch was ever breached
 
+// RTC memory for SMS cleanup timing
+RTC_DATA_ATTR uint32_t rtcSMSCleanupCounter = 0;
+
 // RTC memory for unique reference code
 RTC_DATA_ATTR char rtcReferenceCode[11] = ""; // 10 chars + null terminator
 RTC_DATA_ATTR bool rtcReferenceCodeGenerated = false;
 
-// RTC memory for last Firebase update time
-RTC_DATA_ATTR unsigned long rtcLastFirebaseUpdate = 0;
+// SMS cleanup timing removed - now handled based on storage usage before deep sleep
 
 // --------------------------------------------------------------
 // GEO HELPERS
@@ -315,18 +315,15 @@ bool shouldInterruptOperation() {
 // Forward declaration
 void determineWakeUpReason();
 void updateDisplay();
-bool sendSensorDataToFirebase();
-bool initializeCellularData();
-void sendATCommand(const char* cmd, int timeout);
-String sendATCommandResponse(const char* cmd, int timeout);
-bool checkFirebaseControls();
-void parseFirebaseControls(String jsonData);
+bool sendSensorDataViaSMS();
+bool sendSMS(String phoneNumber, String message);
+bool waitForSMSPrompt();
+String formatSensorDataForSMS(const TrackerData &data);
+void checkForControlSMS();
+void parseControlSMS(String smsContent);
+void cleanupSMSMemory();
+bool isSMSMemoryNearlyFull();
 void generateReferenceCode();
-bool sendFirebaseHTTP(String path, String jsonData, String method);
-String readFirebaseHTTP(String path);
-bool checkDeviceIDExists(String deviceID);
-String generateNextDeviceID(String currentID);
-String validateAndGetUniqueDeviceID();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -372,43 +369,15 @@ void setup() {
   initializeAllHardware();
   Serial.println("✅ Hardware Initialized.");
   
-  // Initialize cellular data connection for Firebase
-  if (initializeCellularData()) {
-    Serial.println("✅ Cellular data initialized for Firebase.");
-  } else {
-    Serial.println("❌ Failed to initialize cellular data.");
-  }
+  // SMS cleanup has been moved to before deep sleep to preserve control messages from Master
   
-  // Validate Device ID uniqueness (only if not already validated)
-  if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
-    Serial.println("\n🔍 Validating Device ID uniqueness...");
-    actualDeviceID = validateAndGetUniqueDeviceID();
-    actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
-    rtcDeviceIDValidated = true;
-    
-    // Save to preferences for permanent storage
-    preferences.begin("tracking", false);
-    preferences.putString("deviceID", actualDeviceID);
-    preferences.end();
-    
-    if (actualDeviceID != DEVICE_ID) {
-      Serial.println("⚠️ Original ID '" + DEVICE_ID + "' was already taken");
-      Serial.println("✅ Assigned new unique ID: " + actualDeviceID);
-    } else {
-      Serial.println("✅ Using original ID: " + actualDeviceID);
-    }
-  } else {
-    // Load from RTC memory (survives deep sleep)
-    actualDeviceID = String(rtcActualDeviceID);
-    Serial.println("✅ Using saved Device ID: " + actualDeviceID);
-  }
-  
-  // Check for control commands from Firebase (skip on first boot)
+  // Check for control SMS from Master (skip on first boot - no data sent yet)
   if (rtcBootCount > 1) {
-    Serial.println("🌐 Checking Firebase for control commands...");
-    checkFirebaseControls();
+    Serial.println("📨 Checking for pending control SMS from Master...");
+    delay(2000); // Small delay to ensure any pending SMS are received
+    checkForControlSMS();
   } else {
-    Serial.println("🌐 Skipping Firebase check on first boot");
+    Serial.println("📨 Skipping SMS check on first boot");
   }
   
   // Restore device details from RTC memory if available
@@ -422,13 +391,16 @@ void setup() {
     Serial.println("⚠️ No device details in RTC memory - using defaults");
   }
   
-  // Collect sensor data for Firebase transmission
+  // Collect sensor data for SMS transmission
   collectSensorReading();
   Serial.println("✅ Sensor Readings Collected.");
   
-  // Send sensor data directly to Firebase
-  if (sendSensorDataToFirebase()) {
-    Serial.println("✅ Sensor data sent to Firebase.");
+  // In SMS mode, we don't evaluate lock breach - Master decides everything
+  // Just collect sensor data and send to Master
+  
+  // Attempt to send data via SMS
+  if (sendSensorDataViaSMS()) {
+    Serial.println("✅ Sensor data sent via SMS to Master device.");
     
     // CRITICAL: If buzzer OR solenoid is active, DO NOT SLEEP
     if (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
@@ -487,10 +459,10 @@ void setup() {
         // Check for new control commands
         if (millis() - lastCheck >= CHECK_INTERVAL) {
           lastCheck = millis();
-          Serial.println("🌐 Checking Firebase for control commands...");
+          Serial.println("📨 Checking for control commands...");
           
-          // Check for control commands from Firebase
-          checkFirebaseControls();
+          // Check for control SMS from Master
+          checkForControlSMS();
           
           // If both are deactivated, exit loop
           if (!currentData.buzzerIsActive && !rtcBuzzerActive && 
@@ -519,9 +491,9 @@ void setup() {
     // Update display with QR code
     showOfflineQRCode();
     
-    Serial.println("Cycle complete → deep sleep (Firebase mode).");
+    Serial.println("Cycle complete → deep sleep (SMS mode).");
   } else {
-    Serial.println("❌ Firebase send failed. Operating in offline mode.");
+    Serial.println("❌ SMS send failed. Operating in offline mode.");
     showOfflineQRCode();
     Serial.println("Cycle complete → deep sleep (offline mode).");
   }
@@ -543,7 +515,7 @@ void loop() {
   // The device performs a single cycle in setup() and then deep sleeps.
 }
 
-// Direct Firebase communication implemented
+// Firebase functions removed - SMS-only mode
 
 // ---------------------------------------------------------------------------
 // SOLENOID CONTROL
@@ -793,9 +765,25 @@ void readGPSLocation() {
   }
 }
 
-// Helper function for compatibility with existing GPS code
+// Helper to send an AT command and echo response for a given duration (ms)
 void sendAT(const char *cmd, uint16_t delayMs) {
-  sendATCommand(cmd, delayMs);
+  Serial.print("\n>> "); Serial.println(cmd);
+  flushSIM7600Buffer();
+  sim7600.println(cmd);
+  unsigned long timeout = millis() + delayMs;
+  while (millis() < timeout) {
+    // Check for interrupts
+    if (shouldInterruptOperation()) {
+      Serial.println("💤 AT command aborted - entering deep sleep to handle interrupt...");
+      digitalWrite(LED_INDICATOR_PIN, LOW);
+      prepareForDeepSleep();
+      esp_deep_sleep_start();
+    }
+    while (sim7600.available()) {
+      Serial.write(sim7600.read());
+    }
+    delay(50); // Small delay to prevent tight loop
+  }
 }
 
 void readBatteryVoltage() {
@@ -1074,7 +1062,13 @@ double convertToDecimalDegrees(String coordinate, String direction) {
 void prepareForDeepSleep() {
   Serial.println("Configuring deep sleep triggers...");
 
-  // No cleanup needed for Firebase mode
+  // Check if SMS memory is nearly full and clean up if needed
+  if (isSMSMemoryNearlyFull()) {
+    Serial.println("⚠️ SMS memory is nearly full (>80%), cleaning up before sleep...");
+    cleanupSMSMemory();
+  } else {
+    Serial.println("✅ SMS memory has sufficient space, no cleanup needed");
+  }
 
   // Wake up on timer
   esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
@@ -1207,7 +1201,7 @@ void updateDisplay() {
   
   // QR Code below service boxes
   rightY += 60;
-  String qrUrl = "https://tracking-box.vercel.app/qr/" + actualDeviceID;
+  String qrUrl = "https://tracking-box.vercel.app/qr/" + DEVICE_ID;
   
   // Generate QR code
   uint8_t qrcodeData[qrcode_getBufferSize(3)];
@@ -1273,10 +1267,10 @@ void updateDisplay() {
 }
 
 // ---------------------------------------------------------------------------
-// OFFLINE PAGE – Shows QR code when offline
+// OFFLINE PAGE – Now just redirects to the combined display
 // ---------------------------------------------------------------------------
 void showOfflineQRCode() {
-  // Show the display with QR code for offline access
+  // Since we're always in SMS mode, we always show the combined display
   updateDisplay();
 }
 
@@ -1284,7 +1278,7 @@ void showOfflineQRCode() {
 // END OF TRACKING BOX MAIN FIRMWARE
 // ===================================================================== 
 
-// Direct Firebase communication implemented
+// Firebase functions removed - SMS-only mode
 
 // ---------------------------------------------------------------------------
 // CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
@@ -1293,253 +1287,184 @@ void showOfflineQRCode() {
 // Cellular location services (CLBS) retained for GPS fallback functionality
 
 // =====================================================================
-// FIREBASE COMMUNICATION FUNCTIONS
+// SMS COMMUNICATION FUNCTIONS
 // =====================================================================
-// These functions implement direct Firebase communication via cellular data.
-// The device sends sensor data directly to Firebase Realtime Database.
+// These functions implement the SMS communication system.
+// The device sends sensor data via SMS to a Master device that forwards it to Firebase.
+// SMS Format: "DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason,referenceCode"
 // =====================================================================
-
-// Initialize cellular data connection
-bool initializeCellularData() {
-  Serial.println("\n=== INITIALIZING CELLULAR DATA ===");
+bool sendSensorDataViaSMS() {
+  Serial.println("Attempting to send sensor data via SMS...");
   
-  // Basic initialization sequence
-  sendATCommand("AT", 2000);                                    // Test communication
-  sendATCommand("AT+CFUN=1", 5000);                            // Set full functionality
-  sendATCommand("AT+CPIN?", 2000);                             // Check SIM status
-  sendATCommand("AT+CREG?", 2000);                             // Check network registration
-  sendATCommand("AT+CGATT=1", 10000);                          // Attach to GPRS service
+  // SMS cleanup moved to before deep sleep to preserve control messages
   
-  // Configure SSL/TLS for HTTPS
-  sendATCommand("AT+CSSLCFG=\"sslversion\",0,3", 2000);        // Set TLS 1.2
-  sendATCommand("AT+CSSLCFG=\"authmode\",0,0", 2000);          // Disable cert verification
-  sendATCommand("AT+CSSLCFG=\"ignorelocaltime\",0,1", 2000);   // Ignore RTC time
+  // Format and send sensor data matching MasterSMSToFirebase format
+  String smsMessage = formatSensorDataForSMS(currentData);
+  Serial.println("SMS Message: " + smsMessage);
   
-  // Configure PDP context
-  String apnCmd = "AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\"";
-  sim7600.println(apnCmd);
-  delay(2000);
-  sendATCommand("AT+CGACT=1,1", 10000);                        // Activate PDP context
-  
-  // Check signal strength
-  sendATCommand("AT+CSQ", 2000);                               // Signal quality
-  
-  Serial.println("✅ Cellular data initialization complete!");
-  return true;
-}
-
-bool sendSensorDataToFirebase() {
-  Serial.println("Attempting to send sensor data to Firebase...");
-  
-  // Create JSON payload for Firebase
-  String jsonData = "{";
-  jsonData += "\"temp\":" + String(currentData.temperature, 1) + ",";
-  jsonData += "\"humidity\":" + String(currentData.humidity, 1) + ",";
-  jsonData += "\"currentLocation\":\"" + String(currentData.latitude, 6) + "," + String(currentData.longitude, 6) + "\",";
-  jsonData += "\"altitude\":" + String(currentData.altitude, 1) + ",";
-  jsonData += "\"tilt\":" + String(currentData.tiltDetected ? "true" : "false") + ",";
-  jsonData += "\"fall\":" + String(currentData.fallDetected ? "true" : "false") + ",";
-  jsonData += "\"limitSwitch\":" + String(currentData.limitSwitchPressed ? "true" : "false") + ",";
-  jsonData += "\"solenoid\":" + String(currentData.solenoidActive ? "true" : "false") + ",";
-  jsonData += "\"accelerometer\":{";
-  jsonData += "\"x\":" + String(currentData.accelX, 3) + ",";
-  jsonData += "\"y\":" + String(currentData.accelY, 3) + ",";
-  jsonData += "\"z\":" + String(currentData.accelZ, 3) + ",";
-  jsonData += "\"tiltDetected\":" + String(currentData.tiltDetected ? "true" : "false");
-  jsonData += "},";
-  jsonData += "\"batteryVoltage\":" + String(currentData.batteryVoltage, 2) + ",";
-  jsonData += "\"wakeUpReason\":\"" + currentData.wakeUpReason + "\",";
-  jsonData += "\"timestamp\":" + String(millis()) + ",";
-  jsonData += "\"bootCount\":" + String(currentData.bootCount) + ",";
-  jsonData += "\"referenceCode\":\"" + currentData.referenceCode + "\",";
-  jsonData += "\"securityBreachActive\":" + String(currentData.securityBreachActive ? "true" : "false");
-  jsonData += "}";
-  
-  // Send to Firebase
-  String path = "/tracking_box/" + actualDeviceID + "/sensorData";
-  bool success = sendFirebaseHTTP(path, jsonData, "PUT");
+  bool success = sendSMS(MASTER_PHONE_NUMBER, smsMessage);
   
   if (success) {
-    Serial.println("✅ Data sent to Firebase successfully");
-    rtcLastFirebaseUpdate = millis();
+    // After sending, check for control commands from Master multiple times
+    Serial.println("📱 Monitoring for control commands (3 checks, 5 seconds apart)...");
     
-    // Check for control commands after sending data
-    delay(2000);
-    checkFirebaseControls();
+    // First check after 5 seconds
+    Serial.println("\n[Check 1/3]");
+    delay(5000);
+    checkForControlSMS();
+    
+    // Second check after another 5 seconds
+    Serial.println("\n[Check 2/3]");
+    delay(5000);
+    checkForControlSMS();
+    
+    // Third check after another 5 seconds
+    Serial.println("\n[Check 3/3]");
+    delay(5000);
+    checkForControlSMS();
+    
+    Serial.println("\n✅ Control command monitoring complete");
   }
   
   return success;
 }
 
-// Send data to Firebase via HTTP
-bool sendFirebaseHTTP(String path, String jsonData, String method) {
-  Serial.println("\n=== SENDING TO FIREBASE ===");
-  Serial.println("Path: " + path);
-  Serial.println("Method: " + method);
-  Serial.println("JSON Length: " + String(jsonData.length()));
+bool sendSMS(String phoneNumber, String message) {
+  Serial.println("Sending SMS to: " + phoneNumber);
   
-  // HTTP sequence for Firebase
-  sendATCommand("AT+HTTPTERM", 1000);
-  sendATCommand("AT+HTTPINIT", 2000);
-  
-  // Set URL
-  String url = String(FIREBASE_URL) + path + ".json";
-  String urlCmd = "AT+HTTPPARA=\"URL\",\"" + url + "\"";
-  sim7600.println(urlCmd);
-  delay(2000);
-  
-  // Set content type
-  sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
-  
-  // Send data
-  String dataCmd = "AT+HTTPDATA=" + String(jsonData.length()) + ",10000";
-  Serial.println("Sending: " + dataCmd);
-  sim7600.println(dataCmd);
-  
-  // Wait for DOWNLOAD prompt
-  delay(1000);
-  
-  // Send JSON data byte by byte
-  for (int i = 0; i < jsonData.length(); i++) {
-    sim7600.write(jsonData[i]);
-    delayMicroseconds(100);
-  }
-  
-  delay(1000);
-  
-  // Execute HTTP action (0=GET, 1=PUT, 2=POST)
-  int action = (method == "GET") ? 0 : (method == "PUT") ? 1 : 2;
-  String actionCmd = "AT+HTTPACTION=" + String(action);
-  sendATCommand(actionCmd.c_str(), 10000);
-  
-  // Check for response
-  delay(2000);
-  String response = sendATCommandResponse("AT+HTTPREAD=0,500", 3000);
-  
-  bool success = (response.indexOf("200") != -1 || response.indexOf("OK") != -1);
-  
-  if (success) {
-    Serial.println("✅ Firebase request successful");
-  } else {
-    Serial.println("❌ Firebase request failed");
-  }
-  
-  sendATCommand("AT+HTTPTERM", 1000);
-  return success;
-}
-
-// Read data from Firebase
-String readFirebaseHTTP(String path) {
-  Serial.println("\n=== READING FROM FIREBASE ===");
-  Serial.println("Path: " + path);
-  
-  sendATCommand("AT+HTTPTERM", 1000);
-  sendATCommand("AT+HTTPINIT", 2000);
-  
-  // Set URL
-  String url = String(FIREBASE_URL) + path + ".json";
-  String urlCmd = "AT+HTTPPARA=\"URL\",\"" + url + "\"";
-  sim7600.println(urlCmd);
-  delay(2000);
-  
-  // Execute GET request
-  sendATCommand("AT+HTTPACTION=0", 5000);
-  
-  // Read response
-  delay(3000);
-  String response = sendATCommandResponse("AT+HTTPREAD=0,1000", 3000);
-  
-  // Extract JSON from response
-  int jsonStart = response.indexOf('{');
-  int jsonEnd = response.lastIndexOf('}');
-  
-  if (jsonStart != -1 && jsonEnd != -1) {
-    response = response.substring(jsonStart, jsonEnd + 1);
-  } else {
-    response = "";
-  }
-  
-  sendATCommand("AT+HTTPTERM", 1000);
-  return response;
-}
-
-// Send AT command with response
-String sendATCommandResponse(const char* cmd, int timeout) {
-  Serial.println("Sending: " + String(cmd));
+  // Ensure SIM7600 is initialized
   flushSIM7600Buffer();
-  sim7600.println(cmd);
   
+  // Set SMS mode - NO interrupt checking during critical AT commands
+  sim7600.println("AT+CMGF=1");
+  delay(1000); // Give adequate time for mode change
+  
+  // Set character set
+  sim7600.println("AT+CSCS=\"GSM\"");
+  delay(500);
+  
+  // Set SMS storage to SIM card
+  sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");
+  delay(1000);
+  
+  // Set recipient
+  sim7600.print("AT+CMGS=\"");
+  sim7600.print(phoneNumber);
+  sim7600.println("\"");
+  
+  // Wait for prompt - critical section, no interrupts
+  delay(2000); // Give time for prompt to appear
+  
+  if (!waitForSMSPrompt()) {
+    Serial.println("❌ Failed to get SMS prompt");
+    return false;
+  }
+  
+  // Send message content
+  sim7600.print(message);
+  delay(500);
+  
+  // Send Ctrl+Z to finish SMS
+  sim7600.write(26);
+  
+  // Wait for SMS to be sent - NO interruption during send
+  delay(5000);
+  
+  // Check response
   String response = "";
-  unsigned long startTime = millis();
+  unsigned long timeout = millis() + 10000; // 10 second timeout for response
   
-  while (millis() - startTime < timeout) {
+  while (millis() < timeout) {
     if (sim7600.available()) {
       response += sim7600.readString();
     }
-    delay(10);
+    delay(100);
   }
   
-  if (response.length() > 0) {
-    Serial.print("Response: " + response);
+  Serial.println("SMS Response: " + response);
+  
+  // Check if SMS was sent successfully
+  bool success = (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1);
+  
+  if (success) {
+    Serial.println("✓ SMS sent successfully");
+  } else {
+    Serial.println("❌ Failed to send SMS");
   }
   
-  return response;
+  return success;
 }
 
-
-// =====================================================================
-// FIREBASE CONTROL FUNCTIONS
-// =====================================================================
-bool checkFirebaseControls() {
-  Serial.println("Checking Firebase for control commands...");
+bool waitForSMSPrompt() {
+  unsigned long timeout = millis() + 10000; // Increased to 10 second timeout
+  String response = "";
   
-  // Read control flags from Firebase
-  String controlPath = "/tracking_box/" + actualDeviceID + "/controlFlags";
-  String controlData = readFirebaseHTTP(controlPath);
+  Serial.println("Waiting for SMS prompt (>)...");
   
-  if (controlData.length() > 0) {
-    Serial.println("Control data received: " + controlData);
-    parseFirebaseControls(controlData);
-    
-    // Also read device details
-    String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
-    String detailsData = readFirebaseHTTP(detailsPath);
-    
-    if (detailsData.length() > 0) {
-      parseFirebaseDetails(detailsData);
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      char c = sim7600.read();
+      response += c;
+      Serial.print(c); // Echo for debugging
+      
+      if (c == '>') {
+        Serial.println("\n✓ SMS prompt received");
+        return true; // Found prompt
+      }
     }
-    
-    return true;
+    delay(10); // Shorter delay for faster response
   }
   
+  Serial.println("\n❌ Timeout waiting for SMS prompt. Response: " + response);
   return false;
 }
 
-void parseFirebaseDetails(String jsonData) {
-  // Parse device details from Firebase
-  // Format: {"name":"...","setLocation":"...","description":"..."}
+String formatSensorDataForSMS(const TrackerData &data) {
+  // Format matching MasterSMSToFirebase expectations (now 17 fields):
+  // DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason,referenceCode,securityBreach
   
-  int nameStart = jsonData.indexOf("\"name\":\"") + 8;
-  if (nameStart > 7) {
-    int nameEnd = jsonData.indexOf("\"", nameStart);
-    if (nameEnd != -1) {
-      currentData.deviceName = jsonData.substring(nameStart, nameEnd);
-      strncpy(rtcDeviceName, currentData.deviceName.c_str(), sizeof(rtcDeviceName) - 1);
-      rtcDeviceDetailsValid = true;
-      Serial.println("✅ Updated device name: " + currentData.deviceName);
-    }
-  }
+  // Get current timestamp in milliseconds
+  uint64_t timestamp = millis();
   
-  int locStart = jsonData.indexOf("\"setLocation\":\"") + 15;
-  if (locStart > 14) {
-    int locEnd = jsonData.indexOf("\"", locStart);
-    if (locEnd != -1) {
-      currentData.deviceSetLocation = jsonData.substring(locStart, locEnd);
-      strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
-      rtcDeviceDetailsValid = true;
-      Serial.println("✅ Updated setLocation: " + currentData.deviceSetLocation);
-    }
-  }
+  String message = DEVICE_ID + ",";
+  message += String(timestamp) + ",";
+  message += String(data.temperature, 1) + ",";
+  message += String(data.humidity, 1) + ",";
+  message += String(data.latitude, 6) + ",";
+  message += String(data.longitude, 6) + ",";
+  message += String(data.altitude, 1) + ",";
+  message += String(data.tiltDetected ? "1" : "0") + ",";
+  message += String(data.fallDetected ? "1" : "0") + ",";
+  message += String(data.limitSwitchPressed ? "1" : "0") + ",";
+  message += String(data.solenoidActive ? "1" : "0") + ",";
+  message += String(data.accelX, 3) + ",";
+  message += String(data.accelY, 3) + ",";
+  message += String(data.accelZ, 3) + ",";
+  message += String(data.batteryVoltage, 2) + ",";
+  message += data.wakeUpReason + ",";
+  message += data.referenceCode + ",";
+  message += String(data.securityBreachActive ? "1" : "0");
+  
+  return message;
+}
+
+
+// =====================================================================
+// SMS CONTROL RECEIVING FUNCTIONS
+// =====================================================================
+void checkForControlSMS() {
+  Serial.println("Checking for control SMS from Master...");
+  
+  // Configure to receive SMS
+  sim7600.println("AT+CMGF=1");  // Text mode
+  delay(500);
+  
+  sim7600.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");  // Use SIM storage
+  delay(500);
+  
+  // Try multiple times to catch all messages
+  bool cmdFound = false;
+  int attempts = 0;
   
   while (!cmdFound && attempts < 3) {
     attempts++;
@@ -1757,35 +1682,40 @@ void parseFirebaseDetails(String jsonData) {
   }
 }
 
-void parseFirebaseControls(String jsonData) {
-  // Parse control flags from Firebase
-  // Format: {"buzzer":true,"solenoid":false,"dismissed":true}
+void parseControlSMS(String smsContent) {
+  // Format: "CMD,buzzer,solenoid,dismiss,clearBreach"
+  // Example: "CMD,1,0,1,0" means buzzer on, solenoid off, dismissed true, don't clear breach
   
-  if (jsonData.length() == 0) return;
+  if (!smsContent.startsWith("CMD,")) return;
   
-  // Parse buzzer state
-  bool newBuzzerState = false;
-  if (jsonData.indexOf("\"buzzer\":true") != -1) {
-    newBuzzerState = true;
-  }
+  // Remove "CMD," prefix
+  smsContent = smsContent.substring(4);
   
-  // Parse solenoid state
-  bool newSolenoidState = false;
-  if (jsonData.indexOf("\"solenoid\":true") != -1) {
-    newSolenoidState = true;
-  }
+  // Parse values
+  int firstComma = smsContent.indexOf(',');
+  int secondComma = smsContent.indexOf(',', firstComma + 1);
+  int thirdComma = smsContent.indexOf(',', secondComma + 1);
   
-  // Parse dismiss state
-  bool newDismissState = false;
-  if (jsonData.indexOf("\"dismissed\":true") != -1) {
-    newDismissState = true;
-  }
-  
-  // Parse clear breach state
-  bool clearBreach = false;
-  if (jsonData.indexOf("\"clearBreach\":true") != -1) {
-    clearBreach = true;
-  }
+  if (firstComma != -1 && secondComma != -1) {
+    String buzzerStr = smsContent.substring(0, firstComma);
+    String solenoidStr = smsContent.substring(firstComma + 1, secondComma);
+    String dismissStr;
+    String clearBreachStr = "0"; // Default to not clearing breach
+    
+    if (thirdComma != -1) {
+      // New format with 4 fields
+      dismissStr = smsContent.substring(secondComma + 1, thirdComma);
+      clearBreachStr = smsContent.substring(thirdComma + 1);
+    } else {
+      // Old format with 3 fields (backward compatibility)
+      dismissStr = smsContent.substring(secondComma + 1);
+    }
+    
+    // Apply control states
+    bool newBuzzerState = (buzzerStr == "1");
+    bool newSolenoidState = (solenoidStr == "1");
+    bool newDismissState = (dismissStr == "1");
+    bool clearBreach = (clearBreachStr == "1");
     
     Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
     Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d, ClearBreach=%d\n", 
@@ -1846,22 +1776,93 @@ void parseFirebaseControls(String jsonData) {
 }
 
 // =====================================================================
-// STUB FUNCTIONS - No longer needed with Firebase
+// SMS MEMORY CLEANUP
 // =====================================================================
 
-// Stub function - SMS cleanup not needed
+// Clean up SMS memory by deleting all messages
 void cleanupSMSMemory() {
-  // No longer used with Firebase
+  Serial.println("\n🧹 Cleaning up SMS memory...");
+  
+  flushSIM7600Buffer();
+  
+  // Delete all messages (read, unread, sent, unsent)
+  // AT+CMGD=1,4 deletes all messages
+  sim7600.println("AT+CMGD=1,4");
+  
+  // Wait for response (reduced from 10 seconds total to 3 seconds)
+  String response = waitForGPSResponse(3000);
+  
+  if (response.indexOf("OK") != -1) {
+    Serial.println("✅ SMS memory cleaned successfully");
+  } else {
+    Serial.println("❌ Primary cleanup failed, trying alternative method...");
+    
+    // Alternative: Try deleting by type (faster with shorter delays)
+    sim7600.println("AT+CMGD=1,1"); // Delete read messages
+    delay(1000);
+    
+    sim7600.println("AT+CMGD=1,2"); // Delete sent messages
+    delay(1000);
+    
+    sim7600.println("AT+CMGD=1,3"); // Delete unsent messages
+    delay(1000);
+  }
+  
+  // Show SMS storage status
+  showSMSStorageStatus();
 }
 
-// Stub function - SMS storage status not needed
+// Show SMS storage status
 void showSMSStorageStatus() {
-  // No longer used with Firebase
+  flushSIM7600Buffer();
+  sim7600.println("AT+CPMS?");
+  delay(1000);
+  String response = waitForGPSResponse(1000);
+  Serial.println("SMS Storage Status: " + response);
 }
 
-// Stub function - SMS memory check not needed
+// Check if SMS memory is nearly full (>80% used)
 bool isSMSMemoryNearlyFull() {
-  return false; // Always return false with Firebase
+  flushSIM7600Buffer();
+  sim7600.println("AT+CPMS?");
+  delay(1000);
+  String response = waitForGPSResponse(1000);
+  
+  // Response format: +CPMS: "SM",used,total,"SM",used,total,"SM",used,total
+  // Example: +CPMS: "SM",10,30,"SM",10,30,"SM",10,30
+  
+  if (response.indexOf("+CPMS:") != -1) {
+    // Find the first set of numbers after "SM"
+    int firstQuote = response.indexOf("\"SM\"");
+    if (firstQuote != -1) {
+      int firstComma = response.indexOf(",", firstQuote);
+      if (firstComma != -1) {
+        int secondComma = response.indexOf(",", firstComma + 1);
+        if (secondComma != -1) {
+          String usedStr = response.substring(firstComma + 1, secondComma);
+          int thirdComma = response.indexOf(",", secondComma + 1);
+          if (thirdComma != -1) {
+            String totalStr = response.substring(secondComma + 1, thirdComma);
+            
+            int used = usedStr.toInt();
+            int total = totalStr.toInt();
+            
+            if (total > 0) {
+              float percentUsed = (float)used / (float)total * 100.0;
+              Serial.println("SMS Memory: " + String(used) + "/" + String(total) + " (" + String(percentUsed, 1) + "% used)");
+              
+              // Return true if more than 80% full
+              return percentUsed > 80.0;
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // If we can't parse, assume it's not full
+  Serial.println("Could not parse SMS storage status");
+  return false;
 }
 
 // Generate a unique 10-character reference code
@@ -1880,97 +1881,4 @@ void generateReferenceCode() {
   rtcReferenceCodeGenerated = true;
   
   Serial.println("✓ Generated unique reference code: " + String(rtcReferenceCode));
-}
-
-// =====================================================================
-// DEVICE ID VALIDATION FUNCTIONS
-// =====================================================================
-
-// Check if a device ID already exists in Firebase
-bool checkDeviceIDExists(String deviceID) {
-  Serial.println("Checking if ID exists in Firebase: " + deviceID);
-  
-  // Check if any data exists under /tracking_box/{deviceID}
-  String path = "/tracking_box/" + deviceID;
-  String response = readFirebaseHTTP(path);
-  
-  // Firebase returns "null" for non-existent paths
-  if (response.length() == 0 || response.indexOf("null") != -1) {
-    return false;  // ID doesn't exist
-  }
-  
-  // If response contains any JSON data, ID exists
-  if (response.indexOf("{") != -1) {
-    return true;  // ID exists with data
-  }
-  
-  return false;  // Default to not exists
-}
-
-// Generate the next sequential device ID
-String generateNextDeviceID(String currentID) {
-  // Extract base and number from ID like "box_001" or "device_99"
-  int lastUnderscore = currentID.lastIndexOf('_');
-  
-  if (lastUnderscore == -1) {
-    // No underscore found, add "_002"
-    return currentID + "_002";
-  }
-  
-  String base = currentID.substring(0, lastUnderscore + 1);
-  String numStr = currentID.substring(lastUnderscore + 1);
-  
-  // Check if the part after underscore is a number
-  bool isNumber = true;
-  for (unsigned int i = 0; i < numStr.length(); i++) {
-    if (!isDigit(numStr[i])) {
-      isNumber = false;
-      break;
-    }
-  }
-  
-  if (!isNumber) {
-    // Not a number, append "_002"
-    return currentID + "_002";
-  }
-  
-  // Parse and increment the number
-  int num = numStr.toInt();
-  num++;
-  
-  // Format with leading zeros (maintain original length)
-  String newNumStr = String(num);
-  while (newNumStr.length() < numStr.length()) {
-    newNumStr = "0" + newNumStr;
-  }
-  
-  return base + newNumStr;
-}
-
-// Validate and get a unique device ID
-String validateAndGetUniqueDeviceID() {
-  String testID = DEVICE_ID;
-  int attempts = 0;
-  const int MAX_ATTEMPTS = 100;  // Prevent infinite loop
-  
-  Serial.println("\n🔍 Starting Device ID validation...");
-  
-  while (attempts < MAX_ATTEMPTS) {
-    Serial.println("Testing ID: " + testID);
-    
-    if (!checkDeviceIDExists(testID)) {
-      Serial.println("✅ ID is available: " + testID);
-      return testID;
-    }
-    
-    Serial.println("❌ ID already exists: " + testID);
-    testID = generateNextDeviceID(testID);
-    attempts++;
-    delay(500);  // Small delay between checks
-  }
-  
-  // Fallback: use timestamp suffix if all attempts fail
-  String fallbackID = DEVICE_ID + "_" + String(millis());
-  Serial.println("⚠️ Max attempts reached, using fallback ID: " + fallbackID);
-  return fallbackID;
 }
