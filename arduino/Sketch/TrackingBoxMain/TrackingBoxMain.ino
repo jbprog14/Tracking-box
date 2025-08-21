@@ -475,8 +475,8 @@ void setup() {
             rtcSolenoidActive = false;
             rtcSolenoidStartTime = 0;
             
-            // Notify Master that solenoid cycle is complete
-            // Master will update Firebase
+            // Solenoid cycle is complete
+            // Update Firebase with status
           } else {
             // Keep solenoid active
             digitalWrite(SOLENOID_PIN, HIGH);
@@ -548,15 +548,15 @@ void loop() {
 // ---------------------------------------------------------------------------
 // SOLENOID CONTROL
 // ---------------------------------------------------------------------------
-// Solenoid state fetching removed - handled via SMS
+// Solenoid state fetching handled via Firebase
 
-// Solenoid activation removed - handled via SMS
+// Solenoid activation handled via Firebase
 
-// Lock breach evaluation removed - Master device handles all logic in SMS mode
+// Lock breach evaluation handled via Firebase
 
-// Buzzer monitoring removed - handled in main SMS loop
+// Buzzer monitoring handled via Firebase
 
-// Solenoid activation wait removed - handled by Master in SMS mode
+// Solenoid activation wait handled via Firebase
 
 // =====================================================================
 // SENSOR READING FUNCTIONS
@@ -654,7 +654,7 @@ void collectSensorReading() {
     // Lid is closed - check if we can clear the security breach
     if (rtcSecurityBreachDetected) {
       Serial.println("🔒 Lid is now closed, but security breach remains active until location is verified safe");
-      // Note: Security breach will only be cleared by Master when both:
+      // Note: Security breach will only be cleared when both:
       // 1. Lid is closed (limitSwitchPressed = true)
       // 2. Device is back in safe zone OR user dismisses the alert
     }
@@ -943,7 +943,7 @@ void writeLSM6DSLRegister(uint8_t reg, uint8_t value) {
 }
 
 // =====================================================================
-// SMS-ONLY COMMUNICATION - WiFi removed
+// FIREBASE COMMUNICATION via cellular data
 // =====================================================================
 
 // ---------------------------------------------------------------------------
@@ -1289,7 +1289,7 @@ void showOfflineQRCode() {
 // ---------------------------------------------------------------------------
 // CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
 // ---------------------------------------------------------------------------
-// Note: Cellular data transmission functions removed - using SMS fallback instead
+// Note: Using cellular data transmission functions for Firebase communication
 // Cellular location services (CLBS) retained for GPS fallback functionality
 
 // =====================================================================
@@ -1540,221 +1540,6 @@ void parseFirebaseDetails(String jsonData) {
       Serial.println("✅ Updated setLocation: " + currentData.deviceSetLocation);
     }
   }
-  
-  while (!cmdFound && attempts < 3) {
-    attempts++;
-    
-    // List unread messages
-    sim7600.println("AT+CMGL=\"REC UNREAD\"");
-    delay(1000);  // Give time for response
-    
-    if (sim7600.available()) {
-      String response = sim7600.readString();
-      if (attempts == 1) {
-        Serial.println("SMS Response: " + response);
-      }
-    
-    // Look for SETNAME messages first
-    int setnameIndex = response.indexOf("SETNAME,");
-    if (setnameIndex != -1) {
-      // Extract the SETNAME message
-      int endIndex = response.indexOf('\r', setnameIndex);
-      if (endIndex == -1) endIndex = response.indexOf('\n', setnameIndex);
-      if (endIndex == -1) endIndex = response.length();
-      
-      String setnameMsg = response.substring(setnameIndex, endIndex);
-      Serial.println("SETNAME message received: " + setnameMsg);
-      
-      // Parse SETNAME,deviceId,name
-      if (setnameMsg.startsWith("SETNAME,")) {
-        setnameMsg = setnameMsg.substring(8); // Remove "SETNAME,"
-        int comma1 = setnameMsg.indexOf(',');
-        
-        if (comma1 != -1) {
-          String deviceId = setnameMsg.substring(0, comma1);
-          String name = setnameMsg.substring(comma1 + 1);
-          
-          // Update device name in memory
-          currentData.deviceName = name;
-          strncpy(rtcDeviceName, currentData.deviceName.c_str(), sizeof(rtcDeviceName) - 1);
-          rtcDeviceDetailsValid = true;
-          
-          Serial.println("✅ Updated device name: " + currentData.deviceName);
-        }
-      }
-      
-      // Find and delete this SMS
-      int msgIndexStart = response.lastIndexOf("+CMGL: ", setnameIndex);
-      if (msgIndexStart != -1) {
-        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
-        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
-        sim7600.print("AT+CMGD=");
-        sim7600.println(smsIndex);
-        delay(500);
-      }
-    }
-    
-    // Look for SETLOC messages
-    int setlocIndex = response.indexOf("SETLOC,");
-    if (setlocIndex != -1) {
-      // Extract the SETLOC message
-      int endIndex = response.indexOf('\r', setlocIndex);
-      if (endIndex == -1) endIndex = response.indexOf('\n', setlocIndex);
-      if (endIndex == -1) endIndex = response.length();
-      
-      String setlocMsg = response.substring(setlocIndex, endIndex);
-      Serial.println("SETLOC message received: " + setlocMsg);
-      
-      // Parse SETLOC,deviceId,lat,lon
-      if (setlocMsg.startsWith("SETLOC,")) {
-        setlocMsg = setlocMsg.substring(7); // Remove "SETLOC,"
-        int comma1 = setlocMsg.indexOf(',');
-        int comma2 = setlocMsg.indexOf(',', comma1 + 1);
-        
-        if (comma1 != -1 && comma2 != -1) {
-          String deviceId = setlocMsg.substring(0, comma1);
-          String latStr = setlocMsg.substring(comma1 + 1, comma2);
-          String lonStr = setlocMsg.substring(comma2 + 1);
-          
-          // Update setLocation in memory
-          currentData.deviceSetLocation = latStr + ", " + lonStr;
-          strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
-          rtcDeviceDetailsValid = true;
-          
-          Serial.println("✅ Updated setLocation: " + currentData.deviceSetLocation);
-        }
-      }
-      
-      // Find and delete this SMS
-      int msgIndexStart = response.lastIndexOf("+CMGL: ", setlocIndex);
-      if (msgIndexStart != -1) {
-        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
-        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
-        sim7600.print("AT+CMGD=");
-        sim7600.println(smsIndex);
-        delay(500);
-      }
-    }
-    
-    // Look for SHIP messages (shipping label data)
-    int shipIndex = response.indexOf("SHIP,");
-    if (shipIndex != -1) {
-      // Extract the SHIP message
-      int endIndex = response.indexOf('\r', shipIndex);
-      if (endIndex == -1) endIndex = response.indexOf('\n', shipIndex);
-      if (endIndex == -1) endIndex = response.length();
-      
-      String shipMsg = response.substring(shipIndex, endIndex);
-      Serial.println("SHIP message received: " + shipMsg);
-      
-      // Parse SHIP,deviceId,senderName|senderAddr|recipName|recipAddr|weight|routing|postal|tracking|service
-      if (shipMsg.startsWith("SHIP,")) {
-        shipMsg = shipMsg.substring(5); // Remove "SHIP,"
-        int comma = shipMsg.indexOf(',');
-        
-        if (comma != -1) {
-          String deviceId = shipMsg.substring(0, comma);
-          String data = shipMsg.substring(comma + 1);
-          
-          // Parse pipe-separated values
-          int idx = 0;
-          String fields[9];
-          int start = 0;
-          for (int i = 0; i < 9; i++) {
-            int pipe = data.indexOf('|', start);
-            if (pipe == -1) {
-              fields[i] = data.substring(start);
-              break;
-            } else {
-              fields[i] = data.substring(start, pipe);
-              start = pipe + 1;
-            }
-          }
-          
-          // Update shipping label data
-          currentData.senderName = fields[0].length() > 0 ? fields[0] : "Not Provided";
-          currentData.senderAddress = fields[1].length() > 0 ? fields[1] : "Not Provided";
-          currentData.recipientName = fields[2].length() > 0 ? fields[2] : "Not Provided";
-          currentData.recipientAddress = fields[3].length() > 0 ? fields[3] : "Not Provided";
-          currentData.packWeight = fields[4].length() > 0 ? fields[4] : "Not Provided";
-          currentData.routingCode = fields[5].length() > 0 ? fields[5] : "Not Provided";
-          currentData.postalCode = fields[6].length() > 0 ? fields[6] : "Not Provided";
-          currentData.trackingNumber = fields[7].length() > 0 ? fields[7] : "Not Provided";
-          currentData.serviceType = fields[8].length() > 0 ? fields[8] : "Not Provided";
-          
-          Serial.println("✅ Updated shipping label data");
-          Serial.println("  Sender: " + currentData.senderName);
-          Serial.println("  Recipient: " + currentData.recipientName);
-          Serial.println("  Tracking: " + currentData.trackingNumber);
-        }
-      }
-      
-      // Find and delete this SMS
-      int msgIndexStart = response.lastIndexOf("+CMGL: ", shipIndex);
-      if (msgIndexStart != -1) {
-        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
-        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
-        sim7600.print("AT+CMGD=");
-        sim7600.println(smsIndex);
-        delay(500);
-      }
-    }
-    
-    // Look for control messages starting with "CMD,"
-    int cmdIndex = response.indexOf("CMD,");
-    if (cmdIndex != -1) {
-      // Extract the control message
-      int endIndex = response.indexOf('\r', cmdIndex);
-      if (endIndex == -1) endIndex = response.indexOf('\n', cmdIndex);
-      if (endIndex == -1) endIndex = response.length();
-      
-      String controlMsg = response.substring(cmdIndex, endIndex);
-      Serial.println("Control message received: " + controlMsg);
-      
-      // Parse and apply the control command
-      parseControlSMS(controlMsg);
-      
-      // Find and delete the SMS
-      int msgIndexStart = response.lastIndexOf("+CMGL: ", cmdIndex);
-      if (msgIndexStart != -1) {
-        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
-        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
-        
-        // Delete the SMS
-        sim7600.print("AT+CMGD=");
-        sim7600.println(smsIndex);
-        delay(1000);
-        
-        // Verify deletion
-        String delResponse = waitForGPSResponse(1000);
-        if (delResponse.indexOf("OK") != -1) {
-          Serial.println("✅ Control SMS deleted successfully");
-        } else {
-          Serial.println("❌ Failed to delete control SMS");
-        }
-        cmdFound = true; // Mark that we found and processed the CMD
-      }
-    }
-    
-    if (!cmdFound && attempts == 1) {
-      Serial.println("No control SMS found in response.");
-    }
-    
-    // If no CMD found, wait a bit before next attempt
-    if (!cmdFound && attempts < 3) {
-      Serial.println("Waiting for CMD message... (attempt " + String(attempts) + "/3)");
-      delay(1000);
-    }
-  } else {
-    if (attempts == 1) {
-      Serial.println("No SMS response received from modem.");
-    }
-  }
-  } // End of while loop
-  
-  if (!cmdFound) {
-    Serial.println("No CMD control message received after 3 attempts.");
-  }
 }
 
 void parseFirebaseControls(String jsonData) {
@@ -1786,83 +1571,67 @@ void parseFirebaseControls(String jsonData) {
   if (jsonData.indexOf("\"clearBreach\":true") != -1) {
     clearBreach = true;
   }
-    
-    Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
-    Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d, ClearBreach=%d\n", 
-                  newBuzzerState, newSolenoidState, newDismissState, clearBreach);
-    
-    // Update dismiss state
-    currentData.buzzerDismissed = newDismissState;
-    rtcBuzzerDismissed = newDismissState;
-    
-    if (newDismissState) {
-      Serial.println("✅ Buzzer dismissed by user");
-    }
-    
-    // Clear security breach if Master instructs us to
-    // This happens when lid is closed AND device is back in safe zone
-    if (clearBreach && rtcSecurityBreachDetected) {
-      Serial.println("🔓 CLEARING SECURITY BREACH - Device is secured and in safe zone");
-      rtcSecurityBreachDetected = false;
-      currentData.securityBreachActive = false;
-    }
-    
-    // Apply buzzer state from Master (Master has already done all calculations)
-    currentData.buzzerIsActive = newBuzzerState;
-    rtcBuzzerActive = newBuzzerState;
-    digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
-    
-    if (newBuzzerState) {
-      Serial.println("🔔 BUZZER ACTIVATED by Master command!");
-      Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to HIGH");
-    } else {
-      Serial.println("🔕 Buzzer turned OFF by Master command");
-      Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to LOW");
-    }
-    
-    // Apply solenoid state from Master
-    if (newSolenoidState != currentData.solenoidActive) {
-      currentData.solenoidActive = newSolenoidState;
-      rtcSolenoidActive = newSolenoidState;
-      
-      if (newSolenoidState) {
-        // Starting new solenoid activation
-        rtcSolenoidStartTime = 0; // Will be set in the monitoring loop
-        Serial.println("🔓 Solenoid activation requested by Master");
-      } else {
-        // Solenoid deactivation
-        digitalWrite(SOLENOID_PIN, LOW);
-        rtcSolenoidStartTime = 0;
-        Serial.println("🔒 Solenoid deactivated by Master");
-      }
-    }
-    
-    Serial.println("Control states applied:");
-    Serial.println("  Buzzer: " + String(newBuzzerState ? "ON" : "OFF"));
-    Serial.println("  Solenoid: " + String(newSolenoidState ? "ON" : "OFF"));
-    Serial.println("  Dismiss: " + String(newDismissState ? "DISMISSED" : "NOT DISMISSED"));
-    Serial.println("=================================");
+  
+  Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
+  Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d, ClearBreach=%d\n", 
+                newBuzzerState, newSolenoidState, newDismissState, clearBreach);
+  
+  // Update dismiss state
+  currentData.buzzerDismissed = newDismissState;
+  rtcBuzzerDismissed = newDismissState;
+  
+  if (newDismissState) {
+    Serial.println("✅ Buzzer dismissed by user");
   }
+  
+  // Clear security breach if Firebase instructs us to
+  // This happens when lid is closed AND device is back in safe zone
+  if (clearBreach && rtcSecurityBreachDetected) {
+    Serial.println("🔓 CLEARING SECURITY BREACH - Device is secured and in safe zone");
+    rtcSecurityBreachDetected = false;
+    currentData.securityBreachActive = false;
+  }
+  
+  // Apply buzzer state from Firebase
+  currentData.buzzerIsActive = newBuzzerState;
+  rtcBuzzerActive = newBuzzerState;
+  digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
+  
+  if (newBuzzerState) {
+    Serial.println("🔔 BUZZER ACTIVATED by Firebase command!");
+    Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to HIGH");
+  } else {
+    Serial.println("🔕 Buzzer turned OFF by Firebase command");
+    Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to LOW");
+  }
+  
+  // Apply solenoid state from Firebase
+  if (newSolenoidState != currentData.solenoidActive) {
+    currentData.solenoidActive = newSolenoidState;
+    rtcSolenoidActive = newSolenoidState;
+    
+    if (newSolenoidState) {
+      // Starting new solenoid activation
+      rtcSolenoidStartTime = 0; // Will be set in the monitoring loop
+      Serial.println("🔓 Solenoid activation requested by Firebase");
+    } else {
+      // Solenoid deactivation
+      digitalWrite(SOLENOID_PIN, LOW);
+      rtcSolenoidStartTime = 0;
+      Serial.println("🔒 Solenoid deactivated by Firebase");
+    }
+  }
+  
+  Serial.println("Control states applied:");
+  Serial.println("  Buzzer: " + String(newBuzzerState ? "ON" : "OFF"));
+  Serial.println("  Solenoid: " + String(newSolenoidState ? "ON" : "OFF"));
+  Serial.println("  Dismiss: " + String(newDismissState ? "DISMISSED" : "NOT DISMISSED"));
+  Serial.println("=================================");
 }
 
 // =====================================================================
-// STUB FUNCTIONS - No longer needed with Firebase
+// UTILITY FUNCTIONS
 // =====================================================================
-
-// Stub function - SMS cleanup not needed
-void cleanupSMSMemory() {
-  // No longer used with Firebase
-}
-
-// Stub function - SMS storage status not needed
-void showSMSStorageStatus() {
-  // No longer used with Firebase
-}
-
-// Stub function - SMS memory check not needed
-bool isSMSMemoryNearlyFull() {
-  return false; // Always return false with Firebase
-}
 
 // Generate a unique 10-character reference code
 void generateReferenceCode() {
