@@ -1464,6 +1464,26 @@ String readFirebaseHTTP(String path) {
 }
 
 // Send AT command with response
+void sendATCommand(const char* cmd, int timeout) {
+  Serial.println("Sending: " + String(cmd));
+  flushSIM7600Buffer();
+  sim7600.println(cmd);
+  
+  String response = "";
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < timeout) {
+    if (sim7600.available()) {
+      response += sim7600.readString();
+    }
+    delay(10);
+  }
+  
+  if (response.length() > 0) {
+    Serial.print("Response: " + response);
+  }
+}
+
 String sendATCommandResponse(const char* cmd, int timeout) {
   Serial.println("Sending: " + String(cmd));
   flushSIM7600Buffer();
