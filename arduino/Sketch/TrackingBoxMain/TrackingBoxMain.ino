@@ -1303,26 +1303,85 @@ void showOfflineQRCode() {
 bool initializeCellularData() {
   Serial.println("\n=== INITIALIZING CELLULAR DATA ===");
   
-  // Basic initialization sequence
-  sendATCommand("AT", 2000);                                    // Test communication
-  sendATCommand("AT+CFUN=1", 5000);                            // Set full functionality
-  sendATCommand("AT+CPIN?", 2000);                             // Check SIM status
-  sendATCommand("AT+CREG?", 2000);                             // Check network registration
-  sendATCommand("AT+CGATT=1", 10000);                          // Attach to GPRS service
+  // Test communication
+  String response = sendATCommandResponse("AT", 2000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("❌ SIM7600 not responding");
+    return false;
+  }
   
-  // Configure SSL/TLS for HTTPS
-  sendATCommand("AT+CSSLCFG=\"sslversion\",0,3", 2000);        // Set TLS 1.2
-  sendATCommand("AT+CSSLCFG=\"authmode\",0,0", 2000);          // Disable cert verification
-  sendATCommand("AT+CSSLCFG=\"ignorelocaltime\",0,1", 2000);   // Ignore RTC time
+  // Set full functionality
+  response = sendATCommandResponse("AT+CFUN=1", 5000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("⚠️ Failed to set full functionality");
+  }
   
-  // Configure PDP context
+  // Check SIM status
+  response = sendATCommandResponse("AT+CPIN?", 2000);
+  if (response.indexOf("READY") == -1) {
+    Serial.println("❌ SIM card not ready");
+    Serial.println("Response: " + response);
+    return false;
+  }
+  Serial.println("✅ SIM card ready");
+  
+  // Check network registration
+  int attempts = 0;
+  bool registered = false;
+  while (attempts < 10 && !registered) {
+    response = sendATCommandResponse("AT+CREG?", 2000);
+    if (response.indexOf(",1") != -1 || response.indexOf(",5") != -1) {
+      registered = true;
+      Serial.println("✅ Network registered");
+    } else {
+      Serial.println("⏳ Waiting for network registration... (attempt " + String(attempts + 1) + "/10)");
+      delay(3000);
+      attempts++;
+    }
+  }
+  
+  if (!registered) {
+    Serial.println("❌ Failed to register on network");
+    return false;
+  }
+  
+  // Attach to GPRS service
+  response = sendATCommandResponse("AT+CGATT=1", 10000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("⚠️ Failed to attach to GPRS");
+  }
+  
+  // Configure SSL/TLS for HTTPS (optional, continue even if fails)
+  sendATCommand("AT+CSSLCFG=\"sslversion\",0,3", 2000);
+  sendATCommand("AT+CSSLCFG=\"authmode\",0,0", 2000);
+  sendATCommand("AT+CSSLCFG=\"ignorelocaltime\",0,1", 2000);
+  
+  // Configure and activate PDP context
   String apnCmd = "AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\"";
-  sim7600.println(apnCmd);
-  delay(2000);
-  sendATCommand("AT+CGACT=1,1", 10000);                        // Activate PDP context
+  response = sendATCommandResponse(apnCmd.c_str(), 3000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("⚠️ Failed to set APN");
+  }
+  
+  response = sendATCommandResponse("AT+CGACT=1,1", 15000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("⚠️ Failed to activate PDP context");
+  }
   
   // Check signal strength
-  sendATCommand("AT+CSQ", 2000);                               // Signal quality
+  response = sendATCommandResponse("AT+CSQ", 2000);
+  if (response.indexOf("+CSQ:") != -1) {
+    int signalStart = response.indexOf("+CSQ:") + 5;
+    int signalEnd = response.indexOf(",", signalStart);
+    if (signalEnd > signalStart) {
+      String signalStr = response.substring(signalStart, signalEnd);
+      int signal = signalStr.toInt();
+      Serial.println("📶 Signal strength: " + String(signal) + "/31");
+      if (signal < 5) {
+        Serial.println("⚠️ Weak signal, may affect connectivity");
+      }
+    }
+  }
   
   Serial.println("✅ Cellular data initialization complete!");
   return true;
@@ -1377,55 +1436,114 @@ bool sendFirebaseHTTP(String path, String jsonData, String method) {
   Serial.println("Path: " + path);
   Serial.println("Method: " + method);
   Serial.println("JSON Length: " + String(jsonData.length()));
+  Serial.println("JSON Data: " + jsonData);
   
-  // HTTP sequence for Firebase
+  // Terminate any existing HTTP session
   sendATCommand("AT+HTTPTERM", 1000);
-  sendATCommand("AT+HTTPINIT", 2000);
+  delay(500);
+  
+  // Initialize HTTP service
+  String initResponse = sendATCommandResponse("AT+HTTPINIT", 3000);
+  if (initResponse.indexOf("OK") == -1) {
+    Serial.println("❌ Failed to initialize HTTP service");
+    return false;
+  }
   
   // Set URL
   String url = String(FIREBASE_URL) + path + ".json";
   String urlCmd = "AT+HTTPPARA=\"URL\",\"" + url + "\"";
-  sim7600.println(urlCmd);
-  delay(2000);
+  Serial.println("Setting URL: " + url);
+  String urlResponse = sendATCommandResponse(urlCmd.c_str(), 3000);
+  if (urlResponse.indexOf("OK") == -1) {
+    Serial.println("❌ Failed to set URL");
+    sendATCommand("AT+HTTPTERM", 1000);
+    return false;
+  }
   
   // Set content type
-  sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
+  String contentResponse = sendATCommandResponse("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 2000);
+  if (contentResponse.indexOf("OK") == -1) {
+    Serial.println("❌ Failed to set content type");
+    sendATCommand("AT+HTTPTERM", 1000);
+    return false;
+  }
   
-  // Send data
+  // Prepare to send data
   String dataCmd = "AT+HTTPDATA=" + String(jsonData.length()) + ",10000";
-  Serial.println("Sending: " + dataCmd);
+  Serial.println("Preparing to send data: " + dataCmd);
+  flushSIM7600Buffer();
   sim7600.println(dataCmd);
   
   // Wait for DOWNLOAD prompt
-  delay(1000);
-  
-  // Send JSON data byte by byte
-  for (int i = 0; i < jsonData.length(); i++) {
-    sim7600.write(jsonData[i]);
-    delayMicroseconds(100);
+  String downloadPrompt = "";
+  unsigned long startTime = millis();
+  while (millis() - startTime < 3000) {
+    if (sim7600.available()) {
+      downloadPrompt += sim7600.readString();
+      if (downloadPrompt.indexOf("DOWNLOAD") != -1) {
+        Serial.println("Got DOWNLOAD prompt");
+        break;
+      }
+    }
+    delay(10);
   }
   
-  delay(1000);
+  if (downloadPrompt.indexOf("DOWNLOAD") == -1) {
+    Serial.println("❌ No DOWNLOAD prompt received");
+    Serial.println("Received instead: " + downloadPrompt);
+    sendATCommand("AT+HTTPTERM", 1000);
+    return false;
+  }
+  
+  // Send JSON data
+  Serial.println("Sending JSON data...");
+  sim7600.print(jsonData);
+  delay(500);
+  
+  // Wait for OK after data send
+  String dataResponse = "";
+  startTime = millis();
+  while (millis() - startTime < 2000) {
+    if (sim7600.available()) {
+      dataResponse += sim7600.readString();
+    }
+    delay(10);
+  }
+  Serial.println("Data send response: " + dataResponse);
   
   // Execute HTTP action (0=GET, 1=PUT, 2=POST)
   int action = (method == "GET") ? 0 : (method == "PUT") ? 1 : 2;
   String actionCmd = "AT+HTTPACTION=" + String(action);
-  sendATCommand(actionCmd.c_str(), 10000);
+  String actionResponse = sendATCommandResponse(actionCmd.c_str(), 15000);
   
-  // Check for response
-  delay(2000);
-  String response = sendATCommandResponse("AT+HTTPREAD=0,500", 3000);
-  
-  bool success = (response.indexOf("200") != -1 || response.indexOf("OK") != -1);
-  
-  if (success) {
-    Serial.println("✅ Firebase request successful");
-  } else {
-    Serial.println("❌ Firebase request failed");
+  // Look for +HTTPACTION response
+  if (actionResponse.indexOf("+HTTPACTION:") != -1) {
+    Serial.println("HTTP Action response received");
+    
+    // Extract status code
+    int statusStart = actionResponse.indexOf(",") + 1;
+    int statusEnd = actionResponse.indexOf(",", statusStart);
+    if (statusStart > 0 && statusEnd > statusStart) {
+      String statusCode = actionResponse.substring(statusStart, statusEnd);
+      Serial.println("HTTP Status Code: " + statusCode);
+      
+      if (statusCode == "200" || statusCode == "204") {
+        Serial.println("✅ Firebase request successful");
+        sendATCommand("AT+HTTPTERM", 1000);
+        return true;
+      }
+    }
   }
   
+  // Try to read any error response
+  String errorResponse = sendATCommandResponse("AT+HTTPREAD=0,500", 3000);
+  if (errorResponse.length() > 0) {
+    Serial.println("Error response: " + errorResponse);
+  }
+  
+  Serial.println("❌ Firebase request failed");
   sendATCommand("AT+HTTPTERM", 1000);
-  return success;
+  return false;
 }
 
 // Read data from Firebase
@@ -1433,20 +1551,49 @@ String readFirebaseHTTP(String path) {
   Serial.println("\n=== READING FROM FIREBASE ===");
   Serial.println("Path: " + path);
   
+  // Terminate any existing HTTP session
   sendATCommand("AT+HTTPTERM", 1000);
-  sendATCommand("AT+HTTPINIT", 2000);
+  delay(500);
+  
+  // Initialize HTTP service
+  String initResponse = sendATCommandResponse("AT+HTTPINIT", 3000);
+  if (initResponse.indexOf("OK") == -1) {
+    Serial.println("❌ Failed to initialize HTTP service");
+    return "";
+  }
   
   // Set URL
   String url = String(FIREBASE_URL) + path + ".json";
   String urlCmd = "AT+HTTPPARA=\"URL\",\"" + url + "\"";
-  sim7600.println(urlCmd);
-  delay(2000);
+  Serial.println("Setting URL: " + url);
+  String urlResponse = sendATCommandResponse(urlCmd.c_str(), 3000);
+  if (urlResponse.indexOf("OK") == -1) {
+    Serial.println("❌ Failed to set URL");
+    sendATCommand("AT+HTTPTERM", 1000);
+    return "";
+  }
   
   // Execute GET request
-  sendATCommand("AT+HTTPACTION=0", 5000);
+  String actionResponse = sendATCommandResponse("AT+HTTPACTION=0", 10000);
   
-  // Read response
-  delay(3000);
+  // Wait for +HTTPACTION response
+  if (actionResponse.indexOf("+HTTPACTION:") == -1) {
+    // Wait a bit more for the response
+    delay(2000);
+    actionResponse = "";
+    unsigned long startTime = millis();
+    while (millis() - startTime < 3000) {
+      if (sim7600.available()) {
+        actionResponse += sim7600.readString();
+        if (actionResponse.indexOf("+HTTPACTION:") != -1) {
+          break;
+        }
+      }
+      delay(10);
+    }
+  }
+  
+  // Read response data
   String response = sendATCommandResponse("AT+HTTPREAD=0,1000", 3000);
   
   // Extract JSON from response
