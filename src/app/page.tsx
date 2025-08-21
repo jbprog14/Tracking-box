@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "./firebase";
 import { ref, onValue, update, set } from "firebase/database";
 import { Toaster, toast } from "react-hot-toast";
@@ -21,6 +21,16 @@ interface TrackingBoxDetails {
   productFrom?: string; // Origin/source of product
   packerShipper?: string; // Name of packer or shipper
   supplierIdTracking?: string; // Supplier ID or tracking number
+  
+  // Shipping Label Fields
+  senderName?: string;
+  senderAddress?: string;
+  recipientName?: string;
+  recipientAddress?: string;
+  routingCode?: string;
+  postalCode?: string;
+  trackingNumber?: string;
+  serviceType?: string;
 }
 
 interface SensorData {
@@ -92,7 +102,7 @@ export default function Home() {
     return dec;
   };
 
-  const parseCoordinates = (raw: string): [number, number] | null => {
+  const parseCoordinates = useCallback((raw: string): [number, number] | null => {
     if (!raw) return null;
 
     // 1) Simple decimal "lat, lon"
@@ -107,7 +117,6 @@ export default function Home() {
       /(\d{1,3})[^0-9]+(\d{1,2})[^0-9]+(\d{1,2}(?:\.\d+)?)\s*["'′″]?\s*([NSEW])/gi;
     const parts: { deg: number; min: number; sec: number; dir: string }[] = [];
     let m;
-    // eslint-disable-next-line no-cond-assign
     while ((m = dmsRegex.exec(raw))) {
       parts.push({ deg: +m[1], min: +m[2], sec: +m[3], dir: m[4] });
     }
@@ -128,7 +137,7 @@ export default function Home() {
       return [lat, lon];
     }
     return null;
-  };
+  }, []);
 
   const [prettyLocations, setPrettyLocations] = useState<
     Record<string, string>
@@ -174,7 +183,9 @@ export default function Home() {
         Object.entries(trackingData).map(async ([boxId, box]) => {
           const rawLoc = box.details.setLocation;
           const coords = parseCoordinates(rawLoc);
-          if (!coords) return;
+          if (!coords) {
+            return;
+          }
           const [lat, lon] = coords;
 
           const human = await fetchReverseGeocode(lat, lon);
@@ -185,7 +196,7 @@ export default function Home() {
         setPrettyLocations((prev) => ({ ...prev, ...updates }));
       }
     })();
-  }, [trackingData]);
+  }, [trackingData, parseCoordinates]);
 
   useEffect(() => {
     prevTrackingDataRef.current = trackingData;
@@ -222,6 +233,15 @@ export default function Home() {
                     productFrom: box.details?.productFrom || "",
                     packerShipper: box.details?.packerShipper || "",
                     supplierIdTracking: box.details?.supplierIdTracking || "",
+                    // Shipping Label Fields
+                    senderName: box.details?.senderName || "",
+                    senderAddress: box.details?.senderAddress || "",
+                    recipientName: box.details?.recipientName || "",
+                    recipientAddress: box.details?.recipientAddress || "",
+                    routingCode: box.details?.routingCode || "",
+                    postalCode: box.details?.postalCode || "",
+                    trackingNumber: box.details?.trackingNumber || "",
+                    serviceType: box.details?.serviceType || "",
                   },
                   sensorData: {
                     temp: box.sensorData?.temp || 0,
@@ -377,6 +397,7 @@ export default function Home() {
     );
 
     return () => unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -460,29 +481,30 @@ export default function Home() {
   };
 
   // Convert human address → "lat, lon" string using Nominatim search
-  const forwardGeocode = async (query: string): Promise<string | null> => {
-    try {
-      const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${encodeURIComponent(
-          query
-        )}`,
-        {
-          headers: {
-            "User-Agent": "tracking-box-dashboard",
-            "Accept-Language": "en",
-          },
-        }
-      );
-      const json = await res.json();
-      if (json && json.length > 0) {
-        const { lat, lon } = json[0];
-        return `${parseFloat(lat).toFixed(5)}, ${parseFloat(lon).toFixed(5)}`;
-      }
-    } catch (e) {
-      console.warn("forward geocode failed", e);
-    }
-    return null;
-  };
+  // Currently not used after simplifying the save logic
+  // const forwardGeocode = async (query: string): Promise<string | null> => {
+  //   try {
+  //     const res = await fetch(
+  //       `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${encodeURIComponent(
+  //         query
+  //       )}`,
+  //       {
+  //         headers: {
+  //           "User-Agent": "tracking-box-dashboard",
+  //           "Accept-Language": "en",
+  //         },
+  //       }
+  //     );
+  //     const json = await res.json();
+  //     if (json && json.length > 0) {
+  //       const { lat, lon } = json[0];
+  //       return `${parseFloat(lat).toFixed(5)}, ${parseFloat(lon).toFixed(5)}`;
+  //     }
+  //   } catch (e) {
+  //     console.warn("forward geocode failed", e);
+  //   }
+  //   return null;
+  // };
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -532,10 +554,19 @@ export default function Home() {
       productFrom: string;
       packerShipper: string;
       supplierIdTracking: string;
+      senderName: string;
+      senderAddress: string;
+      recipientName: string;
+      recipientAddress: string;
+      routingCode: string;
+      postalCode: string;
+      trackingNumber: string;
+      serviceType: string;
     }
   ) => {
     try {
-      const coordString = coords || (await forwardGeocode(label)) || label;
+      // Simply save what was entered - coordinates stay as coordinates, addresses stay as addresses
+      const coordString = coords || label;
 
       const boxRef = ref(db, `tracking_box/${boxId}/details`);
       
@@ -549,11 +580,22 @@ export default function Home() {
       
       // Add package info if provided
       if (packageInfo) {
+        // Original package fields
         updateData.packDate = packageInfo.packDate;
         updateData.packWeight = packageInfo.packWeight;
         updateData.productFrom = packageInfo.productFrom;
         updateData.packerShipper = packageInfo.packerShipper;
         updateData.supplierIdTracking = packageInfo.supplierIdTracking;
+        
+        // New shipping label fields
+        updateData.senderName = packageInfo.senderName;
+        updateData.senderAddress = packageInfo.senderAddress;
+        updateData.recipientName = packageInfo.recipientName;
+        updateData.recipientAddress = packageInfo.recipientAddress;
+        updateData.routingCode = packageInfo.routingCode;
+        updateData.postalCode = packageInfo.postalCode;
+        updateData.trackingNumber = packageInfo.trackingNumber;
+        updateData.serviceType = packageInfo.serviceType;
       }
       
       await update(boxRef, updateData);
@@ -575,6 +617,14 @@ export default function Home() {
               productFrom: packageInfo.productFrom,
               packerShipper: packageInfo.packerShipper,
               supplierIdTracking: packageInfo.supplierIdTracking,
+              senderName: packageInfo.senderName,
+              senderAddress: packageInfo.senderAddress,
+              recipientName: packageInfo.recipientName,
+              recipientAddress: packageInfo.recipientAddress,
+              routingCode: packageInfo.routingCode,
+              postalCode: packageInfo.postalCode,
+              trackingNumber: packageInfo.trackingNumber,
+              serviceType: packageInfo.serviceType,
             }),
           },
         },
@@ -652,7 +702,7 @@ export default function Home() {
                     scope="col"
                     className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border border-gray-300"
                   >
-                    Owner
+                    Recipient Name
                   </th>
                   <th
                     scope="col"
@@ -752,14 +802,14 @@ export default function Home() {
                         </td>
                         <td className="px-6 py-2 text-sm text-gray-500 max-w-xs">
                           <div className="whitespace-normal break-words">
-                            {prettyLocations[boxId] || "Location not set"}
+                            {prettyLocations[boxId] || item.details.setLocationLabel || item.details.setLocation || "Location not set"}
                           </div>
                           <div className="text-xs text-gray-400 break-words">
                             {item.details.setLocation}
                           </div>
                         </td>
                         <td className="px-6 py-2 whitespace-nowrap text-sm text-gray-500">
-                          {item.details.name || "Name not set"}
+                          {item.details.recipientName || item.details.name || "Not provided"}
                         </td>
                         <td className="px-6 py-2 text-sm text-gray-500">
                           <button
@@ -845,6 +895,46 @@ export default function Home() {
             currentSupplierIdTracking={
               selectedEditBoxId
                 ? trackingData[selectedEditBoxId]?.details?.supplierIdTracking || ""
+                : ""
+            }
+            currentSenderName={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.senderName || ""
+                : ""
+            }
+            currentSenderAddress={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.senderAddress || ""
+                : ""
+            }
+            currentRecipientName={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.recipientName || ""
+                : ""
+            }
+            currentRecipientAddress={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.recipientAddress || ""
+                : ""
+            }
+            currentRoutingCode={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.routingCode || ""
+                : ""
+            }
+            currentPostalCode={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.postalCode || ""
+                : ""
+            }
+            currentTrackingNumber={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.trackingNumber || ""
+                : ""
+            }
+            currentServiceType={
+              selectedEditBoxId
+                ? trackingData[selectedEditBoxId]?.details?.serviceType || ""
                 : ""
             }
             onSave={handleSaveInfo}

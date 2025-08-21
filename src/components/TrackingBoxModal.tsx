@@ -42,7 +42,7 @@ interface TrackingBoxDetails {
   setLocationLabel?: string; // human readable
   description?: string;
   referenceCode?: string;
-  
+
   // Package Information Fields
   packDate?: string;
   packWeight?: string;
@@ -130,7 +130,7 @@ export default function TrackingBoxModal({
       const updated = [...prev, point].slice(-30); // keep last 30 readings
       return updated;
     });
-  }, [trackingData?.sensorData.timestamp]);
+  }, [trackingData?.sensorData.timestamp, trackingData]);
 
   if (!boxId || !trackingData) return null;
 
@@ -176,14 +176,6 @@ export default function TrackingBoxModal({
     (currentSensorData.bootCount === 0 ? "FIRST BOOT" : "TIMER SCHEDULE");
 
   // Normalize timestamp (handle seconds vs milliseconds) and build display string
-  const lastUpdateTimestamp =
-    currentSensorData.timestamp && currentSensorData.timestamp < 1e12
-      ? currentSensorData.timestamp * 1000 // convert seconds → ms
-      : currentSensorData.timestamp;
-
-  const lastUpdateDisplay = lastUpdateTimestamp
-    ? new Date(lastUpdateTimestamp).toLocaleTimeString()
-    : "N/A";
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -264,73 +256,44 @@ export default function TrackingBoxModal({
               </div>
             </div>
 
-            {/* Map and Details */}
+            {/* Map - Centered Full Width */}
+            <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-6 mb-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2 justify-center">
+                <MapPin className="h-5 w-5 text-blue-600" />
+                Location Details
+              </h3>
+              <div className="flex items-center gap-4 mb-3 text-sm justify-center">
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-blue-500 rounded-full"></div>
+                  <span className="text-gray-600">Drop-off Location</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-red-500 rounded-full"></div>
+                  <span className="text-gray-600">
+                    Current Package Location
+                  </span>
+                </div>
+              </div>
+              <div className="rounded-lg overflow-hidden">
+                <TrackingBoxMap
+                  setLocation={deviceDetails.setLocation}
+                  currentLocation={currentSensorData.currentLocation}
+                  boxId={boxId}
+                  boxName={deviceDetails.name}
+                />
+              </div>
+            </div>
+
+            {/* Grid for other sections */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Map */}
-              <div className="lg:col-span-2 bg-white rounded-xl shadow-lg border border-gray-200 p-6">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                  <MapPin className="h-5 w-5 text-blue-600" />
-                  Location Details
-                </h3>
-                <div className="flex items-center gap-4 mb-3 text-sm">
-                  <div className="flex items-center gap-2">
-                    <div className="w-4 h-4 bg-blue-500 rounded-full"></div>
-                    <span className="text-gray-600">Drop-off Location</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-4 h-4 bg-red-500 rounded-full"></div>
-                    <span className="text-gray-600">
-                      Current Package Location
-                    </span>
-                  </div>
-                </div>
-                <div className="h-[400px] rounded-lg overflow-hidden">
-                  <TrackingBoxMap
-                    setLocation={deviceDetails.setLocation}
-                    currentLocation={currentSensorData.currentLocation}
-                    boxId={boxId}
-                    boxName={deviceDetails.name}
-                  />
-                </div>
-              </div>
-
-              {/* Device Details */}
-              <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-6 space-y-4">
-                <h3 className="text-lg font-semibold text-gray-900">
-                  Device Details
-                </h3>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-600">Owner Name</span>
-                    <span className="font-semibold text-gray-900">
-                      {deviceDetails.name || "Not Set"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-600">Device ID</span>
-                    <Badge variant="outline">{boxId}</Badge>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-600">Boot Count</span>
-                    <span className="font-semibold text-gray-900">
-                      {currentSensorData.bootCount || 0}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-600">Last Update</span>
-                    <span className="font-semibold text-gray-900">
-                      {lastUpdateDisplay}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Package Information */}
-              {(deviceDetails.packDate || deviceDetails.packWeight || 
-                deviceDetails.productFrom || deviceDetails.packerShipper || 
+              {/* Package Information - Centered and Wider */}
+              {(deviceDetails.packDate ||
+                deviceDetails.packWeight ||
+                deviceDetails.productFrom ||
+                deviceDetails.packerShipper ||
                 deviceDetails.supplierIdTracking) && (
-                <div className="bg-gradient-to-br from-orange-50 to-amber-50 rounded-xl shadow-lg border border-orange-200 p-6 space-y-4">
-                  <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                <div className="lg:col-span-3 bg-gradient-to-br from-orange-50 to-amber-50 rounded-xl shadow-lg border border-orange-200 p-6 space-y-4 max-w-5xl mx-auto w-full">
+                  <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2 justify-center">
                     <Package className="h-5 w-5 text-orange-600" />
                     Package Information
                   </h3>
@@ -342,7 +305,9 @@ export default function TrackingBoxModal({
                           Pack Date
                         </span>
                         <span className="font-semibold text-gray-900">
-                          {new Date(deviceDetails.packDate).toLocaleDateString()}
+                          {new Date(
+                            deviceDetails.packDate
+                          ).toLocaleDateString()}
                         </span>
                       </div>
                     )}

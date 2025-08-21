@@ -98,6 +98,7 @@ float calculateDistance(float lat1, float lon1, float lat2, float lon2);
 void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive);
 void updateDismissAlert(const String &deviceId, bool dismissed);
 void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId);
+void sendShippingLabelToDevice(const String &phoneNumber, const String &deviceId);
 void updateActiveDevice(const String &deviceId, const String &phoneNumber, bool buzzerActive, bool buzzerDismissed, bool solenoidActive);
 void checkActiveDevicesForDismissal();
 void sendReferenceCodeToFirebase(const String &deviceId, const String &referenceCode);
@@ -296,6 +297,8 @@ void readSMS(int index) {
   sendDeviceNameToDevice(phoneNumber, tempDeviceId);
   delay(2000); // Give time for slave to receive and process
   sendSetLocationToDevice(phoneNumber, tempDeviceId);
+  delay(2000); // Give time for slave to receive and process
+  sendShippingLabelToDevice(phoneNumber, tempDeviceId);
   delay(3000); // Give time for slave to receive and process
   
   // Debug: Print each field
@@ -1324,6 +1327,98 @@ void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId) 
     DBG_FB("✓ SetLocation SMS sent successfully");
   } else {
     DBG_FB("❌ Failed to send setLocation SMS");
+  }
+}
+
+// Send shipping label data to device via SMS
+void sendShippingLabelToDevice(const String &phoneNumber, const String &deviceId) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_FB("No WiFi for fetching shipping label data");
+    return;
+  }
+  
+  // Fetch shipping label fields from Firebase
+  String baseUrl = String(FIREBASE_HOST) + "/tracking_box/" + deviceId + "/details/";
+  
+  // Helper function to get field from Firebase
+  auto getFieldFromFirebase = [&](const String &field) -> String {
+    String url = baseUrl + field + ".json?auth=" + FIREBASE_AUTH;
+    HTTPClient http;
+    http.begin(url);
+    int code = http.GET();
+    String value = "";
+    if (code == 200) {
+      value = http.getString();
+      value.replace("\"", "");
+      value.trim();
+      if (value == "null") value = "";
+    }
+    http.end();
+    return value;
+  };
+  
+  // Get all shipping label fields
+  String senderName = getFieldFromFirebase("senderName");
+  String senderAddr = getFieldFromFirebase("senderAddress");
+  String recipName = getFieldFromFirebase("recipientName");
+  String recipAddr = getFieldFromFirebase("recipientAddress");
+  String weight = getFieldFromFirebase("packWeight");
+  String routing = getFieldFromFirebase("routingCode");
+  String postal = getFieldFromFirebase("postalCode");
+  String tracking = getFieldFromFirebase("trackingNumber");
+  String service = getFieldFromFirebase("serviceType");
+  
+  // Format message: SHIP,deviceId,senderName|senderAddr|recipName|recipAddr|weight|routing|postal|tracking|service
+  // Using | as separator within the data to avoid confusion with SMS format
+  String message = "SHIP," + deviceId + "," + 
+                   senderName + "|" + senderAddr + "|" + 
+                   recipName + "|" + recipAddr + "|" + 
+                   weight + "|" + routing + "|" + 
+                   postal + "|" + tracking + "|" + service;
+  
+  // Truncate if too long for SMS (160 chars)
+  if (message.length() > 160) {
+    message = message.substring(0, 157) + "...";
+  }
+  
+  DBG_FB("Sending shipping label SMS: " + message);
+  
+  // Send SMS
+  sendAT("AT+CMGF=1", 500);
+  sendAT("AT+CSCS=\"GSM\"", 500);
+  
+  sim7600.print("AT+CMGS=\"");
+  sim7600.print(phoneNumber);
+  sim7600.println("\"");
+  delay(1000);
+  
+  // Wait for > prompt
+  unsigned long timeout = millis() + 5000;
+  bool promptReceived = false;
+  while (millis() < timeout) {
+    if (sim7600.available()) {
+      char c = sim7600.read();
+      Serial.write(c);
+      if (c == '>') {
+        promptReceived = true;
+        break;
+      }
+    }
+  }
+  
+  if (promptReceived) {
+    sim7600.print(message);
+    sim7600.write(26);  // Ctrl+Z
+    delay(5000);
+    
+    String response = readModem();
+    if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
+      DBG_FB("✓ Shipping label SMS sent successfully");
+    } else {
+      DBG_FB("❌ Failed to send shipping label SMS");
+    }
+  } else {
+    DBG_FB("❌ No prompt received for shipping label SMS");
   }
 }
 

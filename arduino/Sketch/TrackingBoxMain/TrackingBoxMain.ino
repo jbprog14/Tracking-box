@@ -264,6 +264,17 @@ struct TrackerData {
   uint32_t bootCount = 0;   // number of wake-ups since power-on
   bool coarseFix = false;   // true if only CLBS/IP based fix available
   String referenceCode = "";  // Unique 10-character reference code
+  
+  // Shipping label data from Firebase
+  String senderName = "";
+  String senderAddress = "";
+  String recipientName = "";
+  String recipientAddress = "";
+  String packWeight = "";
+  String routingCode = "";
+  String postalCode = "";
+  String trackingNumber = "";
+  String serviceType = "";
 };
 
 TrackerData currentData;
@@ -1074,134 +1085,180 @@ void prepareForDeepSleep() {
 }
 
 
+// Function to draw barcode placeholder
+void drawBarcode(int xPos, int yPos, int width, int height) {
+    // Draw barcode background
+    Paint_DrawRectangle(xPos, yPos, xPos + width, yPos + height, 
+                       EPD_7IN3F_WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    
+    // Draw vertical bars pattern
+    int barWidth = 2;
+    int currentX = xPos + 10;
+    
+    // Simple pattern of bars
+    for (int i = 0; i < 80 && currentX < (xPos + width - 10); i++) {
+        if (i % 3 == 0 || i % 5 == 0) {
+            int thisBarWidth = (i % 7 == 0) ? barWidth * 2 : barWidth;
+            Paint_DrawRectangle(currentX, yPos, currentX + thisBarWidth, yPos + height, 
+                               EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+            currentX += thisBarWidth + 1;
+        } else {
+            currentX += barWidth;
+        }
+    }
+}
+
 // =====================================================================
-// E-PAPER DISPLAY – Waveshare 7.3" 800×400 (7-color) helper
+// E-PAPER DISPLAY – Shipping Label Format with Real Data
 // =====================================================================
 void updateDisplay() {
-  Serial.println("Updating E-Ink display with combined layout...");
+  Serial.println("Updating E-Ink display with shipping label format...");
 
   // Basic initialisation
   DEV_Module_Init();
   EPD_7IN3F_Init();
   EPD_7IN3F_Clear(EPD_7IN3F_WHITE);
 
-  // Allocate a quarter-frame buffer (800×200)
+  // Allocate full frame buffer for complete display
   UBYTE *imgBuf;
-  UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * (EPD_7IN3F_HEIGHT / 2);
+  UDOUBLE imgSize = ((EPD_7IN3F_WIDTH % 2 == 0) ? (EPD_7IN3F_WIDTH / 2) : (EPD_7IN3F_WIDTH / 2 + 1)) * EPD_7IN3F_HEIGHT;
   imgBuf = (UBYTE *)malloc(imgSize);
   if (!imgBuf) {
     Serial.println("✗ Failed to allocate display buffer");
     return;
   }
 
-  Paint_NewImage(imgBuf, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2, 0, EPD_7IN3F_WHITE);
+  Paint_NewImage(imgBuf, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT, 0, EPD_7IN3F_WHITE);
   Paint_SetScale(7);          // 7-colour mode
   Paint_SelectImage(imgBuf);
   Paint_Clear(EPD_7IN3F_WHITE);
 
-  // ------------------------------
-  // LEFT SIDE: Device Details (using smaller font)
-  // ------------------------------
-  uint16_t y = 5;  // Start Y-coord
-  const uint16_t lineGap = 20;  // Reduced line gap for smaller font
-  const uint16_t leftMargin = 10;
-  const uint16_t leftWidth = 500;  // Use 500px for left side
+  // Variables for layout
+  const uint16_t leftMargin = 40;
+  const uint16_t rightColumnX = 480;
+  uint16_t y = 25;
+  char buf[128];
 
-  // Title
-  Paint_DrawString_EN(leftMargin, y, "TRACKING DETAILS", &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
-  y += lineGap + 5;
+  // ========== SENDER INFORMATION ==========
+  // Use "Not Provided" if field is empty
+  String senderName = currentData.senderName.length() > 0 ? currentData.senderName : "Not Provided";
+  String senderAddr = currentData.senderAddress.length() > 0 ? currentData.senderAddress : "Not Provided";
+  
+  Paint_DrawString_EN(leftMargin, y, senderName.c_str(), &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 25;
+  
+  if (senderAddr.length() > 60) senderAddr = senderAddr.substring(0, 57) + "...";
+  Paint_DrawString_EN(leftMargin, y, senderAddr.c_str(), &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 30;
+  
+  // Horizontal divider
+  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
+  y += 20;
+  
+  // ========== RECIPIENT INFORMATION ==========
+  Paint_DrawString_EN(leftMargin, y, "Ship To:", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 30;
+  
+  String recipName = currentData.recipientName.length() > 0 ? currentData.recipientName : "Not Provided";
+  String recipAddr = currentData.recipientAddress.length() > 0 ? currentData.recipientAddress : "Not Provided";
+  
+  Paint_DrawString_EN(leftMargin, y, recipName.c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 35;
+  
+  if (recipAddr.length() > 60) recipAddr = recipAddr.substring(0, 57) + "...";
+  Paint_DrawString_EN(leftMargin, y, recipAddr.c_str(), &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 35;
+  
+  // ========== PACKAGE WEIGHT ==========
+  String weight = currentData.packWeight.length() > 0 ? currentData.packWeight : "Not Provided";
+  Paint_DrawString_EN(leftMargin, y, weight.c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 40;
+  
+  // ========== MAXICODE AND ROUTING INFO ==========
+  // MAXICODE placeholder
+  Paint_DrawRectangle(leftMargin, y, leftMargin + 70, y + 70, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, DRAW_FILL_EMPTY);
+  Paint_DrawString_EN(leftMargin + 15, y + 25, "MAXI", &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(leftMargin + 15, y + 45, "CODE", &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // Routing Code and Postal Code
+  String routing = currentData.routingCode.length() > 0 ? currentData.routingCode : "Not Provided";
+  String postal = currentData.postalCode.length() > 0 ? currentData.postalCode : "Not Provided";
+  
+  Paint_DrawString_EN(leftMargin + 90, y + 10, routing.c_str(), &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(leftMargin + 90, y + 40, postal.c_str(), &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
 
-  // Reference Code (in bold/larger font)
-  char buf[64];
-  snprintf(buf, sizeof(buf), "TRACKING REFERENCE CODE: %s", currentData.referenceCode.c_str());
-  Paint_DrawString_EN(leftMargin, y, buf, &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLUE);
-  y += lineGap + 5;
-
-  // Owner
-  snprintf(buf, sizeof(buf), "Owner: %s", currentData.deviceName.c_str());
-  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  y += lineGap;
-
-  // Current Location (truncate if too long)
-  String currLoc = currentData.currentLocation;
-  if (currLoc.length() > 35) currLoc = currLoc.substring(0, 32) + "...";
-  snprintf(buf, sizeof(buf), "Current: %s", currLoc.c_str());
-  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  y += lineGap;
-
-  // Drop-off Location (truncate if too long)
-  String dropLoc = currentData.deviceSetLocation;
-  if (dropLoc.length() > 35) dropLoc = dropLoc.substring(0, 32) + "...";
-  snprintf(buf, sizeof(buf), "Drop-off: %s", dropLoc.c_str());
-  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  y += lineGap * 2;  // Extra space since we removed sensor data
-
-  // Bottom message
-  Paint_DrawString_EN(leftMargin, y, "PRIORITY MAIL - HANDLE WITH CARE", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_RED);
-
-  // ------------------------------
-  // Draw vertical separator line
-  // ------------------------------
-  Paint_DrawLine(leftWidth, 0, leftWidth, 200, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
-
-  // ------------------------------
-  // RIGHT SIDE: QR Code
-  // ------------------------------
-  String dynamicUrl = "https://tracking-box.vercel.app/qr/" + DEVICE_ID + "/";
-  const char *url = dynamicUrl.c_str();
+  // ========== RIGHT COLUMN - SERVICE TYPE AND QR CODE ==========
+  uint16_t rightY = 85;
+  
+  // Service Type
+  String serviceType = currentData.serviceType.length() > 0 ? currentData.serviceType : "STANDARD";
+  Paint_DrawRectangle(rightColumnX, rightY, rightColumnX + 100, rightY + 40, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, DRAW_FILL_EMPTY);
+  Paint_DrawString_EN(rightColumnX + 15, rightY + 10, serviceType.c_str(), &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // SERVICE label
+  Paint_DrawRectangle(rightColumnX + 110, rightY, rightColumnX + 230, rightY + 40, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, DRAW_FILL_EMPTY);
+  Paint_DrawString_EN(rightColumnX + 125, rightY + 10, "SERVICE", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // QR Code below service boxes
+  rightY += 60;
+  String qrUrl = "https://tracking-box.vercel.app/qr/" + DEVICE_ID;
   
   // Generate QR code
   uint8_t qrcodeData[qrcode_getBufferSize(3)];
   QRCode qrcode;
-  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
-
-  // Position QR code in the right section
-  const int scale = 5;  // Slightly smaller to fit better
-  const int qrSize = qrcode.size;
-  const int qrPix = qrSize * scale;
-  const int rightSectionStart = leftWidth + 10;
-  const int rightSectionWidth = EPD_7IN3F_WIDTH - rightSectionStart;
-  const int qrOffsetX = rightSectionStart + (rightSectionWidth - qrPix) / 2;
-  const int qrOffsetY = 20;
-
+  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, qrUrl.c_str());
+  
   // Draw QR code
-  for (int y = 0; y < qrSize; y++) {
-    for (int x = 0; x < qrSize; x++) {
-      if (qrcode_getModule(&qrcode, x, y)) {
-        Paint_DrawRectangle(qrOffsetX + x * scale,
-                            qrOffsetY + y * scale,
-                            qrOffsetX + (x + 1) * scale,
-                            qrOffsetY + (y + 1) * scale,
+  const int scale = 3;
+  const int qrSize = qrcode.size;
+  const int qrOffsetX = rightColumnX + 60;
+  const int qrOffsetY = rightY;
+  
+  for (int qy = 0; qy < qrSize; qy++) {
+    for (int qx = 0; qx < qrSize; qx++) {
+      if (qrcode_getModule(&qrcode, qx, qy)) {
+        Paint_DrawRectangle(qrOffsetX + qx * scale,
+                            qrOffsetY + qy * scale,
+                            qrOffsetX + (qx + 1) * scale,
+                            qrOffsetY + (qy + 1) * scale,
                             EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
       }
     }
   }
-
-  // QR code caption - centered under QR code
-  // Calculate text positions for centering
-  const char* scanText = "Scan for live tracking";
-  const char* urlText = "tracking-box.vercel.app";
   
-  // Approximate character widths: Font12 ~7px, Font8 ~5px
-  int scanTextWidth = strlen(scanText) * 7;  // Font12 width estimation
-  int urlTextWidth = strlen(urlText) * 5;    // Font8 width estimation
+  // ========== TRACKING NUMBER ==========
+  y = 320;
+  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
+  y += 20;
   
-  // Center the text under the QR code
-  int scanTextX = qrOffsetX + (qrPix - scanTextWidth) / 2;
-  int urlTextX = qrOffsetX + (qrPix - urlTextWidth) / 2;
+  String tracking = currentData.trackingNumber.length() > 0 ? currentData.trackingNumber : "Not Provided";
+  int textWidth = tracking.length() * 14;
+  int centerX = (EPD_7IN3F_WIDTH - textWidth) / 2;
+  Paint_DrawString_EN(centerX, y, tracking.c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 40;
   
-  Paint_DrawString_EN(scanTextX, qrOffsetY + qrPix + 10,
-                      scanText, &Font12,
-                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  // ========== BARCODE ==========
+  drawBarcode(40, y, EPD_7IN3F_WIDTH - 80, 50);
+  y += 55;
   
-  Paint_DrawString_EN(urlTextX, qrOffsetY + qrPix + 30,
-                      urlText, &Font8,
-                      EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  // Barcode numbers
+  Paint_DrawString_EN(50, y, "0522", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(EPD_7IN3F_WIDTH - 100, y, "2077", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // ========== BOTTOM INFO ==========
+  y += 30;
+  // Show reference code at bottom
+  snprintf(buf, sizeof(buf), "REF: %s", currentData.referenceCode.c_str());
+  Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // Show current GPS location (small font)
+  snprintf(buf, sizeof(buf), "GPS: %.6f, %.6f", currentData.latitude, currentData.longitude);
+  Paint_DrawString_EN(rightColumnX, y, buf, &Font8, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
 
   // ------------------------------
   // Push buffer to display
   // ------------------------------
-  EPD_7IN3F_DisplayPart(imgBuf, 0, 0, EPD_7IN3F_WIDTH, EPD_7IN3F_HEIGHT / 2);
+  EPD_7IN3F_Display(imgBuf);
   EPD_7IN3F_Sleep();
   free(imgBuf);
   imgBuf = nullptr;
@@ -1495,6 +1552,70 @@ void checkForControlSMS() {
       
       // Find and delete this SMS
       int msgIndexStart = response.lastIndexOf("+CMGL: ", setlocIndex);
+      if (msgIndexStart != -1) {
+        int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
+        int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
+        sim7600.print("AT+CMGD=");
+        sim7600.println(smsIndex);
+        delay(500);
+      }
+    }
+    
+    // Look for SHIP messages (shipping label data)
+    int shipIndex = response.indexOf("SHIP,");
+    if (shipIndex != -1) {
+      // Extract the SHIP message
+      int endIndex = response.indexOf('\r', shipIndex);
+      if (endIndex == -1) endIndex = response.indexOf('\n', shipIndex);
+      if (endIndex == -1) endIndex = response.length();
+      
+      String shipMsg = response.substring(shipIndex, endIndex);
+      Serial.println("SHIP message received: " + shipMsg);
+      
+      // Parse SHIP,deviceId,senderName|senderAddr|recipName|recipAddr|weight|routing|postal|tracking|service
+      if (shipMsg.startsWith("SHIP,")) {
+        shipMsg = shipMsg.substring(5); // Remove "SHIP,"
+        int comma = shipMsg.indexOf(',');
+        
+        if (comma != -1) {
+          String deviceId = shipMsg.substring(0, comma);
+          String data = shipMsg.substring(comma + 1);
+          
+          // Parse pipe-separated values
+          int idx = 0;
+          String fields[9];
+          int start = 0;
+          for (int i = 0; i < 9; i++) {
+            int pipe = data.indexOf('|', start);
+            if (pipe == -1) {
+              fields[i] = data.substring(start);
+              break;
+            } else {
+              fields[i] = data.substring(start, pipe);
+              start = pipe + 1;
+            }
+          }
+          
+          // Update shipping label data
+          currentData.senderName = fields[0].length() > 0 ? fields[0] : "Not Provided";
+          currentData.senderAddress = fields[1].length() > 0 ? fields[1] : "Not Provided";
+          currentData.recipientName = fields[2].length() > 0 ? fields[2] : "Not Provided";
+          currentData.recipientAddress = fields[3].length() > 0 ? fields[3] : "Not Provided";
+          currentData.packWeight = fields[4].length() > 0 ? fields[4] : "Not Provided";
+          currentData.routingCode = fields[5].length() > 0 ? fields[5] : "Not Provided";
+          currentData.postalCode = fields[6].length() > 0 ? fields[6] : "Not Provided";
+          currentData.trackingNumber = fields[7].length() > 0 ? fields[7] : "Not Provided";
+          currentData.serviceType = fields[8].length() > 0 ? fields[8] : "Not Provided";
+          
+          Serial.println("✅ Updated shipping label data");
+          Serial.println("  Sender: " + currentData.senderName);
+          Serial.println("  Recipient: " + currentData.recipientName);
+          Serial.println("  Tracking: " + currentData.trackingNumber);
+        }
+      }
+      
+      // Find and delete this SMS
+      int msgIndexStart = response.lastIndexOf("+CMGL: ", shipIndex);
       if (msgIndexStart != -1) {
         int msgIndexEnd = response.indexOf(",", msgIndexStart + 7);
         int smsIndex = response.substring(msgIndexStart + 7, msgIndexEnd).toInt();
