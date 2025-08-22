@@ -44,7 +44,9 @@
 #include <math.h>  // for haversine
 // Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
+#include <Adafruit_SHT31.h>
 #define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
+#define ENABLE_SHT30_SENSOR 1  // Set to 1 to enable SHT30 temperature/humidity sensor
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -55,8 +57,8 @@
 #define LSM6DSL_SDA_PIN     21
 #define LSM6DSL_SCL_PIN     22
 #define LSM6DSL_INT1_PIN    34
-#define SIM7600_TX_PIN      17
-#define SIM7600_RX_PIN      16
+#define SIM7600_TX_PIN      19  // Verified working with UART2
+#define SIM7600_RX_PIN      18  // Verified working with UART2
 #define LIMIT_SWITCH_PIN    33
 #define BUZZER_PIN          32
 #define SOLENOID_PIN        2   // GPIO2 – electronic lock/solenoid signal
@@ -110,7 +112,7 @@ volatile bool motionDetected = false;  // Flag for motion interrupt
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
-HardwareSerial sim7600(1);
+HardwareSerial sim7600(2);  // Using UART2 - verified working with SIM7600G-H
 Preferences preferences;  // For permanent storage
 // SIM7600 module is used for both GNSS/GPS location services and cellular data for Firebase
 uint8_t lsm6dsl_address = 0x6A;
@@ -312,7 +314,7 @@ bool shouldInterruptOperation() {
   return false;
 }
 
-// Forward declaration
+// Forward declarations
 void determineWakeUpReason();
 void updateDisplay();
 bool sendSensorDataToFirebase();
@@ -321,12 +323,16 @@ void sendATCommand(const char* cmd, int timeout);
 String sendATCommandResponse(const char* cmd, int timeout);
 bool checkFirebaseControls();
 void parseFirebaseControls(String jsonData);
+void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
 bool sendFirebaseHTTP(String path, String jsonData, String method);
 String readFirebaseHTTP(String path);
 bool checkDeviceIDExists(String deviceID);
 String generateNextDeviceID(String currentID);
 String validateAndGetUniqueDeviceID();
+void flushSIM7600Buffer();
+void sendAT(const char *cmd, uint16_t delayMs);
+void showOfflineQRCode();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -885,7 +891,10 @@ bool initializeAllHardware() {
     Serial.println("✗ LSM6DSL accelerometer initialization failed");
   }
 
+  // Initialize SIM7600 with verified working configuration
+  // UART2: RX=GPIO18, TX=GPIO19 @ 115200 baud
   sim7600.begin(115200, SERIAL_8N1, SIM7600_RX_PIN, SIM7600_TX_PIN);
+  sim7600.setRxBufferSize(2048);  // Increase buffer for large HTTP responses
   delay(2000);
   flushSIM7600Buffer();
 
