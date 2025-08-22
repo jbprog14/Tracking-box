@@ -1,11 +1,13 @@
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\AppData\Local\arduino\sketches\411FFEBA211A85C15C79A88035FFA6C5\sketch\TrackingBoxMain.ino.cpp.o:(.literal._Z22initializeCellularDatav+0x44): undefined reference to `sendATCommand(char const*, int)'
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\AppData\Local\arduino\sketches\411FFEBA211A85C15C79A88035FFA6C5\sketch\TrackingBoxMain.ino.cpp.o: in function `initializeCellularData()':
-C:\Users\Administrator\Projects\Tracking-box\arduino\Sketch\TrackingBoxMain/TrackingBoxMain.ino:1307:(.text._Z22initializeCellularDatav+0x27): undefined reference to `sendATCommand(char const*, int)'
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\Projects\Tracking-box\arduino\Sketch\TrackingBoxMain/TrackingBoxMain.ino:1308:(.text._Z22initializeCellularDatav+0x36): undefined reference to `sendATCommand(char const*, int)'
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\Projects\Tracking-box\arduino\Sketch\TrackingBoxMain/TrackingBoxMain.ino:1309:(.text._Z22initializeCellularDatav+0x42): undefined reference to `sendATCommand(char const*, int)'
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\Projects\Tracking-box\arduino\Sketch\TrackingBoxMain/TrackingBoxMain.ino:1310:(.text._Z22initializeCellularDatav+0x4e): undefined reference to `sendATCommand(char const*, int)'
-C:/Users/Administrator/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\Administrator\AppData\Local\arduino\sketches\411FFEBA211A85C15C79A88035FFA6C5\sketch\TrackingBoxMain.ino.cpp.o:C:\Users\Administrator\Projects\Tracking-box\arduino\Sketch\TrackingBoxMain/TrackingBoxMain.ino:1311: more undefined references to `sendATCommand(char const*, int)' follow
-collect2.exe: error: ld returned 1 exit status
-exit status 1
+------------------------------------------------
+UART2: RX=18, TX=19 @ 115200
+------------------------------------------------
+  Testing AT command... ✓
+  Getting module info... ✓ SIMCOM_SIM7600G-H
+✅ CONFIGURATION WORKING!
+  Running extended diagnostics:
+    SIM Card: ✓ Ready
+    Network: ✓ Registered
+    Signal: ✓ Good (16/31)
+    HTTP: ✓ Supported
 
-Compilation error: exit status 1
+------------------------------------------------
