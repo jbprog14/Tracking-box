@@ -58,22 +58,74 @@ const TrackingBoxMap: React.FC<TrackingBoxMapProps> = ({
     });
   }, []);
 
-  // Parse coordinates from string format "lat,lng"
+  // Parse coordinates from string format "lat,lng" or "lat, lng"
   const parseCoordinates = (coordString: string): [number, number] | null => {
-    if (!coordString || coordString === "No GPS Fix") return null;
+    if (!coordString || 
+        coordString === "No GPS Fix" || 
+        coordString === "GPS Initializing. Please Wait. . .") {
+      return null;
+    }
 
-    const coords = coordString.split(",");
-    if (coords.length !== 2) return null;
+    // Split by comma with optional spaces around it
+    const coords = coordString.split(/\s*,\s*/);
+    if (coords.length !== 2) {
+      console.error(`Invalid coordinate format: "${coordString}"`);
+      return null;
+    }
 
-    const lat = parseFloat(coords[0].trim());
-    const lng = parseFloat(coords[1].trim());
+    let lat = parseFloat(coords[0].trim());
+    let lng = parseFloat(coords[1].trim());
 
-    if (isNaN(lat) || isNaN(lng)) return null;
+    // Check for NaN values
+    if (isNaN(lat) || isNaN(lng)) {
+      console.error(`Failed to parse coordinates: lat=${coords[0]}, lng=${coords[1]}`);
+      return null;
+    }
+
+    // Check if coordinates are swapped (common issue)
+    // If the first value is > 90 or < -90, it's likely longitude
+    // Philippines longitude is typically 116-127, latitude is 4-21
+    if (Math.abs(lat) > 90 && Math.abs(lng) <= 90) {
+      console.warn(`Coordinates appear to be swapped. Swapping them: ${lat},${lng} -> ${lng},${lat}`);
+      [lat, lng] = [lng, lat]; // Swap them
+    }
+
+    // Validate coordinate ranges after potential swap
+    if (lat < -90 || lat > 90) {
+      console.error(`Invalid latitude after swap check: ${lat} (must be between -90 and 90)`);
+      return null;
+    }
+    if (lng < -180 || lng > 180) {
+      console.error(`Invalid longitude after swap check: ${lng} (must be between -180 and 180)`);
+      return null;
+    }
+
+    // Additional validation for Philippines region (optional)
+    // Philippines is roughly between 4-21°N and 116-127°E
+    if ((lat >= 4 && lat <= 21) && (lng >= 116 && lng <= 127)) {
+      // Likely Philippines coordinates - correct
+      console.log(`Coordinates in Philippines region: ${lat}, ${lng}`);
+    } else if ((lng >= 4 && lng <= 21) && (lat >= 116 && lat <= 127)) {
+      // Coordinates are definitely swapped
+      console.warn(`Coordinates were definitely swapped! Fixing: ${lat},${lng} -> ${lng},${lat}`);
+      [lat, lng] = [lng, lat]; // Swap them
+    }
+
     return [lat, lng];
   };
 
   const setLocationCoords = parseCoordinates(setLocation);
   const currentLocationCoords = parseCoordinates(currentLocation);
+
+  // Debug logging
+  console.log(`[TrackingBoxMap ${boxId}] Props received:`, {
+    setLocation,
+    currentLocation,
+    setLocationCoords,
+    currentLocationCoords,
+    setLocationParsed: setLocationCoords ? `[${setLocationCoords[0]}, ${setLocationCoords[1]}]` : 'null',
+    currentLocationParsed: currentLocationCoords ? `[${currentLocationCoords[0]}, ${currentLocationCoords[1]}]` : 'null'
+  });
 
   // Determine map center and zoom
   const getMapCenter = (): LatLngExpression => {

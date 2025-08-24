@@ -142,12 +142,12 @@ tracking_box/
 
 ### Slave-to-Master Message Format
 ```
-DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
+DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,buzzer,coarseFix,usingCGPS,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
 ```
 
 ### Example Slave-to-Master SMS
 ```
-box_001,1703123456789,25.5,60.0,14.562000,121.112100,15.0,0,0,1,0,0.020,-0.010,0.980,3.85,TIMER DUE (15mns.)
+box_001,1703123456789,25.5,60.0,14.562000,121.112100,15.0,0,0,1,0,0,0,0,0.020,-0.010,0.980,3.85,TIMER DUE (15mns.)
 ```
 
 ### Master-to-Slave Control Message Format

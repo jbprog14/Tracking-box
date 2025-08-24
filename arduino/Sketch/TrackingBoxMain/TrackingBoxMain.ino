@@ -697,7 +697,7 @@ void collectSensorReading() {
   currentData.securityBreachActive = rtcSecurityBreachDetected;
 
   if (currentData.gpsFixValid || currentData.coarseFix) {
-    currentData.currentLocation = String(currentData.latitude, 4) + ", " + String(currentData.longitude, 4);
+    currentData.currentLocation = String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6);
   } else {
     currentData.currentLocation = "GPS Initializing. Please Wait. . .";
   }
@@ -1536,7 +1536,7 @@ bool sendSensorDataToFirebase() {
   String jsonData = "{";
   jsonData += "\"temp\":" + String(currentData.temperature, 1) + ",";
   jsonData += "\"humidity\":" + String(currentData.humidity, 1) + ",";
-  jsonData += "\"currentLocation\":\"" + String(currentData.latitude, 6) + "," + String(currentData.longitude, 6) + "\",";
+  jsonData += "\"currentLocation\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
   jsonData += "\"altitude\":" + String(currentData.altitude, 1) + ",";
   jsonData += "\"tilt\":" + String(currentData.tiltDetected ? "true" : "false") + ",";
   jsonData += "\"fall\":" + String(currentData.fallDetected ? "true" : "false") + ",";

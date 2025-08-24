@@ -220,6 +220,38 @@ export default function Home() {
             Object.keys(rawData).forEach((boxId) => {
               const box = rawData[boxId];
               if (box && typeof box === "object") {
+                // Extract latest sensor data (handle both single object and push ID structure)
+                let latestSensorData: any = {};
+                
+                if (box.sensorData) {
+                  const sensorDataKeys = Object.keys(box.sensorData);
+                  
+                  // Check if sensorData has Firebase push IDs (keys starting with "-")
+                  if (sensorDataKeys.length > 0 && sensorDataKeys[0].startsWith('-')) {
+                    // Multiple entries with push IDs - get the latest one
+                    const sensorEntries = Object.entries(box.sensorData)
+                      .map(([key, value]: [string, any]) => ({
+                        key,
+                        ...value,
+                        // Ensure timestamp exists for sorting
+                        timestamp: value.timestamp || 0
+                      }))
+                      .sort((a, b) => {
+                        // Sort by timestamp descending (latest first)
+                        return (b.timestamp || 0) - (a.timestamp || 0);
+                      });
+                    
+                    // Use the most recent entry
+                    if (sensorEntries.length > 0) {
+                      latestSensorData = sensorEntries[0];
+                      console.log(`Using latest sensor data for ${boxId} from push ID: ${sensorEntries[0].key}`);
+                    }
+                  } else {
+                    // Single object structure (from PUT operation)
+                    latestSensorData = box.sensorData;
+                  }
+                }
+
                 validatedData[boxId] = {
                   details: {
                     name: box.details?.name || "",
@@ -244,26 +276,26 @@ export default function Home() {
                     serviceType: box.details?.serviceType || "",
                   },
                   sensorData: {
-                    temp: box.sensorData?.temp || 0,
-                    humidity: box.sensorData?.humidity || 0,
-                    accelerometer: box.sensorData?.accelerometer || "NORMAL",
+                    temp: latestSensorData?.temp || 0,
+                    humidity: latestSensorData?.humidity || 0,
+                    accelerometer: latestSensorData?.accelerometer || "NORMAL",
                     currentLocation:
-                      box.sensorData?.currentLocation || "No GPS Fix",
-                    batteryVoltage: box.sensorData?.batteryVoltage || 0,
+                      latestSensorData?.currentLocation || "No GPS Fix",
+                    batteryVoltage: latestSensorData?.batteryVoltage || 0,
                     wakeUpReason:
-                      box.sensorData?.wakeUpReason ||
-                      box.sensorData?.wakeReason ||
+                      latestSensorData?.wakeUpReason ||
+                      latestSensorData?.wakeReason ||
                       "",
-                    timestamp: box.sensorData?.timestamp || 0,
-                    bootCount: box.sensorData?.bootCount || 0,
-                    altitude: box.sensorData?.altitude || 0,
+                    timestamp: latestSensorData?.timestamp || 0,
+                    bootCount: latestSensorData?.bootCount || 0,
+                    altitude: latestSensorData?.altitude || 0,
                     limitSwitchPressed:
-                      box.sensorData?.limitSwitchPressed ?? true, // Default to true (secure)
-                    locationBreach: box.sensorData?.locationBreach || false,
+                      latestSensorData?.limitSwitchPressed ?? true, // Default to true (secure)
+                    locationBreach: latestSensorData?.locationBreach || false,
                     securityBreachActive:
-                      box.sensorData?.securityBreachActive || false,
-                    buzzerIsActive: box.sensorData?.buzzerIsActive || false,
-                    buzzerDismissed: box.sensorData?.buzzerDismissed || false,
+                      latestSensorData?.securityBreachActive || false,
+                    buzzerIsActive: latestSensorData?.buzzerIsActive || false,
+                    buzzerDismissed: latestSensorData?.buzzerDismissed || false,
                   },
                 };
               }
