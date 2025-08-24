@@ -737,11 +737,12 @@ void readGPSLocation() {
   delay(2000);                      
   sendGPSCommand("AT+CGPSNMEARATE=1");
   delay(2000);                      
+  delay(30000);                      // Initial delay before GPS acquisition
   sendGPSCommand("AT+CGPS=1,1");   // Start GPS in standalone mode
   delay(2000);                      // Allow the receiver to power-up
 
-  // Enable unsolicited CGPSINFO while we wait so we can observe sentences
-  sendAT("AT+CGPSINFOCFG=1,31", 2000);
+  // Skip AT+CGPSINFOCFG command - commented out
+  // sendAT("AT+CGPSINFOCFG=1,31", 2000);
   Serial.println("\nWaiting 10 seconds for GPS to get signal...");
   
   // Check for interrupts during 10 second GPS wait
@@ -755,7 +756,7 @@ void readGPSLocation() {
     delay(100);
   }
   
-  sendAT("AT+CGPSINFOCFG=0,31", 2000);
+  // sendAT("AT+CGPSINFOCFG=0,31", 2000);
   // Power-mode and NMEA configuration diagnostics
   sendAT("AT+CGPSPMD?", 2000);
   sendAT("AT+CGPSNMEA?", 2000);
@@ -814,38 +815,131 @@ void readBatteryVoltage() {
 // Fast Cell-tower location (CLBS)
 // ---------------------------------------------------------------------------
 bool readCellLocation() {
+  Serial.println("📡 Starting CLBS positioning sequence...");
   flushSIM7600Buffer();
-  sim7600.println("AT+CLBS=1,1");
-  String resp = waitForGPSResponse(5000);
-
+  
+  // Step 1: Check network registration (GSM/GPRS)
+  sim7600.println("AT+CREG?");
+  String resp = waitForGPSResponse(2000);
+  if (resp.indexOf("+CREG: 0,1") == -1 && resp.indexOf("+CREG: 0,5") == -1) {
+    Serial.println("✗ Not registered to network (CREG)");
+    return false;
+  }
+  Serial.println("✓ Network registration OK (CREG)");
+  
+  // Step 2: Check LTE registration
+  flushSIM7600Buffer();
+  sim7600.println("AT+CEREG?");
+  resp = waitForGPSResponse(2000);
+  if (resp.indexOf("+CEREG: 0,1") == -1 && resp.indexOf("+CEREG: 0,5") == -1) {
+    Serial.println("⚠️ Not registered to LTE (CEREG) - continuing anyway");
+  } else {
+    Serial.println("✓ LTE registration OK (CEREG)");
+  }
+  
+  // Step 3: Check signal quality
+  flushSIM7600Buffer();
+  sim7600.println("AT+CSQ");
+  resp = waitForGPSResponse(2000);
+  int csqIdx = resp.indexOf("+CSQ:");
+  if (csqIdx != -1) {
+    int signalStrength = resp.substring(csqIdx + 6, resp.indexOf(',', csqIdx + 6)).toInt();
+    Serial.printf("📶 Signal strength: %d", signalStrength);
+    if (signalStrength < 5) {
+      Serial.println(" (weak - may affect accuracy)");
+    } else {
+      Serial.println(" (good)");
+    }
+  }
+  
+  // Step 4: Start network connection
+  flushSIM7600Buffer();
+  sim7600.println("AT+CNETSTART");
+  resp = waitForGPSResponse(3000);
+  if (resp.indexOf("ERROR") != -1) {
+    Serial.println("⚠️ CNETSTART failed, trying restart...");
+    flushSIM7600Buffer();
+    sim7600.println("AT+CNETSTOP");
+    delay(1000);
+    flushSIM7600Buffer();
+    sim7600.println("AT+CNETSTART");
+    resp = waitForGPSResponse(3000);
+    if (resp.indexOf("ERROR") != -1) {
+      Serial.println("✗ Failed to start network connection");
+      return false;
+    }
+  }
+  Serial.println("✓ Network connection started");
+  
+  // Step 5: Get CLBS location
+  flushSIM7600Buffer();
+  sim7600.println("AT+CLBS=1");
+  resp = waitForGPSResponse(10000);  // Increased timeout for CLBS
+  
   int idx = resp.indexOf("+CLBS:");
-  if (idx == -1) return false;
-
-  // Expect format: +CLBS: <err>,<lat>,<lon>,<date>,<time>
+  if (idx == -1) {
+    Serial.println("✗ No CLBS response");
+    return false;
+  }
+  
+  // Parse format: +CLBS: <locationcode>,<longitude>,<latitude>,<acc>
   int firstComma = resp.indexOf(',', idx);
-  if (firstComma == -1) return false;
-  int err = resp.substring(idx + 7, firstComma).toInt();
-  if (err != 0) return false;
-
+  if (firstComma == -1) {
+    Serial.println("✗ Invalid CLBS format");
+    return false;
+  }
+  
+  // Get location code (error code)
+  String locCode = resp.substring(idx + 7, firstComma);
+  int err = locCode.toInt();
+  if (err != 0) {
+    Serial.printf("✗ CLBS error code: %d\n", err);
+    return false;
+  }
+  
+  // Get longitude (comes before latitude)
   int secondComma = resp.indexOf(',', firstComma + 1);
-  if (secondComma == -1) return false;
+  if (secondComma == -1) {
+    Serial.println("✗ Missing longitude in CLBS response");
+    return false;
+  }
+  String lonStr = resp.substring(firstComma + 1, secondComma);
+  
+  // Get latitude
   int thirdComma = resp.indexOf(',', secondComma + 1);
-  if (thirdComma == -1) return false;
-
-  String latStr = resp.substring(firstComma + 1, secondComma);
-  String lonStr = resp.substring(secondComma + 1, thirdComma);
-
-  double lat = latStr.toDouble();
+  if (thirdComma == -1) {
+    Serial.println("✗ Missing latitude in CLBS response");
+    return false;
+  }
+  String latStr = resp.substring(secondComma + 1, thirdComma);
+  
+  // Get accuracy if available
+  int fourthComma = resp.indexOf(',', thirdComma + 1);
+  String accStr = "";
+  if (fourthComma != -1) {
+    accStr = resp.substring(thirdComma + 1, fourthComma);
+  }
+  
   double lon = lonStr.toDouble();
-  if (lat == 0.0 || lon == 0.0) return false;
-
+  double lat = latStr.toDouble();
+  
+  if (lat == 0.0 || lon == 0.0) {
+    Serial.println("✗ Invalid coordinates (0,0)");
+    return false;
+  }
+  
   currentData.latitude = lat;
   currentData.longitude = lon;
   currentData.altitude = 0;
   currentData.gpsFixValid = false;   // not a GNSS fix
   currentData.coarseFix = true;
-
-  Serial.printf("✓ CLBS coarse fix: %.5f, %.5f\n", lat, lon);
+  
+  if (accStr.length() > 0) {
+    Serial.printf("✓ CLBS coarse fix: %.5f, %.5f (accuracy: %sm)\n", lat, lon, accStr.c_str());
+  } else {
+    Serial.printf("✓ CLBS coarse fix: %.5f, %.5f\n", lat, lon);
+  }
+  
   return true;
 }
 
