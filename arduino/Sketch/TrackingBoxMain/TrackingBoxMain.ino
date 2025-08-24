@@ -450,6 +450,17 @@ void setup() {
   collectSensorReading();
   Serial.println("✅ Sensor Readings Collected.");
   
+  // Fetch latest shipping label data from Firebase before display update
+  Serial.println("🌐 Fetching shipping label data from Firebase...");
+  String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
+  String detailsData = readFirebaseHTTP(detailsPath);
+  if (detailsData.length() > 0 && detailsData.indexOf("null") == -1) {
+    parseFirebaseDetails(detailsData);
+    Serial.println("✅ Shipping label data updated from Firebase");
+  } else {
+    Serial.println("⚠️ No shipping label data found in Firebase - using defaults");
+  }
+  
   // Send sensor data directly to Firebase
   if (sendSensorDataToFirebase()) {
     Serial.println("✅ Sensor data sent to Firebase.");
@@ -1805,7 +1816,7 @@ bool checkFirebaseControls() {
 
 void parseFirebaseDetails(String jsonData) {
   // Parse device details from Firebase
-  // Format: {"name":"...","setLocation":"...","description":"..."}
+  // Format: {"name":"...","setLocation":"...","description":"...","senderName":"...","recipientName":"...",...}
   
   int nameStart = jsonData.indexOf("\"name\":\"") + 8;
   if (nameStart > 7) {
@@ -1826,6 +1837,108 @@ void parseFirebaseDetails(String jsonData) {
       strncpy(rtcDeviceSetLocation, currentData.deviceSetLocation.c_str(), sizeof(rtcDeviceSetLocation) - 1);
       rtcDeviceDetailsValid = true;
       Serial.println("✅ Updated setLocation: " + currentData.deviceSetLocation);
+    }
+  }
+  
+  // Parse description
+  int descStart = jsonData.indexOf("\"description\":\"") + 15;
+  if (descStart > 14) {
+    int descEnd = jsonData.indexOf("\"", descStart);
+    if (descEnd != -1) {
+      currentData.deviceDescription = jsonData.substring(descStart, descEnd);
+      Serial.println("✅ Updated description: " + currentData.deviceDescription);
+    }
+  }
+  
+  // Parse shipping label fields
+  
+  // Sender Name
+  int senderNameStart = jsonData.indexOf("\"senderName\":\"") + 14;
+  if (senderNameStart > 13) {
+    int senderNameEnd = jsonData.indexOf("\"", senderNameStart);
+    if (senderNameEnd != -1) {
+      currentData.senderName = jsonData.substring(senderNameStart, senderNameEnd);
+      Serial.println("✅ Updated sender name: " + currentData.senderName);
+    }
+  }
+  
+  // Sender Address
+  int senderAddrStart = jsonData.indexOf("\"senderAddress\":\"") + 17;
+  if (senderAddrStart > 16) {
+    int senderAddrEnd = jsonData.indexOf("\"", senderAddrStart);
+    if (senderAddrEnd != -1) {
+      currentData.senderAddress = jsonData.substring(senderAddrStart, senderAddrEnd);
+      Serial.println("✅ Updated sender address: " + currentData.senderAddress);
+    }
+  }
+  
+  // Recipient Name
+  int recipNameStart = jsonData.indexOf("\"recipientName\":\"") + 17;
+  if (recipNameStart > 16) {
+    int recipNameEnd = jsonData.indexOf("\"", recipNameStart);
+    if (recipNameEnd != -1) {
+      currentData.recipientName = jsonData.substring(recipNameStart, recipNameEnd);
+      Serial.println("✅ Updated recipient name: " + currentData.recipientName);
+    }
+  }
+  
+  // Recipient Address
+  int recipAddrStart = jsonData.indexOf("\"recipientAddress\":\"") + 20;
+  if (recipAddrStart > 19) {
+    int recipAddrEnd = jsonData.indexOf("\"", recipAddrStart);
+    if (recipAddrEnd != -1) {
+      currentData.recipientAddress = jsonData.substring(recipAddrStart, recipAddrEnd);
+      Serial.println("✅ Updated recipient address: " + currentData.recipientAddress);
+    }
+  }
+  
+  // Package Weight
+  int weightStart = jsonData.indexOf("\"packWeight\":\"") + 14;
+  if (weightStart > 13) {
+    int weightEnd = jsonData.indexOf("\"", weightStart);
+    if (weightEnd != -1) {
+      currentData.packWeight = jsonData.substring(weightStart, weightEnd);
+      Serial.println("✅ Updated package weight: " + currentData.packWeight);
+    }
+  }
+  
+  // Routing Code
+  int routingStart = jsonData.indexOf("\"routingCode\":\"") + 15;
+  if (routingStart > 14) {
+    int routingEnd = jsonData.indexOf("\"", routingStart);
+    if (routingEnd != -1) {
+      currentData.routingCode = jsonData.substring(routingStart, routingEnd);
+      Serial.println("✅ Updated routing code: " + currentData.routingCode);
+    }
+  }
+  
+  // Postal Code
+  int postalStart = jsonData.indexOf("\"postalCode\":\"") + 14;
+  if (postalStart > 13) {
+    int postalEnd = jsonData.indexOf("\"", postalStart);
+    if (postalEnd != -1) {
+      currentData.postalCode = jsonData.substring(postalStart, postalEnd);
+      Serial.println("✅ Updated postal code: " + currentData.postalCode);
+    }
+  }
+  
+  // Tracking Number
+  int trackingStart = jsonData.indexOf("\"trackingNumber\":\"") + 18;
+  if (trackingStart > 17) {
+    int trackingEnd = jsonData.indexOf("\"", trackingStart);
+    if (trackingEnd != -1) {
+      currentData.trackingNumber = jsonData.substring(trackingStart, trackingEnd);
+      Serial.println("✅ Updated tracking number: " + currentData.trackingNumber);
+    }
+  }
+  
+  // Service Type
+  int serviceStart = jsonData.indexOf("\"serviceType\":\"") + 15;
+  if (serviceStart > 14) {
+    int serviceEnd = jsonData.indexOf("\"", serviceStart);
+    if (serviceEnd != -1) {
+      currentData.serviceType = jsonData.substring(serviceStart, serviceEnd);
+      Serial.println("✅ Updated service type: " + currentData.serviceType);
     }
   }
 }
