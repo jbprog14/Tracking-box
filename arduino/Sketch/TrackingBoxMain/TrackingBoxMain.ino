@@ -1229,19 +1229,29 @@ void drawBarcode(int xPos, int yPos, int width, int height) {
     Paint_DrawRectangle(xPos, yPos, xPos + width, yPos + height, 
                        EPD_7IN3F_WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
     
-    // Draw vertical bars pattern
-    int barWidth = 2;
-    int currentX = xPos + 10;
+    // Draw vertical bars pattern - optimized for wider display
+    int barWidth = 3;  // Wider base bars for better visibility
+    int currentX = xPos + 5;  // Start closer to edge
     
-    // Simple pattern of bars
-    for (int i = 0; i < 80 && currentX < (xPos + width - 10); i++) {
-        if (i % 3 == 0 || i % 5 == 0) {
-            int thisBarWidth = (i % 7 == 0) ? barWidth * 2 : barWidth;
-            Paint_DrawRectangle(currentX, yPos, currentX + thisBarWidth, yPos + height, 
+    // Create a more realistic barcode pattern that fills the width
+    for (int i = 0; i < 120 && currentX < (xPos + width - 5); i++) {
+        // Varied pattern for realistic barcode appearance
+        if (i % 2 == 0 || i % 3 == 0 || i % 5 == 0) {
+            // Vary bar widths: thin (3px), medium (6px), thick (9px)
+            int thisBarWidth;
+            if (i % 7 == 0) {
+                thisBarWidth = barWidth * 3;  // Thick bar
+            } else if (i % 4 == 0) {
+                thisBarWidth = barWidth * 2;  // Medium bar
+            } else {
+                thisBarWidth = barWidth;      // Thin bar
+            }
+            
+            Paint_DrawRectangle(currentX, yPos + 2, currentX + thisBarWidth, yPos + height - 2, 
                                EPD_7IN3F_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-            currentX += thisBarWidth + 1;
+            currentX += thisBarWidth + 2;  // Small gap between bars
         } else {
-            currentX += barWidth;
+            currentX += barWidth + 1;  // Space for white areas
         }
     }
 }
@@ -1290,7 +1300,7 @@ void updateDisplay() {
   y += 30;
   
   // Horizontal divider
-  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
+  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
   y += 20;
   
   // ========== RECIPIENT INFORMATION ==========
@@ -1312,18 +1322,14 @@ void updateDisplay() {
   Paint_DrawString_EN(leftMargin, y, weight.c_str(), &Font24, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   y += 40;
   
-  // ========== MAXICODE AND ROUTING INFO ==========
-  // MAXICODE placeholder
-  Paint_DrawRectangle(leftMargin, y, leftMargin + 70, y + 70, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, DRAW_FILL_EMPTY);
-  Paint_DrawString_EN(leftMargin + 15, y + 25, "MAXI", &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  Paint_DrawString_EN(leftMargin + 15, y + 45, "CODE", &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  
-  // Routing Code and Postal Code
+  // ========== ROUTING INFO ==========
+  // Routing Code and Postal Code (without Maxicode)
   String routing = currentData.routingCode.length() > 0 ? currentData.routingCode : "Not Provided";
   String postal = currentData.postalCode.length() > 0 ? currentData.postalCode : "Not Provided";
   
-  Paint_DrawString_EN(leftMargin + 90, y + 10, routing.c_str(), &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  Paint_DrawString_EN(leftMargin + 90, y + 40, postal.c_str(), &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(leftMargin, y + 10, routing.c_str(), &Font20, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(leftMargin, y + 40, postal.c_str(), &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  y += 70;  // Move y position after routing info
 
   // ========== RIGHT COLUMN - SERVICE TYPE AND QR CODE ==========
   uint16_t rightY = 85;
@@ -1346,10 +1352,10 @@ void updateDisplay() {
   QRCode qrcode;
   qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, qrUrl.c_str());
   
-  // Draw QR code
-  const int scale = 3;
+  // Draw QR code (larger size)
+  const int scale = 4;  // Increased from 3 to 4 for larger QR code
   const int qrSize = qrcode.size;
-  const int qrOffsetX = rightColumnX + 60;
+  const int qrOffsetX = rightColumnX + 40;  // Adjusted for better centering
   const int qrOffsetY = rightY;
   
   for (int qy = 0; qy < qrSize; qy++) {
@@ -1365,8 +1371,8 @@ void updateDisplay() {
   }
   
   // ========== TRACKING NUMBER ==========
-  y = 320;
-  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_2X2, LINE_STYLE_SOLID);
+  y += 20;  // Add spacing before tracking section
+  Paint_DrawLine(30, y, EPD_7IN3F_WIDTH - 30, y, EPD_7IN3F_BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
   y += 20;
   
   String tracking = currentData.trackingNumber.length() > 0 ? currentData.trackingNumber : "Not Provided";
@@ -1376,12 +1382,12 @@ void updateDisplay() {
   y += 40;
   
   // ========== BARCODE ==========
-  drawBarcode(40, y, EPD_7IN3F_WIDTH - 80, 50);
-  y += 55;
+  drawBarcode(50, y, 700, 60);  // Extended to 700px width with 50px margins, taller at 60px
+  y += 65;
   
-  // Barcode numbers
-  Paint_DrawString_EN(50, y, "0522", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
-  Paint_DrawString_EN(EPD_7IN3F_WIDTH - 100, y, "2077", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  // Barcode numbers aligned with extended barcode
+  Paint_DrawString_EN(60, y, "0522", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(710, y, "2077", &Font16, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   
   // ========== BOTTOM INFO ==========
   y += 30;
@@ -1389,8 +1395,12 @@ void updateDisplay() {
   snprintf(buf, sizeof(buf), "REF: %s", currentData.referenceCode.c_str());
   Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   
-  // Show current GPS location (small font)
-  snprintf(buf, sizeof(buf), "GPS: %.6f, %.6f", currentData.latitude, currentData.longitude);
+  // Show current GPS location with better formatting
+  char latDir = currentData.latitude >= 0 ? 'N' : 'S';
+  char lonDir = currentData.longitude >= 0 ? 'E' : 'W';
+  snprintf(buf, sizeof(buf), "%.4f %c %.4f %c", 
+           fabs(currentData.latitude), latDir, 
+           fabs(currentData.longitude), lonDir);
   Paint_DrawString_EN(rightColumnX, y, buf, &Font8, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
 
   // ------------------------------
