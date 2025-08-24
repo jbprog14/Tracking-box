@@ -351,10 +351,11 @@ void setup() {
   rtcBootCount++;
   currentData.bootCount = rtcBootCount;
 
-  // Load or generate reference code from permanent storage
+  // Load or generate reference code and device ID from permanent storage
   preferences.begin("tracking", false);  // Open in read/write mode
-  String storedRefCode = preferences.getString("refCode", "");
   
+  // Load reference code
+  String storedRefCode = preferences.getString("refCode", "");
   if (storedRefCode.length() == 0) {
     // No reference code exists in permanent storage, generate one
     generateReferenceCode();
@@ -368,6 +369,17 @@ void setup() {
     rtcReferenceCodeGenerated = true;
     Serial.println("✓ Loaded permanent reference code: " + storedRefCode);
   }
+  
+  // Load saved device ID from permanent storage
+  String storedDeviceID = preferences.getString("deviceID", "");
+  if (storedDeviceID.length() > 0) {
+    // Device ID exists in permanent storage, use it
+    actualDeviceID = storedDeviceID;
+    actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
+    rtcDeviceIDValidated = true;
+    Serial.println("✓ Loaded permanent device ID: " + actualDeviceID);
+  }
+  
   preferences.end();
   
   currentData.referenceCode = String(rtcReferenceCode);
@@ -385,28 +397,34 @@ void setup() {
     Serial.println("❌ Failed to initialize cellular data.");
   }
   
-  // Validate Device ID uniqueness (only if not already validated)
-  if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
-    Serial.println("\n🔍 Validating Device ID uniqueness...");
-    actualDeviceID = validateAndGetUniqueDeviceID();
-    actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
-    rtcDeviceIDValidated = true;
-    
-    // Save to preferences for permanent storage
-    preferences.begin("tracking", false);
-    preferences.putString("deviceID", actualDeviceID);
-    preferences.end();
-    
-    if (actualDeviceID != DEVICE_ID) {
-      Serial.println("⚠️ Original ID '" + DEVICE_ID + "' was already taken");
-      Serial.println("✅ Assigned new unique ID: " + actualDeviceID);
+  // Validate Device ID uniqueness only if we don't have a saved ID
+  if (actualDeviceID.length() == 0) {
+    // No saved device ID found in permanent storage or RTC memory
+    if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
+      Serial.println("\n🔍 No saved device ID found. Validating Device ID uniqueness...");
+      actualDeviceID = validateAndGetUniqueDeviceID();
+      actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
+      rtcDeviceIDValidated = true;
+      
+      // Save to preferences for permanent storage
+      preferences.begin("tracking", false);
+      preferences.putString("deviceID", actualDeviceID);
+      preferences.end();
+      
+      if (actualDeviceID != DEVICE_ID) {
+        Serial.println("⚠️ Original ID '" + DEVICE_ID + "' was already taken");
+        Serial.println("✅ Assigned new unique ID: " + actualDeviceID);
+      } else {
+        Serial.println("✅ Using original ID: " + actualDeviceID);
+      }
     } else {
-      Serial.println("✅ Using original ID: " + actualDeviceID);
+      // Load from RTC memory (survives deep sleep)
+      actualDeviceID = String(rtcActualDeviceID);
+      Serial.println("✅ Using saved Device ID from RTC: " + actualDeviceID);
     }
   } else {
-    // Load from RTC memory (survives deep sleep)
-    actualDeviceID = String(rtcActualDeviceID);
-    Serial.println("✅ Using saved Device ID: " + actualDeviceID);
+    // Device ID was already loaded from permanent storage
+    Serial.println("✅ Using permanent Device ID: " + actualDeviceID);
   }
   
   // Check for control commands from Firebase (skip on first boot)
@@ -874,7 +892,7 @@ bool readCellLocation() {
   // Step 5: Get CLBS location
   flushSIM7600Buffer();
   sim7600.println("AT+CLBS=1");
-  resp = waitForGPSResponse(10000);  // Increased timeout for CLBS
+  resp = waitForGPSResponse(20000);  // Increased timeout for CLBS
   
   int idx = resp.indexOf("+CLBS:");
   if (idx == -1) {
