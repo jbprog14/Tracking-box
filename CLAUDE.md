@@ -35,17 +35,22 @@ Use Arduino IDE with the following libraries installed:
 - GxEPD2
 - Adafruit_SHT31
 - SparkFun_LSM6DSL
+- TinyGSM (for SIM7600 cellular connectivity)
 
-Main firmware: `arduino/Sketch/TrackingBoxMain/TrackingBoxMain.ino`
+Main firmware files:
+- Tracking Device: `arduino/Sketch/TrackingBoxMain/TrackingBoxMain.ino`
+- Master Device: `arduino/Sketch/MasterDevice/MasterDevice.ino`
 
 ### Test Sketches
 - `TrackingBoxDisplayTest/`: E-ink display testing
-- `accel-gyro/`: LSM6DSL accelerometer testing
+- `accel-gyro/`: LSM6DSL accelerometer testing for tilt/fall detection
 - `gps-gnss-ip/`: SIM7600 GPS module testing
-- `sht-gyro/`: Combined sensor testing
+- `sht-gyro/`: Combined SHT31 and LSM6DSL sensor testing
 - `epd7in3f-demo/`: E-ink display demo
 - `M2S/`: SMS reading functionality
 - `MasterSMSToFirebase/`: SMS receiver debug tool
+- `sim7600_at_command_test/`: SIM7600 module AT command testing
+- `dfr_firebase/`: Firebase connectivity testing
 
 ## Architecture
 
@@ -66,8 +71,8 @@ The ESP32 tracking devices operate in cycles:
 1. Deep sleep (15 minutes default)
 2. Wake on timer or motion interrupt
 3. Read sensors (temperature, humidity, GPS, accelerometer)
-4. Try to send data to Firebase via WiFi
-5. If WiFi fails, send SMS to Master device
+4. Send data directly to Firebase via cellular data (SIM7600)
+5. If cellular fails, fallback to SMS mode (legacy)
 6. Update e-ink display (LAST STEP - refresh takes significant time)
 7. Return to sleep
 
@@ -84,10 +89,10 @@ A dedicated ESP32 with SIM7600 that:
 
 #### Communication Flow
 ```
-1. Normal Operation (WiFi Available):
-   Slave Device <---> Firebase (direct connection)
+1. Current Operation (Direct Cellular):
+   Tracking Device <---> Firebase (via SIM7600 cellular data)
 
-2. SMS Fallback Mode (No WiFi):
+2. Legacy SMS Fallback Mode (preserved for compatibility):
    Slave Device --SMS--> Master Device --WiFi--> Firebase
    Slave Device <--SMS-- Master Device <--WiFi-- Firebase
 ```
@@ -98,7 +103,7 @@ A dedicated ESP32 with SIM7600 that:
 **Note**: There are discrepancies between documentation. Use these from `Pin Configs.txt`:
 - SHT30: SDA=21, SCL=22
 - LSM6DSL: SDA=21, SCL=22, INT=34
-- SIM7600: RX=16, TX=17
+- SIM7600: RX=16, TX=17 (Note: Recent code may use pins 18/19 for UART2)
 - E-ink: DIN=14, SCLK=13, CS=15, DC=27, RST=26, BUSY=25
 - Battery ADC: Pin 36
 - Buzzer: Pin 32
@@ -110,7 +115,7 @@ A dedicated ESP32 with SIM7600 that:
 tracking_box/
   box_XXX/
     details/
-      name, setLocation, description
+      name, setLocation, description, referenceCode
     sensorData/
       temp, humidity, accelerometer, currentLocation, 
       batteryVoltage, wakeReason, timestamp, solenoid,
@@ -172,6 +177,12 @@ For continuous testing without deep sleep:
 - Device will run continuous 30-second cycles
 - Useful for debugging sensor readings and connectivity
 
+### Testing Approach
+- Individual component tests in `arduino/Sketch/` subdirectories
+- Each sensor has dedicated test sketch for isolated debugging
+- Master device can be tested with `MasterSMSToFirebase` sketch
+- Web dashboard development server supports hot reload
+
 ## Important Configuration
 
 ### Web Dashboard
@@ -180,6 +191,17 @@ For continuous testing without deep sleep:
 - Tailwind config includes custom CSS variables for theming
 
 ### Arduino Firmware
-- WiFi credentials must be set in firmware before upload
+- WiFi credentials must be set in firmware before upload (when using WiFi mode)
+- SIM7600 APN configuration required for cellular connectivity
 - Device ID and owner info configured in main sketch
 - Development mode available (disables deep sleep)
+- Battery voltage calibration may be needed based on voltage divider
+
+## Recent Architecture Changes
+
+### Direct Firebase Connection (Current)
+The system has been migrated from SMS-based communication to direct Firebase connection via cellular data:
+- Each tracking device now uses SIM7600 for direct Firebase updates
+- SMS functionality preserved as fallback/legacy mode
+- Master device role reduced but maintained for backward compatibility
+- See `FIREBASE_MIGRATION_SUMMARY.md` for migration details

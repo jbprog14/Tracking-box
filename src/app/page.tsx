@@ -57,9 +57,24 @@ interface SensorData {
   buzzerDismissed?: boolean;
 }
 
+interface MotionAlert {
+  deviceId: string;
+  location: string;
+  message: string;
+  timestamp: number;
+  type: string;
+}
+
+interface Alerts {
+  motion?: {
+    [key: string]: MotionAlert;
+  };
+}
+
 interface TrackingBox {
   details: TrackingBoxDetails;
   sensorData: SensorData;
+  alerts?: Alerts;
 }
 
 interface TrackingData {
@@ -237,14 +252,15 @@ export default function Home() {
                         timestamp: value.timestamp || 0
                       }))
                       .sort((a, b) => {
-                        // Sort by timestamp descending (latest first)
-                        return (b.timestamp || 0) - (a.timestamp || 0);
+                        // Sort by Firebase push ID (lexicographically)
+                        // Firebase push IDs are chronologically ordered - newer IDs are greater
+                        return b.key.localeCompare(a.key);
                       });
                     
-                    // Use the most recent entry
+                    // Use the most recent entry (first after sorting by push ID)
                     if (sensorEntries.length > 0) {
                       latestSensorData = sensorEntries[0];
-                      console.log(`Using latest sensor data for ${boxId} from push ID: ${sensorEntries[0].key}`);
+                      console.log(`Using latest sensor data for ${boxId} from push ID: ${sensorEntries[0].key} (newest by push ID)`);
                     }
                   } else {
                     // Single object structure (from PUT operation)
@@ -297,6 +313,7 @@ export default function Home() {
                     buzzerIsActive: latestSensorData?.buzzerIsActive || false,
                     buzzerDismissed: latestSensorData?.buzzerDismissed || false,
                   },
+                  alerts: box.alerts || undefined, // Capture alerts from Firebase
                 };
               }
             });
@@ -308,19 +325,30 @@ export default function Home() {
               const currentBox = validatedData[boxId];
               const prevBox = prevData ? prevData[boxId] : null;
 
-              // Check for motion detection wake up
+              // Check for motion alerts from Firebase alerts/motion path
               if (currentBox && prevBox) {
-                const currentWakeReason = currentBox.sensorData.wakeUpReason || "";
-                const prevWakeReason = prevBox.sensorData.wakeUpReason || "";
+                // Get current motion alerts
+                const currentMotionAlerts = currentBox.alerts?.motion || {};
+                const prevMotionAlerts = prevBox.alerts?.motion || {};
                 
-                // Check if wake reason changed to motion detection
-                if (currentWakeReason.toLowerCase().includes("motion") && 
-                    !prevWakeReason.toLowerCase().includes("motion")) {
+                // Check for new motion alerts (alerts that exist now but didn't exist before)
+                const currentAlertKeys = Object.keys(currentMotionAlerts);
+                const prevAlertKeys = Object.keys(prevMotionAlerts);
+                
+                // Find new alert keys
+                const newAlertKeys = currentAlertKeys.filter(key => !prevAlertKeys.includes(key));
+                
+                // If there are new motion alerts, show toast
+                if (newAlertKeys.length > 0) {
+                  // Get the most recent new alert
+                  const latestAlertKey = newAlertKeys[newAlertKeys.length - 1];
+                  const latestAlert = currentMotionAlerts[latestAlertKey];
+                  
                   toast(
-                    `🏃 Motion detected on ${currentBox.details.name || boxId}`,
+                    `🏃 ${latestAlert?.message || 'Motion detected'} on ${currentBox.details.name || boxId}`,
                     {
                       id: `motion-toast-${boxId}-${Date.now()}`,
-                      duration: 15000, // Changed from 5000ms (5 seconds) to 15000ms (15 seconds)
+                      duration: 15000, // 15 seconds
                       position: "top-right",
                       style: {
                         background: "#FEF3C7",
@@ -333,6 +361,18 @@ export default function Home() {
                       },
                     }
                   );
+                  
+                  // Clean up the motion alert after toast duration
+                  setTimeout(async () => {
+                    try {
+                      // Remove the specific motion alert from Firebase
+                      const alertRef = ref(db, `tracking_box/${boxId}/alerts/motion/${latestAlertKey}`);
+                      await set(alertRef, null);
+                      console.log(`Motion alert ${latestAlertKey} removed for ${boxId} after toast duration`);
+                    } catch (error) {
+                      console.error(`Error removing motion alert for ${boxId}:`, error);
+                    }
+                  }, 15000); // Match the toast duration
                 }
               }
 
