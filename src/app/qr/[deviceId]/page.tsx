@@ -83,13 +83,45 @@ export default function QRDevicePage() {
           try {
             const data = snapshot.val();
             if (data) {
+              // Extract latest sensor data (handle both single object and push ID structure)
+              let latestSensorData: any = {};
+              
+              if (data.sensorData) {
+                const sensorDataKeys = Object.keys(data.sensorData);
+                
+                // Check if sensorData has Firebase push IDs (keys starting with "-")
+                if (sensorDataKeys.length > 0 && sensorDataKeys[0].startsWith('-')) {
+                  // Multiple entries with push IDs - get the latest one
+                  const sensorEntries = Object.entries(data.sensorData)
+                    .map(([key, value]: [string, any]) => ({
+                      key,
+                      ...value,
+                      // Ensure timestamp exists for sorting
+                      timestamp: value.timestamp || 0
+                    }))
+                    .sort((a, b) => {
+                      // Sort by timestamp descending (latest first)
+                      return (b.timestamp || 0) - (a.timestamp || 0);
+                    });
+                  
+                  // Use the most recent entry
+                  if (sensorEntries.length > 0) {
+                    latestSensorData = sensorEntries[0];
+                    console.log(`[QR Page] Using latest sensor data for ${deviceId} from push ID: ${sensorEntries[0].key}`);
+                  }
+                } else {
+                  // Single object structure (from PUT operation)
+                  latestSensorData = data.sensorData;
+                }
+              }
+
               setDeviceData({
                 details: {
                   name: data.details?.name || "",
                   setLocation: data.details?.setLocation || "",
                   setLocationLabel: data.details?.setLocationLabel || "",
                   description: data.details?.description || "",
-                  referenceCode: data.details?.referenceCode || "",
+                  referenceCode: latestSensorData?.referenceCode || data.details?.referenceCode || "",
                   packDate: data.details?.packDate || "",
                   packWeight: data.details?.packWeight || "",
                   productFrom: data.details?.productFrom || "",
@@ -97,10 +129,10 @@ export default function QRDevicePage() {
                   supplierIdTracking: data.details?.supplierIdTracking || "",
                 },
                 sensorData: {
-                  temp: data.sensorData?.temp || 0,
-                  humidity: data.sensorData?.humidity || 0,
+                  temp: latestSensorData?.temp || 0,
+                  humidity: latestSensorData?.humidity || 0,
                   accelerometer: (() => {
-                    const raw = data.sensorData?.accelerometer;
+                    const raw = latestSensorData?.accelerometer;
                     if (typeof raw === "string") return raw;
                     if (raw && typeof raw === "object") {
                       if (raw.fallDetected) return "FALL DETECTED";
@@ -110,18 +142,18 @@ export default function QRDevicePage() {
                     return "NORMAL";
                   })(),
                   currentLocation:
-                    data.sensorData?.currentLocation || "No GPS Fix",
-                  batteryVoltage: data.sensorData?.batteryVoltage || 0,
+                    latestSensorData?.currentLocation || "No GPS Fix",
+                  batteryVoltage: latestSensorData?.batteryVoltage || 0,
                   wakeUpReason:
-                    data.sensorData?.wakeUpReason ||
-                    data.sensorData?.wakeReason ||
+                    latestSensorData?.wakeUpReason ||
+                    latestSensorData?.wakeReason ||
                     "",
-                  timestamp: data.sensorData?.timestamp || 0,
-                  bootCount: data.sensorData?.bootCount || 0,
-                  altitude: data.sensorData?.altitude || 0,
+                  timestamp: latestSensorData?.timestamp || 0,
+                  bootCount: latestSensorData?.bootCount || 0,
+                  altitude: latestSensorData?.altitude || 0,
                   limitSwitchPressed:
-                    data.sensorData?.limitSwitchPressed || false,
-                  locationBreach: data.sensorData?.locationBreach || false,
+                    latestSensorData?.limitSwitchPressed || false,
+                  locationBreach: latestSensorData?.locationBreach || false,
                 },
               });
               setDataError(null);
