@@ -17,7 +17,6 @@ import {
   MapPin,
   Zap,
   Shield,
-  AlertTriangle,
   Package,
   Calendar,
   Weight,
@@ -69,7 +68,6 @@ interface SensorData {
   bootCount?: number;
   altitude?: number;
   limitSwitchPressed?: boolean;
-  locationBreach?: boolean;
 }
 
 interface TrackingBoxData {
@@ -138,16 +136,6 @@ export default function TrackingBoxModal({
   const deviceDetails = trackingData.details;
 
   const getStatus = () => {
-    if (
-      !currentSensorData.limitSwitchPressed &&
-      currentSensorData.locationBreach
-    ) {
-      return {
-        text: "CRITICAL BREACH",
-        color: "bg-red-600",
-        icon: <AlertTriangle className="h-4 w-4 mr-2" />,
-      };
-    }
     // Safely check for tilt detection
     const tiltDetected =
       typeof currentSensorData.accelerometer === "object" &&

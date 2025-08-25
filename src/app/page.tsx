@@ -52,8 +52,6 @@ interface SensorData {
   bootCount?: number;
   altitude?: number;
   limitSwitchPressed?: boolean;
-  locationBreach?: boolean;
-  securityBreachActive?: boolean;
   buzzerIsActive?: boolean;
   buzzerDismissed?: boolean;
 }
@@ -308,9 +306,6 @@ export default function Home() {
                     altitude: latestSensorData?.altitude || 0,
                     limitSwitchPressed:
                       latestSensorData?.limitSwitchPressed ?? true, // Default to true (secure)
-                    locationBreach: latestSensorData?.locationBreach || false,
-                    securityBreachActive:
-                      latestSensorData?.securityBreachActive || false,
                     buzzerIsActive: latestSensorData?.buzzerIsActive || false,
                     buzzerDismissed: latestSensorData?.buzzerDismissed || false,
                   },
@@ -377,17 +372,10 @@ export default function Home() {
                 }
               }
 
-              const isNowCritical =
-                currentBox &&
-                currentBox.sensorData.securityBreachActive &&
-                currentBox.sensorData.buzzerIsActive &&
-                !currentBox.sensorData.buzzerDismissed;
+              // Security breach alerts removed - no longer tracking geofence/location breach
+              const isNowCritical = false; // Disabled
 
-              const wasPreviouslyCritical =
-                prevBox &&
-                prevBox.sensorData.securityBreachActive &&
-                prevBox.sensorData.buzzerIsActive &&
-                !prevBox.sensorData.buzzerDismissed;
+              const wasPreviouslyCritical = false; // Disabled
 
               if (isNowCritical && !wasPreviouslyCritical) {
                 toast.error(

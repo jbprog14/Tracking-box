@@ -94,7 +94,6 @@ void cleanupSMSMemory();
 void showSMSStorageStatus();
 String getSetLocationFromFirebase(const String &deviceId);
 bool parseCoordinates(const String &coordStr, float &lat, float &lon);
-float calculateDistance(float lat1, float lon1, float lat2, float lon2);
 void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive);
 void updateDismissAlert(const String &deviceId, bool dismissed);
 void sendSetLocationToDevice(const String &phoneNumber, const String &deviceId);
@@ -788,10 +787,7 @@ String csvToFirebaseJson(const String &csv) {
   json += "\"usingCGPS\":true,";
   
   // Wake up reason
-  json += "\"wakeUpReason\":\"" + tokens[15] + "\",";
-  
-  // Security breach active
-  json += "\"securityBreachActive\":" + String(tokens[17] == "1" ? "true" : "false");
+  json += "\"wakeUpReason\":\"" + tokens[15] + "\"";
   
   json += "}";
   return json;
@@ -1107,19 +1103,6 @@ bool parseCoordinates(const String &coordStr, float &lat, float &lon) {
   return (lat != 0.0 && lon != 0.0);
 }
 
-// Calculate distance between two GPS coordinates in meters using Haversine formula
-float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
-  const float R = 6371000.0; // Earth radius in meters
-  float dLat = (lat2 - lat1) * DEG_TO_RAD;
-  float dLon = (lon2 - lon1) * DEG_TO_RAD;
-  
-  float a = sin(dLat / 2) * sin(dLat / 2) +
-            cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
-            sin(dLon / 2) * sin(dLon / 2);
-            
-  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
-  return R * c;
-}
 
 // Update buzzer state in Firebase
 void updateBuzzerInFirebase(const String &deviceId, bool buzzerActive) {

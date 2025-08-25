@@ -33,7 +33,6 @@ interface RawSensorData {
   bootCount?: number;
   altitude?: number;
   limitSwitchPressed?: boolean;
-  locationBreach?: boolean;
   referenceCode?: string; // Can be in sensor data
 }
 
@@ -50,7 +49,6 @@ interface SensorData {
   bootCount?: number;
   altitude?: number;
   limitSwitchPressed?: boolean;
-  locationBreach?: boolean;
   referenceCode?: string; // Can be in sensor data
 }
 
@@ -173,7 +171,6 @@ export default function QRDevicePage() {
                   altitude: latestSensorData?.altitude || 0,
                   limitSwitchPressed:
                     latestSensorData?.limitSwitchPressed || false,
-                  locationBreach: latestSensorData?.locationBreach || false,
                 },
               });
               setDataError(null);

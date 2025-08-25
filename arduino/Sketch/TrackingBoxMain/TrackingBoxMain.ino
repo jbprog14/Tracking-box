@@ -41,7 +41,6 @@
 #include "EPD.h"
 #include "GUI_Paint.h"
 #include "qrcode.h"   // QR code generator for display
-#include <math.h>  // for haversine
 // Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
 #include <Adafruit_SHT31.h>
@@ -140,8 +139,6 @@ RTC_DATA_ATTR bool rtcBuzzerDismissed = false;
 RTC_DATA_ATTR bool rtcSolenoidActive = false;
 RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
 
-// RTC memory for security breach tracking
-RTC_DATA_ATTR bool rtcSecurityBreachDetected = false;  // Tracks if limit switch was ever breached
 
 // RTC memory for unique reference code
 RTC_DATA_ATTR char rtcReferenceCode[11] = ""; // 10 chars + null terminator
@@ -153,17 +150,6 @@ RTC_DATA_ATTR unsigned long rtcLastFirebaseUpdate = 0;
 // --------------------------------------------------------------
 // GEO HELPERS
 // --------------------------------------------------------------
-// Simple haversine – returns great-circle distance in meters
-double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371000.0; // Earth radius metres
-  double dLat = (lat2 - lat1) * DEG_TO_RAD;
-  double dLon = (lon2 - lon1) * DEG_TO_RAD;
-  double a = sin(dLat / 2) * sin(dLat / 2) +
-             cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
-                 sin(dLon / 2) * sin(dLon / 2);
-  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
-  return R * c;
-}
 
 // --------------------------------------------------------------
 // Parse coordinate string that may be in:
@@ -262,7 +248,6 @@ struct TrackerData {
   bool buzzerIsActive = false;
   bool buzzerDismissed = false;
   bool solenoidActive = false; // NEW: current requested state from Firebase
-  bool securityBreachActive = false;  // Tracks if security has been breached (limit switch opened)
   uint32_t bootCount = 0;   // number of wake-ups since power-on
   bool coarseFix = false;   // true if only CLBS/IP based fix available
   String referenceCode = "";  // Unique 10-character reference code
@@ -674,27 +659,16 @@ void collectSensorReading() {
   attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
   Serial.println("✓ Limit switch interrupt attached");
   
-  // Track security breach - once breached, it stays breached until physically resolved
+  // Check if lid is open and handle buzzer dismissal
   if (!currentData.limitSwitchPressed) {
-    // Lid is open - security breach!
-    if (!rtcSecurityBreachDetected) {
-      rtcSecurityBreachDetected = true;
-      // When a new breach is detected, clear any previous dismissal
+    // Lid is open
+    // When lid opens, clear any previous dismissal
+    if (rtcBuzzerDismissed) {
       rtcBuzzerDismissed = false;
       currentData.buzzerDismissed = false;
-      Serial.println("🚨 NEW SECURITY BREACH DETECTED - Lid opened!");
-      Serial.println("🚨 Clearing any previous dismissal flags");
-    }
-  } else {
-    // Lid is closed - check if we can clear the security breach
-    if (rtcSecurityBreachDetected) {
-      Serial.println("🔒 Lid is now closed, but security breach remains active until location is verified safe");
-      // Note: Security breach will only be cleared when both:
-      // 1. Lid is closed (limitSwitchPressed = true)
-      // 2. Device is back in safe zone OR user dismisses the alert
+      Serial.println("🚨 Lid opened - clearing previous dismissal flags");
     }
   }
-  currentData.securityBreachActive = rtcSecurityBreachDetected;
 
   if (currentData.gpsFixValid || currentData.coarseFix) {
     currentData.currentLocation = String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6);
@@ -1552,8 +1526,7 @@ bool sendSensorDataToFirebase() {
   jsonData += "\"wakeUpReason\":\"" + currentData.wakeUpReason + "\",";
   jsonData += "\"timestamp\":" + String(millis()) + ",";
   jsonData += "\"bootCount\":" + String(currentData.bootCount) + ",";
-  jsonData += "\"referenceCode\":\"" + currentData.referenceCode + "\",";
-  jsonData += "\"securityBreachActive\":" + String(currentData.securityBreachActive ? "true" : "false");
+  jsonData += "\"referenceCode\":\"" + currentData.referenceCode + "\"";
   jsonData += "}";
   
   // Send to Firebase
@@ -1977,15 +1950,9 @@ void parseFirebaseControls(String jsonData) {
     newDismissState = true;
   }
   
-  // Parse clear breach state
-  bool clearBreach = false;
-  if (jsonData.indexOf("\"clearBreach\":true") != -1) {
-    clearBreach = true;
-  }
-  
   Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
-  Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d, ClearBreach=%d\n", 
-                newBuzzerState, newSolenoidState, newDismissState, clearBreach);
+  Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d\n", 
+                newBuzzerState, newSolenoidState, newDismissState);
   
   // Update dismiss state
   currentData.buzzerDismissed = newDismissState;
@@ -1993,14 +1960,6 @@ void parseFirebaseControls(String jsonData) {
   
   if (newDismissState) {
     Serial.println("✅ Buzzer dismissed by user");
-  }
-  
-  // Clear security breach if Firebase instructs us to
-  // This happens when lid is closed AND device is back in safe zone
-  if (clearBreach && rtcSecurityBreachDetected) {
-    Serial.println("🔓 CLEARING SECURITY BREACH - Device is secured and in safe zone");
-    rtcSecurityBreachDetected = false;
-    currentData.securityBreachActive = false;
   }
   
   // Apply buzzer state from Firebase

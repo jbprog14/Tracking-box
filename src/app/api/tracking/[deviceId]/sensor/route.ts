@@ -22,7 +22,6 @@ interface SensorData {
   timestamp: number;
   bootCount: number;
   referenceCode: string;
-  securityBreachActive: boolean;
 }
 
 export async function POST(
