@@ -310,6 +310,8 @@ bool checkFirebaseControls();
 void parseFirebaseControls(String jsonData);
 void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
+void sendMotionAlert();
+void sendMotionEventAlert(String eventType, String message);
 bool sendFirebaseHTTP(String path, String jsonData, String method);
 String readFirebaseHTTP(String path);
 bool checkDeviceIDExists(String deviceID);
@@ -412,6 +414,11 @@ void setup() {
     Serial.println("✅ Using permanent Device ID: " + actualDeviceID);
   }
   
+  // Send motion alert if device woke from motion detection
+  if (currentData.wakeUpReason == "MOTION DETECTED" && rtcBootCount > 1) {
+    sendMotionAlert();
+  }
+  
   // Check for control commands from Firebase (skip on first boot)
   if (rtcBootCount > 1) {
     Serial.println("🌐 Checking Firebase for control commands...");
@@ -434,6 +441,14 @@ void setup() {
   // Collect sensor data for Firebase transmission
   collectSensorReading();
   Serial.println("✅ Sensor Readings Collected.");
+  
+  // Send alerts for special motion events (shock, tilt) if detected
+  if (currentData.fallDetected && rtcBootCount > 1) {
+    sendMotionEventAlert("shock", "Shock/impact detected");
+  }
+  if (currentData.tiltDetected && rtcBootCount > 1) {
+    sendMotionEventAlert("tilt", "Device tilted");
+  }
   
   // Fetch latest shipping label data from Firebase before display update
   Serial.println("🌐 Fetching shipping label data from Firebase...");
@@ -821,39 +836,7 @@ bool readCellLocation() {
   Serial.println("📡 Starting CLBS positioning sequence...");
   flushSIM7600Buffer();
   
-  // Step 1: Check network registration (GSM/GPRS)
-  sim7600.println("AT+CREG?");
-  String resp = waitForGPSResponse(2000);
-  if (resp.indexOf("+CREG: 0,1") == -1 && resp.indexOf("+CREG: 0,5") == -1) {
-    Serial.println("✗ Not registered to network (CREG)");
-    return false;
-  }
-  Serial.println("✓ Network registration OK (CREG)");
-  
-  // Step 2: Check LTE registration
-  flushSIM7600Buffer();
-  sim7600.println("AT+CEREG?");
-  resp = waitForGPSResponse(2000);
-  if (resp.indexOf("+CEREG: 0,1") == -1 && resp.indexOf("+CEREG: 0,5") == -1) {
-    Serial.println("⚠️ Not registered to LTE (CEREG) - continuing anyway");
-  } else {
-    Serial.println("✓ LTE registration OK (CEREG)");
-  }
-  
-  // Step 3: Check signal quality
-  flushSIM7600Buffer();
-  sim7600.println("AT+CSQ");
-  resp = waitForGPSResponse(2000);
-  int csqIdx = resp.indexOf("+CSQ:");
-  if (csqIdx != -1) {
-    int signalStrength = resp.substring(csqIdx + 6, resp.indexOf(',', csqIdx + 6)).toInt();
-    Serial.printf("📶 Signal strength: %d", signalStrength);
-    if (signalStrength < 5) {
-      Serial.println(" (weak - may affect accuracy)");
-    } else {
-      Serial.println(" (good)");
-    }
-  }
+  String resp = "";  // Declare response variable
   
   // Step 4: Start network connection
   flushSIM7600Buffer();
@@ -2002,6 +1985,55 @@ void parseFirebaseControls(String jsonData) {
 // =====================================================================
 // UTILITY FUNCTIONS
 // =====================================================================
+
+// Send motion detection alert to Firebase
+void sendMotionAlert() {
+  Serial.println("\n🏃 SENDING MOTION ALERT TO FIREBASE...");
+  
+  // Create alert JSON payload
+  String alertData = "{";
+  alertData += "\"message\":\"Motion detected\",";
+  alertData += "\"timestamp\":" + String(millis()) + ",";
+  alertData += "\"type\":\"motion\"";
+  alertData += "}";
+  
+  // Create unique alert ID using timestamp
+  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
+  
+  // Send alert to Firebase
+  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  
+  if (success) {
+    Serial.println("✅ Motion alert sent to Firebase successfully!");
+    Serial.println("   Alert will trigger notification on web dashboard");
+  } else {
+    Serial.println("❌ Failed to send motion alert to Firebase");
+  }
+}
+
+// Send specific motion event alerts (shock, tilt, etc.)
+void sendMotionEventAlert(String eventType, String message) {
+  Serial.println("\n⚠️ SENDING " + eventType + " ALERT TO FIREBASE...");
+  
+  // Create alert JSON payload
+  String alertData = "{";
+  alertData += "\"message\":\"" + message + "\",";
+  alertData += "\"timestamp\":" + String(millis()) + ",";
+  alertData += "\"type\":\"" + eventType + "\"";
+  alertData += "}";
+  
+  // Create unique alert ID using timestamp
+  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
+  
+  // Send alert to Firebase
+  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  
+  if (success) {
+    Serial.println("✅ " + eventType + " alert sent to Firebase successfully!");
+  } else {
+    Serial.println("❌ Failed to send " + eventType + " alert to Firebase");
+  }
+}
 
 // Generate a unique 10-character reference code
 void generateReferenceCode() {

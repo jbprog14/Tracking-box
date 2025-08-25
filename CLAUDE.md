@@ -25,6 +25,9 @@ npm run build
 # Run linting
 npm run lint
 
+# Type checking
+npx tsc --noEmit
+
 # Deploy to Cloudflare Pages
 npm run deploy
 ```
@@ -204,4 +207,5 @@ The system has been migrated from SMS-based communication to direct Firebase con
 - Each tracking device now uses SIM7600 for direct Firebase updates
 - SMS functionality preserved as fallback/legacy mode
 - Master device role reduced but maintained for backward compatibility
-- See `FIREBASE_MIGRATION_SUMMARY.md` for migration details
+- Device ID validation and auto-generation for duplicate prevention
+- Runtime ID persistence across deep sleep cycles using RTC memory
