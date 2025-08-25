@@ -221,6 +221,23 @@ bool parseCoordPair(const String &raw, double &lat, double &lon) {
   return false; // unsupported format
 }
 
+// Calculate distance between two GPS coordinates using Haversine formula
+// Returns distance in meters
+float calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+  const float R = 6371000.0; // Earth radius in meters
+  const float phi1 = lat1 * PI / 180.0;
+  const float phi2 = lat2 * PI / 180.0;
+  const float deltaPhi = (lat2 - lat1) * PI / 180.0;
+  const float deltaLambda = (lon2 - lon1) * PI / 180.0;
+
+  const float a = sin(deltaPhi / 2) * sin(deltaPhi / 2) +
+                  cos(phi1) * cos(phi2) *
+                  sin(deltaLambda / 2) * sin(deltaLambda / 2);
+  const float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+  return R * c; // Distance in meters
+}
+
 // This structure holds all data, both from sensors and fetched from Firebase.
 struct TrackerData {
   // Sensor-derived data
@@ -312,6 +329,11 @@ void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
 void sendMotionAlert();
 void sendMotionEventAlert(String eventType, String message);
+void sendDeliveryNotification();
+void activateSolenoidForDelivery(unsigned long duration);
+void handleLockBreachEarly();
+void handleBuzzerActivation(unsigned long duration);
+float calculateDistance(double lat1, double lon1, double lat2, double lon2);
 bool sendFirebaseHTTP(String path, String jsonData, String method);
 String readFirebaseHTTP(String path);
 bool checkDeviceIDExists(String deviceID);
@@ -382,6 +404,13 @@ void setup() {
     Serial.println("✅ Cellular data initialized for Firebase.");
   } else {
     Serial.println("❌ Failed to initialize cellular data.");
+  }
+  
+  // OPTIMIZED LOCK BREACH HANDLING - Handle immediately after cellular init
+  if (currentData.wakeUpReason == "LOCK BREACH" && rtcBootCount > 1) {
+    handleLockBreachEarly();
+    // handleLockBreachEarly() will handle everything and enter deep sleep
+    // Code will not continue past this point for lock breach scenarios
   }
   
   // Validate Device ID uniqueness only if we don't have a saved ID
@@ -1694,14 +1723,46 @@ String readFirebaseHTTP(String path) {
   // Read response data
   String response = sendATCommandResponse("AT+HTTPREAD=0,1000", 3000);
   
-  // Extract JSON from response
+  // First try to extract JSON object (between { and })
   int jsonStart = response.indexOf('{');
   int jsonEnd = response.lastIndexOf('}');
   
   if (jsonStart != -1 && jsonEnd != -1) {
+    // Found JSON object
     response = response.substring(jsonStart, jsonEnd + 1);
   } else {
-    response = "";
+    // No JSON object found, try to extract plain string value
+    // Look for the actual data after +HTTPREAD: DATA,XX format
+    int dataStart = response.indexOf("+HTTPREAD: DATA,");
+    if (dataStart != -1) {
+      // Find the line after DATA line
+      int newlineAfterData = response.indexOf('\n', dataStart);
+      if (newlineAfterData != -1) {
+        // Get the next line which contains the actual value
+        int valueStart = newlineAfterData + 1;
+        int valueEnd = response.indexOf('\n', valueStart);
+        if (valueEnd == -1) {
+          valueEnd = response.indexOf("+HTTPREAD: 0", valueStart);
+          if (valueEnd == -1) {
+            valueEnd = response.length();
+          }
+        }
+        
+        String value = response.substring(valueStart, valueEnd);
+        value.trim();
+        
+        // Remove surrounding quotes if present
+        if (value.startsWith("\"") && value.endsWith("\"")) {
+          value = value.substring(1, value.length() - 1);
+        }
+        
+        response = value;
+      } else {
+        response = "";
+      }
+    } else {
+      response = "";
+    }
   }
   
   sendATCommand("AT+HTTPTERM", 1000);
@@ -1990,8 +2051,10 @@ void parseFirebaseControls(String jsonData) {
 void sendMotionAlert() {
   Serial.println("\n🏃 SENDING MOTION ALERT TO FIREBASE...");
   
-  // Create alert JSON payload
+  // Create alert JSON payload with all required fields for MotionAlert interface
   String alertData = "{";
+  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
+  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
   alertData += "\"message\":\"Motion detected\",";
   alertData += "\"timestamp\":" + String(millis()) + ",";
   alertData += "\"type\":\"motion\"";
@@ -2015,8 +2078,10 @@ void sendMotionAlert() {
 void sendMotionEventAlert(String eventType, String message) {
   Serial.println("\n⚠️ SENDING " + eventType + " ALERT TO FIREBASE...");
   
-  // Create alert JSON payload
+  // Create alert JSON payload with all required fields for MotionAlert interface
   String alertData = "{";
+  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
+  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
   alertData += "\"message\":\"" + message + "\",";
   alertData += "\"timestamp\":" + String(millis()) + ",";
   alertData += "\"type\":\"" + eventType + "\"";
@@ -2144,4 +2209,276 @@ String validateAndGetUniqueDeviceID() {
   String fallbackID = DEVICE_ID + "_" + String(millis());
   Serial.println("⚠️ Max attempts reached, using fallback ID: " + fallbackID);
   return fallbackID;
+}
+
+// =====================================================================
+// OPTIMIZED LOCK BREACH HANDLING FUNCTIONS
+// =====================================================================
+
+// Handle lock breach early in the boot cycle for faster response
+void handleLockBreachEarly() {
+  Serial.println("\n🔒 HANDLING LOCK BREACH - Optimized Early Detection");
+  Serial.printf("   Process start time: %lu ms\n", millis());
+  
+  // Fetch ONLY setLocation from Firebase (optimized data usage)
+  String setLocationPath = "/tracking_box/" + actualDeviceID + "/details/setLocation";
+  String setLocationData = readFirebaseHTTP(setLocationPath);
+  
+  // readFirebaseHTTP now handles quote removal, so we get clean data
+  Serial.println("📍 Safe zone location retrieved: '" + setLocationData + "'");
+  
+  // Parse safe zone coordinates
+  double safeLat = 0.0, safeLon = 0.0;
+  bool hasValidSafeZone = parseCoordPair(setLocationData, safeLat, safeLon);
+  
+  if (hasValidSafeZone) {
+    Serial.printf("✅ Safe zone parsed successfully: lat=%.8f, lon=%.8f\n", safeLat, safeLon);
+  } else {
+    Serial.println("❌ Failed to parse safe zone coordinates");
+  }
+  
+  // Get current GPS location (quick fix attempt)
+  Serial.println("🛰️ Getting current GPS location...");
+  readGPSLocation();
+  
+  // If GPS fails, try cell location as fallback
+  if (!currentData.gpsFixValid) {
+    Serial.println("📡 GPS unavailable, trying cell tower location...");
+    readCellLocation();
+  }
+  
+  Serial.printf("📍 Current location after read: lat=%.8f, lon=%.8f\n", 
+                currentData.latitude, currentData.longitude);
+  Serial.printf("   Location fix valid: %s (GPS: %s, Cell: %s)\n", 
+                currentData.gpsFixValid ? "YES" : "NO",
+                currentData.gpsFixValid && !currentData.usingCGPS ? "YES" : "NO",
+                currentData.usingCGPS ? "YES" : "NO");
+  
+  bool buzzerActivated = false;
+  bool solenoidActivated = false;
+  
+  if (hasValidSafeZone && currentData.gpsFixValid) {
+    // Calculate distance from safe zone using Haversine formula
+    float distance = calculateDistance(safeLat, safeLon, 
+                                      currentData.latitude, currentData.longitude);
+    
+    Serial.println("\n📊 DISTANCE CALCULATION DEBUG:");
+    Serial.printf("   Safe zone coords: %.8f, %.8f\n", safeLat, safeLon);
+    Serial.printf("   Current coords:   %.8f, %.8f\n", currentData.latitude, currentData.longitude);
+    Serial.printf("   Lat difference:   %.8f degrees\n", currentData.latitude - safeLat);
+    Serial.printf("   Lon difference:   %.8f degrees\n", currentData.longitude - safeLon);
+    
+    // Manual quick approximation for verification (at equator: 1 degree ≈ 111km)
+    float approxLatDist = abs(currentData.latitude - safeLat) * 111000.0; // meters
+    float approxLonDist = abs(currentData.longitude - safeLon) * 111000.0 * cos(safeLat * PI / 180.0);
+    float approxDist = sqrt(approxLatDist * approxLatDist + approxLonDist * approxLonDist);
+    
+    Serial.printf("   Haversine distance: %.2f meters\n", distance);
+    Serial.printf("   Approximate distance: %.2f meters (quick check)\n", approxDist);
+    Serial.printf("   Threshold: 100 meters\n");
+    Serial.printf("   Decision: %s (distance %.2f %s 100m)\n", 
+                  distance < 100.0 ? "SAFE ZONE - SOLENOID" : "CRITICAL - BUZZER",
+                  distance,
+                  distance < 100.0 ? "<" : ">=");
+    
+    if (distance < 100.0) {
+      // Within safe zone - delivery scenario
+      Serial.println("✅ Device within safe zone - Package delivery detected");
+      
+      // 1. Send delivery notification first (quick, non-blocking)
+      sendDeliveryNotification();
+      
+      // 2. Activate solenoid for 20 seconds (blocking operation)
+      Serial.println("\n⏱️ Starting solenoid activation sequence...");
+      activateSolenoidForDelivery(20000);
+      solenoidActivated = true;
+      
+    } else {
+      // Outside safe zone - security breach
+      Serial.println("⚠️ DEVICE OUTSIDE SAFE ZONE - CRITICAL BREACH!");
+      
+      // 1. Send critical alert to Firebase first (quick, non-blocking)
+      sendLockBreachAlert();
+      
+      // 2. Activate buzzer for 15 seconds (blocking operation)
+      Serial.println("\n⏱️ Starting buzzer activation sequence...");
+      handleBuzzerActivation(15000);
+      buzzerActivated = true;
+    }
+  } else if (!hasValidSafeZone) {
+    Serial.println("⚠️ No valid safe zone coordinates - treating as critical breach");
+    // 1. Send alert first
+    sendLockBreachAlert();
+    // 2. Activate buzzer
+    Serial.println("\n⏱️ Starting buzzer activation sequence...");
+    handleBuzzerActivation(15000);
+    buzzerActivated = true;
+  } else if (!currentData.gpsFixValid) {
+    Serial.println("⚠️ No GPS fix available - defaulting to critical breach alert");
+    // 1. Send alert first
+    sendLockBreachAlert();
+    // 2. Activate buzzer
+    Serial.println("\n⏱️ Starting buzzer activation sequence...");
+    handleBuzzerActivation(15000);
+    buzzerActivated = true;
+  }
+  
+  // Log completion of actuator operations
+  Serial.println("\n✅ ALL ACTUATOR OPERATIONS COMPLETED");
+  if (buzzerActivated) {
+    Serial.println("   - Buzzer sequence completed");
+  }
+  if (solenoidActivated) {
+    Serial.println("   - Solenoid sequence completed");
+  }
+  Serial.printf("   Process time before display: %lu ms\n", millis());
+  
+  // NOW update display (LAST operation, after all blocking operations)
+  Serial.println("\n📱 Starting e-ink display update (may take several seconds)...");
+  showOfflineQRCode();
+  Serial.println("✅ E-ink display update completed");
+  
+  // Enter deep sleep
+  Serial.println("\n💤 Entering deep sleep after lock breach handling");
+  Serial.printf("   Total process time: %lu ms\n", millis());
+  prepareForDeepSleep();
+  esp_deep_sleep_start();
+}
+
+// Send delivery notification to Firebase
+void sendDeliveryNotification() {
+  Serial.println("\n📦 SENDING DELIVERY NOTIFICATION...");
+  
+  // Create alert JSON payload with all required fields for MotionAlert interface
+  String alertData = "{";
+  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
+  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
+  alertData += "\"message\":\"📦 Package delivered - Security lock activated\",";
+  alertData += "\"timestamp\":" + String(millis()) + ",";
+  alertData += "\"type\":\"delivery\"";
+  alertData += "}";
+  
+  // Send to safe alerts path (will show as toast notification)
+  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/safe/" + String(millis());
+  
+  // Send alert to Firebase
+  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  
+  if (success) {
+    Serial.println("✅ Delivery notification sent to Firebase!");
+    Serial.println("   Package delivery will be notified on web dashboard");
+  } else {
+    Serial.println("❌ Failed to send delivery notification");
+  }
+}
+
+// Activate solenoid for delivery with specified duration
+void activateSolenoidForDelivery(unsigned long duration) {
+  Serial.println("\n🔓 ACTIVATING SOLENOID FOR DELIVERY");
+  Serial.printf("   Duration: %lu seconds\n", duration / 1000);
+  Serial.printf("   Start time: %lu ms\n", millis());
+  
+  // Activate solenoid
+  digitalWrite(SOLENOID_PIN, HIGH);
+  rtcSolenoidActive = true;
+  rtcSolenoidStartTime = millis();
+  
+  // Keep solenoid active for specified duration
+  unsigned long startTime = millis();
+  unsigned long elapsedTime = 0;
+  unsigned long lastDebugTime = 0;
+  
+  while (elapsedTime < duration) {
+    elapsedTime = millis() - startTime;
+    
+    // Print detailed progress every second
+    if (elapsedTime - lastDebugTime >= 1000) {
+      Serial.printf("🔓 Solenoid active: %lu/%lu seconds (elapsed: %lu ms)\n", 
+                    elapsedTime / 1000, duration / 1000, elapsedTime);
+      lastDebugTime = elapsedTime;
+    }
+    
+    // Check for interrupts
+    if (shouldInterruptOperation()) {
+      Serial.printf("⚠️ Solenoid operation interrupted at %lu ms!\n", elapsedTime);
+      break;
+    }
+    
+    delay(50); // Small delay to prevent tight loop
+  }
+  
+  // Deactivate solenoid
+  digitalWrite(SOLENOID_PIN, LOW);
+  rtcSolenoidActive = false;
+  rtcSolenoidStartTime = 0;
+  
+  Serial.printf("🔒 Solenoid deactivated after %lu ms\n", elapsedTime);
+  Serial.printf("   End time: %lu ms\n", millis());
+  Serial.printf("   Total duration: %.1f seconds\n", elapsedTime / 1000.0);
+}
+
+// Handle buzzer activation with proper timing control
+void handleBuzzerActivation(unsigned long duration) {
+  Serial.println("\n🔊 ACTIVATING BUZZER");
+  Serial.printf("   Duration: %lu seconds\n", duration / 1000);
+  Serial.printf("   Start time: %lu ms\n", millis());
+  
+  // Activate buzzer
+  digitalWrite(BUZZER_PIN, HIGH);
+  
+  unsigned long startTime = millis();
+  unsigned long elapsedTime = 0;
+  unsigned long lastDebugTime = 0;
+  
+  while (elapsedTime < duration) {
+    elapsedTime = millis() - startTime;
+    
+    // Print debug info every second
+    if (elapsedTime - lastDebugTime >= 1000) {
+      Serial.printf("🔊 Buzzer active: %lu/%lu seconds\n", 
+                    elapsedTime / 1000, duration / 1000);
+      lastDebugTime = elapsedTime;
+    }
+    
+    // Check for interrupts
+    if (shouldInterruptOperation()) {
+      Serial.println("⚠️ Buzzer operation interrupted!");
+      break;
+    }
+    
+    delay(50); // Small delay to prevent tight loop
+  }
+  
+  // Deactivate buzzer
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  Serial.printf("🔇 Buzzer deactivated after %lu ms\n", elapsedTime);
+  Serial.printf("   End time: %lu ms\n", millis());
+}
+
+// Send critical lock breach alert to Firebase
+void sendLockBreachAlert() {
+  Serial.println("\n🚨 SENDING CRITICAL LOCK BREACH ALERT TO FIREBASE...");
+  
+  // Create alert JSON payload with all required fields for MotionAlert interface
+  String alertData = "{";
+  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
+  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
+  alertData += "\"message\":\"⚠️ CRITICAL: Lock breach detected - device outside safe zone\",";
+  alertData += "\"timestamp\":" + String(millis()) + ",";
+  alertData += "\"type\":\"lock_breach\"";
+  alertData += "}";
+  
+  // Send to critical alerts path
+  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/critical/" + String(millis());
+  
+  // Send alert to Firebase
+  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  
+  if (success) {
+    Serial.println("✅ Critical lock breach alert sent to Firebase!");
+    Serial.println("   Alert will trigger notification on web dashboard");
+  } else {
+    Serial.println("❌ Failed to send critical lock breach alert to Firebase");
+  }
 }

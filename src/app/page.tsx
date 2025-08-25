@@ -64,9 +64,31 @@ interface MotionAlert {
   type: string;
 }
 
+interface CriticalAlert {
+  message: string;
+  timestamp: number;
+  type: string;
+  currentLocation?: string;
+  setLocation?: string;
+}
+
+interface SafeAlert {
+  deviceId: string;
+  location: string;
+  message: string;
+  timestamp: number;
+  type: string;
+}
+
 interface Alerts {
   motion?: {
     [key: string]: MotionAlert;
+  };
+  critical?: {
+    [key: string]: CriticalAlert;
+  };
+  safe?: {
+    [key: string]: SafeAlert;
   };
 }
 
@@ -372,9 +394,109 @@ export default function Home() {
                 }
               }
 
-              // Security breach alerts removed - no longer tracking geofence/location breach
-              const isNowCritical = false; // Disabled
+              // Check for safe alerts from Firebase alerts/safe path  
+              if (currentBox && prevBox) {
+                // Get current safe alerts
+                const currentSafeAlerts = currentBox.alerts?.safe || {};
+                const prevSafeAlerts = prevBox.alerts?.safe || {};
+                
+                // Check for new safe alerts (alerts that exist now but didn't exist before)
+                const currentAlertKeys = Object.keys(currentSafeAlerts);
+                const prevAlertKeys = Object.keys(prevSafeAlerts);
+                
+                // Find new alert keys
+                const newAlertKeys = currentAlertKeys.filter(key => !prevAlertKeys.includes(key));
+                
+                // If there are new safe alerts, show toast
+                if (newAlertKeys.length > 0) {
+                  // Get the most recent new alert
+                  const latestAlertKey = newAlertKeys[newAlertKeys.length - 1];
+                  const latestAlert = currentSafeAlerts[latestAlertKey];
+                  
+                  toast(
+                    `📦 ${latestAlert?.message || 'Package delivered'} on ${currentBox.details.name || boxId}`,
+                    {
+                      id: `safe-toast-${boxId}-${Date.now()}`,
+                      duration: 15000, // 15 seconds
+                      position: "top-right",
+                      style: {
+                        background: "#FEF3C7",
+                        color: "#92400E",
+                        border: "1px solid #F59E0B",
+                      },
+                      iconTheme: {
+                        primary: "#F59E0B",
+                        secondary: "#FFFFFF",
+                      },
+                    }
+                  );
+                  
+                  // Clean up the safe alert after toast duration
+                  setTimeout(async () => {
+                    try {
+                      // Remove the specific safe alert from Firebase
+                      const alertRef = ref(db, `tracking_box/${boxId}/alerts/safe/${latestAlertKey}`);
+                      await set(alertRef, null);
+                      console.log(`Safe alert ${latestAlertKey} removed for ${boxId} after toast duration`);
+                    } catch (error) {
+                      console.error(`Error removing safe alert for ${boxId}:`, error);
+                    }
+                  }, 15000); // Match the toast duration
+                }
+              }
 
+              // Check for critical alerts from Firebase alerts/critical path
+              if (currentBox && prevBox) {
+                // Get current critical alerts
+                const currentCriticalAlerts = currentBox.alerts?.critical || {};
+                const prevCriticalAlerts = prevBox.alerts?.critical || {};
+                
+                // Check for new critical alerts
+                const currentAlertKeys = Object.keys(currentCriticalAlerts);
+                const prevAlertKeys = Object.keys(prevCriticalAlerts);
+                
+                // Find new alert keys
+                const newAlertKeys = currentAlertKeys.filter(key => !prevAlertKeys.includes(key));
+                
+                if (newAlertKeys.length > 0) {
+                  // Get the most recent new alert
+                  const latestAlertKey = newAlertKeys[newAlertKeys.length - 1];
+                  const latestCriticalAlert = currentCriticalAlerts[latestAlertKey];
+                  
+                  // Show critical alert with same style as motion/safe alerts (yellow toast)
+                  toast(
+                    `🚨 ${latestCriticalAlert?.message || `${currentBox.details.name || boxId} has been moved outside the safe zone.`}`,
+                    {
+                      id: `critical-toast-${boxId}-${Date.now()}`,
+                      duration: 15000, // 15 seconds (same as motion/safe)
+                      position: "top-right",
+                      style: {
+                        background: "#FEF3C7",
+                        color: "#92400E",
+                        border: "1px solid #F59E0B",
+                      },
+                      iconTheme: {
+                        primary: "#F59E0B",
+                        secondary: "#FFFFFF",
+                      },
+                    }
+                  );
+                  
+                  // Auto-remove critical alert from Firebase after displaying
+                  setTimeout(async () => {
+                    try {
+                      const alertRef = ref(db, `tracking_box/${boxId}/alerts/critical/${latestAlertKey}`);
+                      await set(alertRef, null);
+                      console.log(`Critical alert ${latestAlertKey} auto-removed for ${boxId}`);
+                    } catch (error) {
+                      console.error(`Error removing critical alert for ${boxId}:`, error);
+                    }
+                  }, 15000); // Match the toast duration
+                }
+              }
+
+              // Legacy critical alert code (disabled)
+              const isNowCritical = false; // Disabled
               const wasPreviouslyCritical = false; // Disabled
 
               if (isNowCritical && !wasPreviouslyCritical) {
