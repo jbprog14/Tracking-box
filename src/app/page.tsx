@@ -47,6 +47,7 @@ interface SensorData {
   currentLocation: string;
   batteryVoltage?: number;
   wakeUpReason?: string; // standardized key
+  wakeReason?: string; // alternative key used sometimes
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
@@ -236,7 +237,7 @@ export default function Home() {
               const box = rawData[boxId];
               if (box && typeof box === "object") {
                 // Extract latest sensor data (handle both single object and push ID structure)
-                let latestSensorData: any = {};
+                let latestSensorData: Partial<SensorData> = {};
                 
                 if (box.sensorData) {
                   const sensorDataKeys = Object.keys(box.sensorData);
@@ -244,8 +245,8 @@ export default function Home() {
                   // Check if sensorData has Firebase push IDs (keys starting with "-")
                   if (sensorDataKeys.length > 0 && sensorDataKeys[0].startsWith('-')) {
                     // Multiple entries with push IDs - get the latest one
-                    const sensorEntries = Object.entries(box.sensorData)
-                      .map(([key, value]: [string, any]) => ({
+                    const sensorEntries = Object.entries(box.sensorData as Record<string, SensorData>)
+                      .map(([key, value]) => ({
                         key,
                         ...value,
                         // Ensure timestamp exists for sorting

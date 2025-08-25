@@ -20,18 +20,38 @@ interface DeviceDetails {
   supplierIdTracking?: string;
 }
 
-interface SensorData {
+// Raw sensor data from Firebase (before normalization)
+interface RawSensorData {
   temp: number;
   humidity: number;
-  accelerometer: string;
+  accelerometer: string | { fallDetected?: boolean; tiltDetected?: boolean };
   currentLocation: string;
   batteryVoltage?: number;
   wakeUpReason?: string;
+  wakeReason?: string; // Alternative key used sometimes
   timestamp?: number;
   bootCount?: number;
   altitude?: number;
   limitSwitchPressed?: boolean;
   locationBreach?: boolean;
+  referenceCode?: string; // Can be in sensor data
+}
+
+// Normalized sensor data for display
+interface SensorData {
+  temp: number;
+  humidity: number;
+  accelerometer: string; // Always normalized to string in this component
+  currentLocation: string;
+  batteryVoltage?: number;
+  wakeUpReason?: string;
+  wakeReason?: string; // Alternative key used sometimes
+  timestamp?: number;
+  bootCount?: number;
+  altitude?: number;
+  limitSwitchPressed?: boolean;
+  locationBreach?: boolean;
+  referenceCode?: string; // Can be in sensor data
 }
 
 interface DeviceData {
@@ -84,7 +104,7 @@ export default function QRDevicePage() {
             const data = snapshot.val();
             if (data) {
               // Extract latest sensor data (handle both single object and push ID structure)
-              let latestSensorData: any = {};
+              let latestSensorData: Partial<RawSensorData> = {};
               
               if (data.sensorData) {
                 const sensorDataKeys = Object.keys(data.sensorData);
@@ -92,8 +112,8 @@ export default function QRDevicePage() {
                 // Check if sensorData has Firebase push IDs (keys starting with "-")
                 if (sensorDataKeys.length > 0 && sensorDataKeys[0].startsWith('-')) {
                   // Multiple entries with push IDs - get the latest one
-                  const sensorEntries = Object.entries(data.sensorData)
-                    .map(([key, value]: [string, any]) => ({
+                  const sensorEntries = Object.entries(data.sensorData as Record<string, RawSensorData>)
+                    .map(([key, value]) => ({
                       key,
                       ...value,
                       // Ensure timestamp exists for sorting
