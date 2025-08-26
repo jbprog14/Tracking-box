@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 This is an IoT tracking device system with three main components:
-- **Tracking Device Firmware** (ESP32-based slave devices with sensors)
-- **Master Device Firmware** (ESP32 with SIM7600 for SMS-to-Firebase relay)
-- **Web Dashboard** (Next.js/React application for monitoring)
+- **Tracking Device Firmware** (ESP32-based devices with multiple sensors and cellular connectivity)
+- **Master Device Firmware** (ESP32 with SIM7600 for SMS-to-Firebase relay - legacy/fallback)
+- **Web Dashboard** (Next.js/React application for real-time monitoring)
 
 ## Commands
 
@@ -27,6 +27,9 @@ npm run lint
 
 # Type checking
 npx tsc --noEmit
+
+# Preview Cloudflare Pages build locally
+npm run preview
 
 # Deploy to Cloudflare Pages
 npm run deploy
@@ -51,9 +54,10 @@ Main firmware files:
 - `sht-gyro/`: Combined SHT31 and LSM6DSL sensor testing
 - `epd7in3f-demo/`: E-ink display demo
 - `M2S/`: SMS reading functionality
-- `MasterSMSToFirebase/`: SMS receiver debug tool
+- `MasterSMSToFirebase/`: SMS receiver and Firebase forwarding
 - `sim7600_at_command_test/`: SIM7600 module AT command testing
-- `dfr_firebase/`: Firebase connectivity testing
+- `dfr_firebase/`: Direct Firebase connectivity testing via cellular
+- `ShippingLabelDisplay/`: QR code generation for shipping labels
 
 ## Architecture
 
@@ -62,6 +66,8 @@ Main firmware files:
   - `firebase.ts`: Firebase configuration and helper functions
   - `page.tsx`: Main dashboard with real-time monitoring
   - `qr-link/`: Device sharing via QR codes
+  - `qr/[deviceId]/`: Device-specific QR tracking pages
+  - `api/tracking/[deviceId]/sensor/`: API endpoints for sensor data
 - **src/components/**: React components for device management
   - `TrackingBoxModal.tsx`: Device detail view with charts
   - `EditInfoModal.tsx`: Device info editing
@@ -103,29 +109,64 @@ A dedicated ESP32 with SIM7600 that:
 **Important**: When Slave devices cannot connect to WiFi, they rely on the Master device for both sending sensor data AND receiving control commands (buzzer activation, solenoid control, etc.)
 
 #### Pin Configurations
-**Note**: There are discrepancies between documentation. Use these from `Pin Configs.txt`:
+**Source**: `arduino/Pin Configs.txt` and verified working configuration
 - SHT30: SDA=21, SCL=22
-- LSM6DSL: SDA=21, SCL=22, INT=34
-- SIM7600: RX=16, TX=17 (Note: Recent code may use pins 18/19 for UART2)
+- LSM6DSL: SDA=21, SCL=22, INT1=34
+- SIM7600: RX=18, TX=19 (UART2 - verified working)
 - E-ink: DIN=14, SCLK=13, CS=15, DC=27, RST=26, BUSY=25
 - Battery ADC: Pin 36
 - Buzzer: Pin 32
 - Limit Switch: Pin 33
 - Solenoid: Pin 2
+- LED: Pin 4
 
 ### Firebase Data Structure
 ```
 tracking_box/
   box_XXX/
     details/
-      name, setLocation, description, referenceCode
-    sensorData/
+      name, setLocation, setLocationLabel, description, referenceCode,
+      packDate, packWeight, productFrom, packerShipper, supplierIdTracking,
+      senderName, senderAddress, recipientName, recipientAddress,
+      routingCode, postalCode, trackingNumber, serviceType
+    sensorData/  // Can be single object (PUT) or multiple with push IDs (POST)
       temp, humidity, accelerometer, currentLocation, 
       batteryVoltage, wakeReason, timestamp, solenoid,
-      limitSwitch, tilt, fall
+      limitSwitch, tilt, fall, bootCount, altitude,
+      buzzerIsActive, buzzerDismissed
     controlFlags/
-      buzzer, solenoid  // Control states set by web dashboard
+      buzzer, solenoid, timestamp  // Control states set by web dashboard
+    alerts/
+      motion/{pushID}/    // Motion detection alerts
+      critical/{pushID}/  // Security breach alerts
+      safe/{pushID}/      // Delivery confirmation alerts
+    dismissAlert/
+      dismissed, timestamp
 ```
+
+## Real-time Alert System
+
+The dashboard implements a sophisticated alert system:
+- **Motion Alerts**: Triggered by accelerometer events (shake/tilt)
+- **Critical Alerts**: Security breaches (geofencing violations)
+- **Safe Alerts**: Delivery confirmations (limit switch events)
+
+All alerts:
+- Display as yellow toast notifications (15 seconds)
+- Auto-cleanup from Firebase after display
+- Include device ID, location, and contextual message
+
+## API Endpoints
+
+### Sensor Data API
+`POST /api/tracking/[deviceId]/sensor`
+- Accepts JSON sensor data from devices
+- Updates Firebase sensorData path
+- Returns control flags for device actions
+
+`GET /api/tracking/[deviceId]/sensor`
+- Returns latest sensor readings
+- Used by dashboard for real-time updates
 
 ## Key Development Patterns
 
@@ -136,6 +177,7 @@ tracking_box/
 - Radix UI components for accessible UI elements
 - React Leaflet for map visualization
 - Recharts for data visualization
+- React Hot Toast for notifications
 
 ### Arduino/ESP32
 - Power optimization through deep sleep
@@ -145,6 +187,7 @@ tracking_box/
 - Battery voltage monitoring with ADC
 - Master-slave architecture for reliable data transmission
 - E-ink display updates performed last due to time constraints
+- RTC memory persistence across deep sleep cycles
 
 ## SMS Communication Protocol
 
@@ -199,6 +242,8 @@ For continuous testing without deep sleep:
 - Device ID and owner info configured in main sketch
 - Development mode available (disables deep sleep)
 - Battery voltage calibration may be needed based on voltage divider
+- Device ID auto-generation system prevents duplicates
+- MAC address-based unique ID generation when preferred ID taken
 
 ## Recent Architecture Changes
 
@@ -209,3 +254,9 @@ The system has been migrated from SMS-based communication to direct Firebase con
 - Master device role reduced but maintained for backward compatibility
 - Device ID validation and auto-generation for duplicate prevention
 - Runtime ID persistence across deep sleep cycles using RTC memory
+
+### Location Services
+- Primary: GNSS/GPS via SIM7600G module
+- Fallback: CLBS (Cell Location Based Services) when GPS unavailable
+- Coordinate parsing supports both decimal and DMS formats
+- Reverse geocoding via OpenStreetMap Nominatim API

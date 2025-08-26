@@ -495,67 +495,6 @@ export default function Home() {
                 }
               }
 
-              // Legacy critical alert code (disabled)
-              const isNowCritical = false; // Disabled
-              const wasPreviouslyCritical = false; // Disabled
-
-              if (isNowCritical && !wasPreviouslyCritical) {
-                toast.error(
-                  (t) => {
-                    if (!currentBox) return null;
-                    return (
-                      <div className="flex flex-col gap-2">
-                        <span className="font-bold">
-                          CRITICAL SECURITY BREACH!
-                        </span>
-                        <span>
-                          {currentBox.details.name || boxId} has been moved
-                          outside the safe zone.
-                        </span>
-                        <div className="flex gap-2 mt-2">
-                          <button
-                            onClick={() => {
-                              dismissCriticalAlert(boxId);
-                              toast.dismiss(t.id);
-                            }}
-                            disabled={isDismissing === boxId}
-                            className={`flex-1 font-semibold py-1 px-2 rounded-md transition-colors ${
-                              isDismissing === boxId
-                                ? "bg-gray-400 cursor-not-allowed"
-                                : "bg-red-700 hover:bg-red-800"
-                            } text-white`}
-                          >
-                            {isDismissing === boxId
-                              ? "Dismissing..."
-                              : "DISMISS ALARM"}
-                          </button>
-                          <button
-                            onClick={() => toast.dismiss(t.id)}
-                            className="flex-1 bg-gray-500 text-white font-semibold py-1 px-2 rounded-md hover:bg-gray-600 transition-colors"
-                          >
-                            Close
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  },
-                  {
-                    id: `critical-toast-${boxId}`, // Prevent duplicate toasts for the same box
-                    duration: Infinity, // Keep toast open until manually dismissed
-                    position: "top-right",
-                    style: {
-                      border: "2px solid #B91C1C",
-                      padding: "12px",
-                      color: "#B91C1C",
-                      backgroundColor: "#FEE2E2",
-                    },
-                    iconTheme: {
-                      primary: "#B91C1C",
-                      secondary: "#FFFFFF",
-                    },
-                  }
-                );
-              }
             });
 
             // Finally update React state with the new snapshot
@@ -636,19 +575,11 @@ export default function Home() {
     setIsDismissing(boxId);
 
     try {
-      // Update BOTH paths to support WiFi and SMS modes
-      // 1. For WiFi mode: Update dismissAlert path
-      const dismissAlertRef = ref(db, `tracking_box/${boxId}/dismissAlert`);
-      await set(dismissAlertRef, {
-        dismissed: true,
+      // Update controlFlags path for buzzer control (used by device firmware)
+      const controlFlagsRef = ref(db, `tracking_box/${boxId}/controlFlags`);
+      await update(controlFlagsRef, {
+        buzzer: false,  // Turn off buzzer
         timestamp: Date.now()
-      });
-
-      // 2. For SMS mode: Update sensorData flags
-      const sensorDataRef = ref(db, `tracking_box/${boxId}/sensorData`);
-      await update(sensorDataRef, {
-        buzzerIsActive: false,
-        buzzerDismissed: true, // Mark as dismissed for SMS mode
       });
 
       toast.success(`Alarm for ${boxId} dismissed successfully.`, {
@@ -663,31 +594,6 @@ export default function Home() {
     }
   };
 
-  // Convert human address → "lat, lon" string using Nominatim search
-  // Currently not used after simplifying the save logic
-  // const forwardGeocode = async (query: string): Promise<string | null> => {
-  //   try {
-  //     const res = await fetch(
-  //       `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${encodeURIComponent(
-  //         query
-  //       )}`,
-  //       {
-  //         headers: {
-  //           "User-Agent": "tracking-box-dashboard",
-  //           "Accept-Language": "en",
-  //         },
-  //       }
-  //     );
-  //     const json = await res.json();
-  //     if (json && json.length > 0) {
-  //       const { lat, lon } = json[0];
-  //       return `${parseFloat(lat).toFixed(5)}, ${parseFloat(lon).toFixed(5)}`;
-  //     }
-  //   } catch (e) {
-  //     console.warn("forward geocode failed", e);
-  //   }
-  //   return null;
-  // };
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();

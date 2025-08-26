@@ -93,10 +93,11 @@
 // =====================================================================
 const String DEVICE_ID = "box_001";  // Base/preferred device ID
 
-// Device ID validation - auto-generates unique ID if base ID exists
-String actualDeviceID = "";  // Runtime device ID (either original or auto-generated)
+// Device ID validation - auto-generates unique ID based on MAC if base ID exists
+String actualDeviceID = "";  // Runtime device ID (either original or MAC-based)
 RTC_DATA_ATTR char rtcActualDeviceID[32] = "";  // Persist across deep sleep
 RTC_DATA_ATTR bool rtcDeviceIDValidated = false;  // Flag to track if ID was validated
+String deviceMacAddress = "";  // Store the device's MAC address
 
 // FIREBASE CONFIGURATION
 const char* FIREBASE_URL = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
@@ -131,13 +132,10 @@ RTC_DATA_ATTR char rtcDeviceSetLocation[64] = "Unknown";
 RTC_DATA_ATTR char rtcDeviceName[64] = "Unknown";
 RTC_DATA_ATTR bool rtcDeviceDetailsValid = false;
 
-// RTC memory to store buzzer state
-RTC_DATA_ATTR bool rtcBuzzerActive = false;
-RTC_DATA_ATTR bool rtcBuzzerDismissed = false;
-
-// RTC memory to store solenoid state
-RTC_DATA_ATTR bool rtcSolenoidActive = false;
-RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
+// RTC memory for automated buzzer/solenoid tracking
+RTC_DATA_ATTR bool rtcBuzzerActive = false;  // Track if buzzer was activated by lock breach
+RTC_DATA_ATTR bool rtcSolenoidActive = false;  // Track if solenoid was activated for delivery
+RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;  // Track solenoid activation time
 
 
 // RTC memory for unique reference code
@@ -262,9 +260,6 @@ struct TrackerData {
   String deviceSetLabel = "";            // human readable
   String deviceDescription = "No Description";
   String wakeUpReason = "Power On";
-  bool buzzerIsActive = false;
-  bool buzzerDismissed = false;
-  bool solenoidActive = false; // NEW: current requested state from Firebase
   uint32_t bootCount = 0;   // number of wake-ups since power-on
   bool coarseFix = false;   // true if only CLBS/IP based fix available
   String referenceCode = "";  // Unique 10-character reference code
@@ -323,8 +318,6 @@ bool sendSensorDataToFirebase();
 bool initializeCellularData();
 void sendATCommand(const char* cmd, int timeout);
 String sendATCommandResponse(const char* cmd, int timeout);
-bool checkFirebaseControls();
-void parseFirebaseControls(String jsonData);
 void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
 void sendMotionAlert();
@@ -339,6 +332,8 @@ String readFirebaseHTTP(String path);
 bool checkDeviceIDExists(String deviceID);
 String generateNextDeviceID(String currentID);
 String validateAndGetUniqueDeviceID();
+String getDeviceMacAddress();
+String generateDeviceIDFromMAC();
 void flushSIM7600Buffer();
 void sendAT(const char *cmd, uint16_t delayMs);
 void showOfflineQRCode();
@@ -359,6 +354,10 @@ void setup() {
   // Increment persistent boot counter
   rtcBootCount++;
   currentData.bootCount = rtcBootCount;
+  
+  // Get device MAC address for unique identification
+  deviceMacAddress = getDeviceMacAddress();
+  Serial.println("Device MAC Address: " + deviceMacAddress);
 
   // Load or generate reference code and device ID from permanent storage
   preferences.begin("tracking", false);  // Open in read/write mode
@@ -433,6 +432,11 @@ void setup() {
       } else {
         Serial.println("✅ Using original ID: " + actualDeviceID);
       }
+      
+      // Device ID is validated - sensor data will be sent in the main flow
+      Serial.println("📝 New device ID registered: " + actualDeviceID);
+      Serial.println("ℹ️ Device details will be set from web dashboard");
+      Serial.println("ℹ️ Sensor data will be sent after collection");
     } else {
       // Load from RTC memory (survives deep sleep)
       actualDeviceID = String(rtcActualDeviceID);
@@ -448,13 +452,7 @@ void setup() {
     sendMotionAlert();
   }
   
-  // Check for control commands from Firebase (skip on first boot)
-  if (rtcBootCount > 1) {
-    Serial.println("🌐 Checking Firebase for control commands...");
-    checkFirebaseControls();
-  } else {
-    Serial.println("🌐 Skipping Firebase check on first boot");
-  }
+  // Control commands removed - buzzer/solenoid handled automatically by location detection
   
   // Restore device details from RTC memory if available
   if (rtcDeviceDetailsValid) {
@@ -464,7 +462,14 @@ void setup() {
     Serial.println("  Device name: " + currentData.deviceName);
     Serial.println("  Set location: " + currentData.deviceSetLocation);
   } else {
-    Serial.println("⚠️ No device details in RTC memory - using defaults");
+    Serial.println("⚠️ No device details in RTC memory - fetching from Firebase");
+    // Read device details from Firebase
+    String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
+    String detailsData = readFirebaseHTTP(detailsPath);
+    
+    if (detailsData.length() > 0 && detailsData.indexOf("null") == -1) {
+      parseFirebaseDetails(detailsData);
+    }
   }
   
   // Collect sensor data for Firebase transmission
@@ -491,94 +496,9 @@ void setup() {
   }
   
   // Send sensor data directly to Firebase
+  Serial.println("📊 Preparing to send sensor data to Firebase...");
   if (sendSensorDataToFirebase()) {
-    Serial.println("✅ Sensor data sent to Firebase.");
-    
-    // CRITICAL: If buzzer OR solenoid is active, DO NOT SLEEP
-    if (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
-      Serial.println("\n⚠️ ACTIVE CONTROL - STAYING AWAKE");
-      
-      if (currentData.buzzerIsActive || rtcBuzzerActive) {
-        Serial.println("🚨 BUZZER ACTIVE - monitoring for dismiss");
-      }
-      if (currentData.solenoidActive || rtcSolenoidActive) {
-        Serial.println("🔓 SOLENOID ACTIVE - running lock cycle");
-      }
-      
-      // Keep monitoring while either is active
-      unsigned long lastCheck = millis();
-      const unsigned long CHECK_INTERVAL = 5000; // Check every 5 seconds
-      unsigned long solenoidRunTime = 0;
-      
-      // If solenoid just activated, record start time
-      if ((currentData.solenoidActive || rtcSolenoidActive) && rtcSolenoidStartTime == 0) {
-        rtcSolenoidStartTime = millis();
-        digitalWrite(SOLENOID_PIN, HIGH); // Activate solenoid
-        Serial.println("🔓 Solenoid activated at " + String(rtcSolenoidStartTime));
-      }
-      
-      // Display QR code immediately when entering active control mode
-      if (!rtcBuzzerActive && !rtcSolenoidActive) {
-        showOfflineQRCode();
-      }
-      
-      while (currentData.buzzerIsActive || rtcBuzzerActive || currentData.solenoidActive || rtcSolenoidActive) {
-        // Handle buzzer
-        if (currentData.buzzerIsActive || rtcBuzzerActive) {
-          digitalWrite(BUZZER_PIN, HIGH);
-        }
-        
-        // Handle solenoid (15-second activation)
-        if (currentData.solenoidActive || rtcSolenoidActive) {
-          solenoidRunTime = millis() - rtcSolenoidStartTime;
-          
-          if (solenoidRunTime >= 15000) { // 15 seconds elapsed
-            Serial.println("🔒 Solenoid deactivating after 15 seconds");
-            digitalWrite(SOLENOID_PIN, LOW);
-            currentData.solenoidActive = false;
-            rtcSolenoidActive = false;
-            rtcSolenoidStartTime = 0;
-            
-            // Solenoid cycle is complete
-            // Update Firebase with status
-          } else {
-            // Keep solenoid active
-            digitalWrite(SOLENOID_PIN, HIGH);
-            Serial.println("🔓 Solenoid active for " + String(solenoidRunTime / 1000) + " seconds");
-          }
-        }
-        
-        // Check for new control commands
-        if (millis() - lastCheck >= CHECK_INTERVAL) {
-          lastCheck = millis();
-          Serial.println("🌐 Checking Firebase for control commands...");
-          
-          // Check for control commands from Firebase
-          checkFirebaseControls();
-          
-          // If both are deactivated, exit loop
-          if (!currentData.buzzerIsActive && !rtcBuzzerActive && 
-              !currentData.solenoidActive && !rtcSolenoidActive) {
-            Serial.println("✅ All controls deactivated - preparing for sleep");
-            break;
-          }
-        }
-        
-        // Check for interrupts
-        if (shouldInterruptOperation()) {
-          Serial.println("💤 Entering deep sleep to handle interrupt...");
-          // Turn off buzzer and solenoid before sleep
-          digitalWrite(BUZZER_PIN, LOW);
-          digitalWrite(SOLENOID_PIN, LOW);
-          digitalWrite(LED_INDICATOR_PIN, LOW);
-          // Enter deep sleep - will wake with proper reason
-          prepareForDeepSleep();
-          esp_deep_sleep_start();
-        }
-        
-        delay(100); // Small delay to prevent busy waiting
-      }
-    }
+    Serial.println("✅ Sensor data sent to Firebase successfully!");
     
     // Update display with QR code
     showOfflineQRCode();
@@ -590,8 +510,8 @@ void setup() {
     Serial.println("Cycle complete → deep sleep (offline mode).");
   }
   
-  // CRITICAL: Set buzzer to correct state before deep sleep
-  digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
+  // Ensure buzzer is off before deep sleep (unless still active from lock breach)
+  digitalWrite(BUZZER_PIN, LOW);
   
   // Turn OFF LED indicator before sleep
   digitalWrite(LED_INDICATOR_PIN, LOW);
@@ -608,19 +528,7 @@ void loop() {
 }
 
 // Direct Firebase communication implemented
-
-// ---------------------------------------------------------------------------
-// SOLENOID CONTROL
-// ---------------------------------------------------------------------------
-// Solenoid state fetching handled via Firebase
-
-// Solenoid activation handled via Firebase
-
-// Lock breach evaluation handled via Firebase
-
-// Buzzer monitoring handled via Firebase
-
-// Solenoid activation wait handled via Firebase
+// Buzzer and solenoid control handled automatically by location detection
 
 // =====================================================================
 // SENSOR READING FUNCTIONS
@@ -703,16 +611,7 @@ void collectSensorReading() {
   attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
   Serial.println("✓ Limit switch interrupt attached");
   
-  // Check if lid is open and handle buzzer dismissal
-  if (!currentData.limitSwitchPressed) {
-    // Lid is open
-    // When lid opens, clear any previous dismissal
-    if (rtcBuzzerDismissed) {
-      rtcBuzzerDismissed = false;
-      currentData.buzzerDismissed = false;
-      Serial.println("🚨 Lid opened - clearing previous dismissal flags");
-    }
-  }
+  // Note: Lid open state is handled automatically by handleLockBreachEarly()
 
   if (currentData.gpsFixValid || currentData.coarseFix) {
     currentData.currentLocation = String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6);
@@ -792,14 +691,8 @@ void readGPSLocation() {
   // sendAT("AT+CGPSINFOCFG=1,31", 2000);
   Serial.println("\nWaiting 10 seconds for GPS to get signal...");
   
-  // Check for interrupts during 10 second GPS wait
+  // Simple delay without interrupt checking to prevent stuck cycles
   for (int i = 0; i < 100; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 GPS acquisition aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
     delay(100);
   }
   
@@ -813,14 +706,8 @@ void readGPSLocation() {
 
   sim7600.println("AT+CGNSSINFO"); // Query both for robustness
   
-  // Check for interrupts during 2 second wait
+  // Simple delay without interrupt checking to prevent stuck cycles
   for (int i = 0; i < 20; i++) {
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 GPS query aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
     delay(100);
   }
                       
@@ -963,11 +850,7 @@ bool readCellLocation() {
 // =====================================================================
 bool initializeAllHardware() {
   pinMode(BUZZER_PIN, OUTPUT);
-  // Restore buzzer state from RTC memory
-  digitalWrite(BUZZER_PIN, rtcBuzzerActive ? HIGH : LOW);
-  if (rtcBuzzerActive) {
-    Serial.println("🔔 Restoring buzzer state: ON");
-  }
+  digitalWrite(BUZZER_PIN, LOW); // Buzzer off by default
   pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
   
   pinMode(SOLENOID_PIN, OUTPUT); // Initialize solenoid pin
@@ -1103,13 +986,7 @@ String waitForGPSResponse(unsigned long timeout) {
   String response = "";
   unsigned long startTime = millis();
   while (millis() - startTime < timeout) {
-    // Check for interrupts
-    if (shouldInterruptOperation()) {
-      Serial.println("💤 GPS response wait aborted - entering deep sleep to handle interrupt...");
-      digitalWrite(LED_INDICATOR_PIN, LOW);
-      prepareForDeepSleep();
-      esp_deep_sleep_start();
-    }
+    // Simple wait without interrupt checking to prevent stuck cycles
     if (sim7600.available()) {
       response += sim7600.readString();
     }
@@ -1381,13 +1258,28 @@ void updateDisplay() {
   snprintf(buf, sizeof(buf), "REF: %s", currentData.referenceCode.c_str());
   Paint_DrawString_EN(leftMargin, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   
-  // Show current GPS location with better formatting
+  // Parse safe zone coordinates if available
+  double safeLat = 0.0, safeLon = 0.0;
+  bool hasSafeZone = parseCoordPair(currentData.deviceSetLocation, safeLat, safeLon);
+  
+  // Show current GPS location with simplified formatting (3 decimal places)
   char latDir = currentData.latitude >= 0 ? 'N' : 'S';
   char lonDir = currentData.longitude >= 0 ? 'E' : 'W';
-  snprintf(buf, sizeof(buf), "%.4f %c %.4f %c", 
+  snprintf(buf, sizeof(buf), "GPS: %.3f%c %.3f%c", 
            fabs(currentData.latitude), latDir, 
            fabs(currentData.longitude), lonDir);
-  Paint_DrawString_EN(rightColumnX, y, buf, &Font8, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  Paint_DrawString_EN(rightColumnX, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  
+  // Show safe zone location if available (on next line)
+  if (hasSafeZone && safeLat != 0.0 && safeLon != 0.0) {
+    y += 15;
+    char safeLatDir = safeLat >= 0 ? 'N' : 'S';
+    char safeLonDir = safeLon >= 0 ? 'E' : 'W';
+    snprintf(buf, sizeof(buf), "SAFE:%.3f%c %.3f%c",
+             fabs(safeLat), safeLatDir,
+             fabs(safeLon), safeLonDir);
+    Paint_DrawString_EN(rightColumnX, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
+  }
 
   // ------------------------------
   // Push buffer to display
@@ -1516,7 +1408,13 @@ bool initializeCellularData() {
 }
 
 bool sendSensorDataToFirebase() {
-  Serial.println("Attempting to send sensor data to Firebase...");
+  Serial.println("\n📤 SENDING SENSOR DATA TO FIREBASE");
+  Serial.println("Device ID: " + actualDeviceID);
+  Serial.println("Current sensor values:");
+  Serial.println("  Temperature: " + String(currentData.temperature, 1) + "°C");
+  Serial.println("  Humidity: " + String(currentData.humidity, 1) + "%");
+  Serial.println("  Location: " + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6));
+  Serial.println("  Battery: " + String(currentData.batteryVoltage, 2) + "V");
   
   // Create JSON payload for Firebase
   String jsonData = "{";
@@ -1527,7 +1425,6 @@ bool sendSensorDataToFirebase() {
   jsonData += "\"tilt\":" + String(currentData.tiltDetected ? "true" : "false") + ",";
   jsonData += "\"fall\":" + String(currentData.fallDetected ? "true" : "false") + ",";
   jsonData += "\"limitSwitch\":" + String(currentData.limitSwitchPressed ? "true" : "false") + ",";
-  jsonData += "\"solenoid\":" + String(currentData.solenoidActive ? "true" : "false") + ",";
   jsonData += "\"accelerometer\":{";
   jsonData += "\"x\":" + String(currentData.accelX, 3) + ",";
   jsonData += "\"y\":" + String(currentData.accelY, 3) + ",";
@@ -1543,15 +1440,19 @@ bool sendSensorDataToFirebase() {
   
   // Send to Firebase
   String path = "/tracking_box/" + actualDeviceID + "/sensorData";
+  Serial.println("📍 Firebase path: " + path);
+  Serial.println("📝 JSON payload: " + jsonData);
+  
   bool success = sendFirebaseHTTP(path, jsonData, "PUT");
   
   if (success) {
-    Serial.println("✅ Data sent to Firebase successfully");
+    Serial.println("✅ Sensor data sent to Firebase successfully");
+    Serial.println("🔗 Check Firebase at: " + String(FIREBASE_URL) + path);
     rtcLastFirebaseUpdate = millis();
     
-    // Check for control commands after sending data
-    delay(2000);
-    checkFirebaseControls();
+    // No need to check control commands - handled automatically by location detection
+  } else {
+    Serial.println("❌ Failed to send sensor data to Firebase");
   }
   
   return success;
@@ -1814,32 +1715,9 @@ String sendATCommandResponse(const char* cmd, int timeout) {
 
 
 // =====================================================================
-// FIREBASE CONTROL FUNCTIONS
+// FIREBASE DETAILS FUNCTIONS
 // =====================================================================
-bool checkFirebaseControls() {
-  Serial.println("Checking Firebase for control commands...");
-  
-  // Read control flags from Firebase
-  String controlPath = "/tracking_box/" + actualDeviceID + "/controlFlags";
-  String controlData = readFirebaseHTTP(controlPath);
-  
-  if (controlData.length() > 0) {
-    Serial.println("Control data received: " + controlData);
-    parseFirebaseControls(controlData);
-    
-    // Also read device details
-    String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
-    String detailsData = readFirebaseHTTP(detailsPath);
-    
-    if (detailsData.length() > 0) {
-      parseFirebaseDetails(detailsData);
-    }
-    
-    return true;
-  }
-  
-  return false;
-}
+// Control functions removed - buzzer/solenoid handled automatically by location detection
 
 void parseFirebaseDetails(String jsonData) {
   // Parse device details from Firebase
@@ -1970,79 +1848,6 @@ void parseFirebaseDetails(String jsonData) {
   }
 }
 
-void parseFirebaseControls(String jsonData) {
-  // Parse control flags from Firebase
-  // Format: {"buzzer":true,"solenoid":false,"dismissed":true}
-  
-  if (jsonData.length() == 0) return;
-  
-  // Parse buzzer state
-  bool newBuzzerState = false;
-  if (jsonData.indexOf("\"buzzer\":true") != -1) {
-    newBuzzerState = true;
-  }
-  
-  // Parse solenoid state
-  bool newSolenoidState = false;
-  if (jsonData.indexOf("\"solenoid\":true") != -1) {
-    newSolenoidState = true;
-  }
-  
-  // Parse dismiss state
-  bool newDismissState = false;
-  if (jsonData.indexOf("\"dismissed\":true") != -1) {
-    newDismissState = true;
-  }
-  
-  Serial.println("✅ CONTROL COMMAND RECEIVED - Applying immediately...");
-  Serial.printf("Control states: Buzzer=%d, Solenoid=%d, Dismiss=%d\n", 
-                newBuzzerState, newSolenoidState, newDismissState);
-  
-  // Update dismiss state
-  currentData.buzzerDismissed = newDismissState;
-  rtcBuzzerDismissed = newDismissState;
-  
-  if (newDismissState) {
-    Serial.println("✅ Buzzer dismissed by user");
-  }
-  
-  // Apply buzzer state from Firebase
-  currentData.buzzerIsActive = newBuzzerState;
-  rtcBuzzerActive = newBuzzerState;
-  digitalWrite(BUZZER_PIN, newBuzzerState ? HIGH : LOW);
-  
-  if (newBuzzerState) {
-    Serial.println("🔔 BUZZER ACTIVATED by Firebase command!");
-    Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to HIGH");
-  } else {
-    Serial.println("🔕 Buzzer turned OFF by Firebase command");
-    Serial.println("Buzzer pin " + String(BUZZER_PIN) + " set to LOW");
-  }
-  
-  // Apply solenoid state from Firebase
-  if (newSolenoidState != currentData.solenoidActive) {
-    currentData.solenoidActive = newSolenoidState;
-    rtcSolenoidActive = newSolenoidState;
-    
-    if (newSolenoidState) {
-      // Starting new solenoid activation
-      rtcSolenoidStartTime = 0; // Will be set in the monitoring loop
-      Serial.println("🔓 Solenoid activation requested by Firebase");
-    } else {
-      // Solenoid deactivation
-      digitalWrite(SOLENOID_PIN, LOW);
-      rtcSolenoidStartTime = 0;
-      Serial.println("🔒 Solenoid deactivated by Firebase");
-    }
-  }
-  
-  Serial.println("Control states applied:");
-  Serial.println("  Buzzer: " + String(newBuzzerState ? "ON" : "OFF"));
-  Serial.println("  Solenoid: " + String(newSolenoidState ? "ON" : "OFF"));
-  Serial.println("  Dismiss: " + String(newDismissState ? "DISMISSED" : "NOT DISMISSED"));
-  Serial.println("=================================");
-}
-
 // =====================================================================
 // UTILITY FUNCTIONS
 // =====================================================================
@@ -2130,16 +1935,26 @@ bool checkDeviceIDExists(String deviceID) {
   String path = "/tracking_box/" + deviceID;
   String response = readFirebaseHTTP(path);
   
-  // Firebase returns "null" for non-existent paths
-  if (response.length() == 0 || response.indexOf("null") != -1) {
+  Serial.println("Firebase response for " + deviceID + ": " + response);
+  
+  // Firebase returns "null" or empty for non-existent paths
+  if (response.length() == 0) {
+    Serial.println("→ Empty response, ID does not exist");
+    return false;
+  }
+  
+  if (response.indexOf("null") != -1 && response.indexOf("{") == -1) {
+    Serial.println("→ Response is 'null', ID does not exist");
     return false;  // ID doesn't exist
   }
   
   // If response contains any JSON data, ID exists
   if (response.indexOf("{") != -1) {
+    Serial.println("→ Found JSON data, ID exists");
     return true;  // ID exists with data
   }
   
+  Serial.println("→ Unclear response, assuming ID does not exist");
   return false;  // Default to not exists
 }
 
@@ -2183,15 +1998,75 @@ String generateNextDeviceID(String currentID) {
   return base + newNumStr;
 }
 
+// Get device MAC address
+String getDeviceMacAddress() {
+  uint64_t mac = ESP.getEfuseMac();
+  String macStr = "";
+  
+  // Convert MAC to string format XX:XX:XX:XX:XX:XX
+  for (int i = 0; i < 6; i++) {
+    uint8_t byte = (mac >> (i * 8)) & 0xFF;
+    if (macStr.length() > 0) macStr += ":";
+    if (byte < 0x10) macStr += "0";
+    macStr += String(byte, HEX);
+  }
+  
+  macStr.toUpperCase();
+  return macStr;
+}
+
+// Generate device ID from MAC address
+String generateDeviceIDFromMAC() {
+  // Use last 3 bytes of MAC to create a unique suffix
+  uint64_t mac = ESP.getEfuseMac();
+  uint32_t uniqueNum = (mac & 0xFFFFFF);  // Last 3 bytes
+  
+  // Convert to a 3-digit number (001-999)
+  int deviceNum = (uniqueNum % 999) + 1;
+  
+  // Format as box_XXX with leading zeros
+  String deviceID = "box_";
+  if (deviceNum < 10) deviceID += "00";
+  else if (deviceNum < 100) deviceID += "0";
+  deviceID += String(deviceNum);
+  
+  return deviceID;
+}
+
 // Validate and get a unique device ID
 String validateAndGetUniqueDeviceID() {
-  String testID = DEVICE_ID;
-  int attempts = 0;
-  const int MAX_ATTEMPTS = 100;  // Prevent infinite loop
-  
   Serial.println("\n🔍 Starting Device ID validation...");
+  Serial.println("MAC Address: " + deviceMacAddress);
+  
+  // First, try the preferred device ID (box_001)
+  String testID = DEVICE_ID;
+  Serial.println("Testing preferred ID: " + testID);
+  
+  if (!checkDeviceIDExists(testID)) {
+    Serial.println("✅ Preferred ID is available: " + testID);
+    return testID;
+  }
+  
+  Serial.println("❌ Preferred ID already exists: " + testID);
+  
+  // Generate MAC-based ID
+  String macBasedID = generateDeviceIDFromMAC();
+  Serial.println("Generated MAC-based ID: " + macBasedID);
+  
+  // Test the MAC-based ID
+  if (!checkDeviceIDExists(macBasedID)) {
+    Serial.println("✅ MAC-based ID is available: " + macBasedID);
+    return macBasedID;
+  }
+  
+  // If MAC-based ID also exists, increment sequentially
+  Serial.println("❌ MAC-based ID already exists: " + macBasedID);
+  testID = macBasedID;
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 100;
   
   while (attempts < MAX_ATTEMPTS) {
+    testID = generateNextDeviceID(testID);
     Serial.println("Testing ID: " + testID);
     
     if (!checkDeviceIDExists(testID)) {
@@ -2200,14 +2075,15 @@ String validateAndGetUniqueDeviceID() {
     }
     
     Serial.println("❌ ID already exists: " + testID);
-    testID = generateNextDeviceID(testID);
     attempts++;
-    delay(500);  // Small delay between checks
+    delay(500);
   }
   
-  // Fallback: use timestamp suffix if all attempts fail
-  String fallbackID = DEVICE_ID + "_" + String(millis());
-  Serial.println("⚠️ Max attempts reached, using fallback ID: " + fallbackID);
+  // Ultimate fallback: use full MAC suffix
+  String macSuffix = deviceMacAddress.substring(9);
+  macSuffix.replace(":", "");
+  String fallbackID = "box_" + macSuffix;
+  Serial.println("⚠️ Max attempts reached, using MAC fallback ID: " + fallbackID);
   return fallbackID;
 }
 
