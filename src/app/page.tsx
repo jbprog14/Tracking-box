@@ -362,7 +362,7 @@ export default function Home() {
                   const latestAlert = currentMotionAlerts[latestAlertKey];
                   
                   toast(
-                    `🏃 ${latestAlert?.message || 'Motion detected'} on ${currentBox.details.name || boxId}`,
+                    `🏃 ${latestAlert?.message || 'Motion detected'} on ${boxId.toUpperCase()}`,
                     {
                       id: `motion-toast-${boxId}-${Date.now()}`,
                       duration: 15000, // 15 seconds
@@ -413,7 +413,7 @@ export default function Home() {
                   const latestAlert = currentSafeAlerts[latestAlertKey];
                   
                   toast(
-                    `📦 ${latestAlert?.message || 'Package delivered'} on ${currentBox.details.name || boxId}`,
+                    `📦 ${latestAlert?.message || 'Package delivered'} on ${boxId.toUpperCase()}`,
                     {
                       id: `safe-toast-${boxId}-${Date.now()}`,
                       duration: 15000, // 15 seconds
@@ -464,7 +464,7 @@ export default function Home() {
                   
                   // Show critical alert with same style as motion/safe alerts (yellow toast)
                   toast(
-                    `🚨 ${latestCriticalAlert?.message || `${currentBox.details.name || boxId} has been moved outside the safe zone.`}`,
+                    `🚨 ${latestCriticalAlert?.message || `${boxId.toUpperCase()} has been moved outside the safe zone.`}`,
                     {
                       id: `critical-toast-${boxId}-${Date.now()}`,
                       duration: 15000, // 15 seconds (same as motion/safe)

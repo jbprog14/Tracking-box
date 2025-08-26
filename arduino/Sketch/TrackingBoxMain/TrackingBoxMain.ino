@@ -416,6 +416,27 @@ void setup() {
     if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
       Serial.println("\n🔍 No saved device ID found. Generating MAC-based Device ID...");
       actualDeviceID = generateDeviceIDFromMAC();
+      Serial.println("🔍 Generated ID: " + actualDeviceID);
+      
+      // Check if this ID already exists in Firebase
+      Serial.println("🔍 Checking if ID is available in Firebase...");
+      String testPath = "/tracking_box/" + actualDeviceID + "/sensorData";
+      String response = readFirebaseHTTP(testPath);
+      
+      if (response.indexOf("null") == -1 && response.length() > 0) {
+        // ID already exists - collision detected!
+        Serial.println("⚠️ ID collision! " + actualDeviceID + " already exists in Firebase");
+        
+        // Use first 3 bytes of MAC address as fallback
+        String fullMacID = deviceMacAddress;
+        fullMacID.replace(":", "");  // Remove colons
+        // Take only first 6 characters (first 3 bytes) for shorter ID
+        actualDeviceID = "box_" + fullMacID.substring(0, 6);
+        Serial.println("✅ Using fallback MAC-based ID: " + actualDeviceID);
+      } else {
+        Serial.println("✅ ID is available: " + actualDeviceID);
+      }
+      
       actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
       rtcDeviceIDValidated = true;
       
@@ -424,7 +445,7 @@ void setup() {
       preferences.putString("deviceID", actualDeviceID);
       preferences.end();
       
-      Serial.println("✅ Generated MAC-based ID: " + actualDeviceID);
+      Serial.println("✅ Device ID registered: " + actualDeviceID);
       
       // Device ID is validated - sensor data will be sent in the main flow
       Serial.println("📝 New device ID registered: " + actualDeviceID);
@@ -2018,20 +2039,19 @@ String getDeviceMacAddress() {
 
 // Generate device ID from MAC address
 String generateDeviceIDFromMAC() {
-  // Use last 3 bytes of MAC to create a unique suffix
+  // Use last 3 bytes of MAC in hex format for guaranteed uniqueness
   uint64_t mac = ESP.getEfuseMac();
-  uint32_t uniqueNum = (mac & 0xFFFFFF);  // Last 3 bytes
   
-  // Convert to a 3-digit number (001-999)
-  int deviceNum = (uniqueNum % 999) + 1;
+  // Extract last 3 bytes
+  uint8_t byte1 = (mac >> 16) & 0xFF;
+  uint8_t byte2 = (mac >> 8) & 0xFF;
+  uint8_t byte3 = mac & 0xFF;
   
-  // Format as box_XXX with leading zeros
-  String deviceID = "box_";
-  if (deviceNum < 10) deviceID += "00";
-  else if (deviceNum < 100) deviceID += "0";
-  deviceID += String(deviceNum);
+  // Format as box_XXXXXX using hex values (uppercase)
+  char deviceID[16];
+  snprintf(deviceID, sizeof(deviceID), "box_%02X%02X%02X", byte1, byte2, byte3);
   
-  return deviceID;
+  return String(deviceID);
 }
 
 // =====================================================================
