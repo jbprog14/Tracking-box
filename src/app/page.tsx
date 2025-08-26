@@ -121,7 +121,6 @@ export default function Home() {
   );
   const [isLoading, setIsLoading] = useState(true);
   const [dataError, setDataError] = useState<string | null>(null);
-  const [isDismissing, setIsDismissing] = useState<string | null>(null);
   const prevTrackingDataRef = useRef<TrackingData>({});
 
   // ------------------------------------------------------------------
@@ -519,7 +518,6 @@ export default function Home() {
     );
 
     return () => unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -569,30 +567,6 @@ export default function Home() {
       }
     };
   }, []);
-
-  // Function to dismiss critical security breach alert
-  const dismissCriticalAlert = async (boxId: string) => {
-    setIsDismissing(boxId);
-
-    try {
-      // Update controlFlags path for buzzer control (used by device firmware)
-      const controlFlagsRef = ref(db, `tracking_box/${boxId}/controlFlags`);
-      await update(controlFlagsRef, {
-        buzzer: false,  // Turn off buzzer
-        timestamp: Date.now()
-      });
-
-      toast.success(`Alarm for ${boxId} dismissed successfully.`, {
-        position: "top-right",
-      });
-      console.log(`Critical alert dismissed for ${boxId}`);
-    } catch (error) {
-      console.error("Error dismissing alert:", error);
-      toast.error(`An error occurred while dismissing the alarm for ${boxId}.`);
-    } finally {
-      setIsDismissing(null);
-    }
-  };
 
 
   const handleLogin = (e: React.FormEvent) => {

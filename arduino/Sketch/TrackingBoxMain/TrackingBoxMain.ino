@@ -91,10 +91,9 @@
 // =====================================================================
 // DEVICE & FIREBASE CONFIGURATION
 // =====================================================================
-const String DEVICE_ID = "box_001";  // Base/preferred device ID
 
-// Device ID validation - auto-generates unique ID based on MAC if base ID exists
-String actualDeviceID = "";  // Runtime device ID (either original or MAC-based)
+// Device ID validation - auto-generates unique ID based on MAC address
+String actualDeviceID = "";  // Runtime device ID (MAC-based)
 RTC_DATA_ATTR char rtcActualDeviceID[32] = "";  // Persist across deep sleep
 RTC_DATA_ATTR bool rtcDeviceIDValidated = false;  // Flag to track if ID was validated
 String deviceMacAddress = "";  // Store the device's MAC address
@@ -221,17 +220,17 @@ bool parseCoordPair(const String &raw, double &lat, double &lon) {
 
 // Calculate distance between two GPS coordinates using Haversine formula
 // Returns distance in meters
-float calculateDistance(double lat1, double lon1, double lat2, double lon2) {
-  const float R = 6371000.0; // Earth radius in meters
-  const float phi1 = lat1 * PI / 180.0;
-  const float phi2 = lat2 * PI / 180.0;
-  const float deltaPhi = (lat2 - lat1) * PI / 180.0;
-  const float deltaLambda = (lon2 - lon1) * PI / 180.0;
+double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0; // Earth radius in meters
+  const double phi1 = lat1 * PI / 180.0;
+  const double phi2 = lat2 * PI / 180.0;
+  const double deltaPhi = (lat2 - lat1) * PI / 180.0;
+  const double deltaLambda = (lon2 - lon1) * PI / 180.0;
 
-  const float a = sin(deltaPhi / 2) * sin(deltaPhi / 2) +
+  const double a = sin(deltaPhi / 2) * sin(deltaPhi / 2) +
                   cos(phi1) * cos(phi2) *
                   sin(deltaLambda / 2) * sin(deltaLambda / 2);
-  const float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  const double c = 2 * atan2(sqrt(a), sqrt(1 - a));
 
   return R * c; // Distance in meters
 }
@@ -326,12 +325,11 @@ void sendDeliveryNotification();
 void activateSolenoidForDelivery(unsigned long duration);
 void handleLockBreachEarly();
 void handleBuzzerActivation(unsigned long duration);
-float calculateDistance(double lat1, double lon1, double lat2, double lon2);
+double calculateDistance(double lat1, double lon1, double lat2, double lon2);
 bool sendFirebaseHTTP(String path, String jsonData, String method);
 String readFirebaseHTTP(String path);
 bool checkDeviceIDExists(String deviceID);
 String generateNextDeviceID(String currentID);
-String validateAndGetUniqueDeviceID();
 String getDeviceMacAddress();
 String generateDeviceIDFromMAC();
 void flushSIM7600Buffer();
@@ -408,16 +406,16 @@ void setup() {
   // OPTIMIZED LOCK BREACH HANDLING - Handle immediately after cellular init
   if (currentData.wakeUpReason == "LOCK BREACH" && rtcBootCount > 1) {
     handleLockBreachEarly();
-    // handleLockBreachEarly() will handle everything and enter deep sleep
-    // Code will not continue past this point for lock breach scenarios
+    // handleLockBreachEarly() handles buzzer/solenoid based on location
+    // Normal cycle continues after to fetch details and update display
   }
   
   // Validate Device ID uniqueness only if we don't have a saved ID
   if (actualDeviceID.length() == 0) {
     // No saved device ID found in permanent storage or RTC memory
     if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
-      Serial.println("\n🔍 No saved device ID found. Validating Device ID uniqueness...");
-      actualDeviceID = validateAndGetUniqueDeviceID();
+      Serial.println("\n🔍 No saved device ID found. Generating MAC-based Device ID...");
+      actualDeviceID = generateDeviceIDFromMAC();
       actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
       rtcDeviceIDValidated = true;
       
@@ -426,12 +424,7 @@ void setup() {
       preferences.putString("deviceID", actualDeviceID);
       preferences.end();
       
-      if (actualDeviceID != DEVICE_ID) {
-        Serial.println("⚠️ Original ID '" + DEVICE_ID + "' was already taken");
-        Serial.println("✅ Assigned new unique ID: " + actualDeviceID);
-      } else {
-        Serial.println("✅ Using original ID: " + actualDeviceID);
-      }
+      Serial.println("✅ Generated MAC-based ID: " + actualDeviceID);
       
       // Device ID is validated - sensor data will be sent in the main flow
       Serial.println("📝 New device ID registered: " + actualDeviceID);
@@ -784,7 +777,7 @@ bool readCellLocation() {
     return false;
   }
   
-  // Parse format: +CLBS: <locationcode>,<longitude>,<latitude>,<acc>
+  // Parse format: +CLBS: <locationcode>,<latitude>,<longitude>,<acc>
   int firstComma = resp.indexOf(',', idx);
   if (firstComma == -1) {
     Serial.println("✗ Invalid CLBS format");
@@ -799,21 +792,21 @@ bool readCellLocation() {
     return false;
   }
   
-  // Get longitude (comes before latitude)
+  // Get latitude (comes first after error code)
   int secondComma = resp.indexOf(',', firstComma + 1);
   if (secondComma == -1) {
-    Serial.println("✗ Missing longitude in CLBS response");
-    return false;
-  }
-  String lonStr = resp.substring(firstComma + 1, secondComma);
-  
-  // Get latitude
-  int thirdComma = resp.indexOf(',', secondComma + 1);
-  if (thirdComma == -1) {
     Serial.println("✗ Missing latitude in CLBS response");
     return false;
   }
-  String latStr = resp.substring(secondComma + 1, thirdComma);
+  String latStr = resp.substring(firstComma + 1, secondComma);
+  
+  // Get longitude (comes second)
+  int thirdComma = resp.indexOf(',', secondComma + 1);
+  if (thirdComma == -1) {
+    Serial.println("✗ Missing longitude in CLBS response");
+    return false;
+  }
+  String lonStr = resp.substring(secondComma + 1, thirdComma);
   
   // Get accuracy if available
   int fourthComma = resp.indexOf(',', thirdComma + 1);
@@ -822,24 +815,40 @@ bool readCellLocation() {
     accStr = resp.substring(thirdComma + 1, fourthComma);
   }
   
-  double lon = lonStr.toDouble();
-  double lat = latStr.toDouble();
+  // Debug: Print what we parsed
+  Serial.println("📍 CLBS Parsing Debug:");
+  Serial.printf("   latStr (1st value) = '%s'\n", latStr.c_str());
+  Serial.printf("   lonStr (2nd value) = '%s'\n", lonStr.c_str());
   
-  if (lat == 0.0 || lon == 0.0) {
+  // CLBS response format from SIM7600: errorcode,latitude,longitude,accuracy
+  // latStr contains latitude (first coordinate after error code)
+  // lonStr contains longitude (second coordinate)
+  double clbs_latitude = latStr.toDouble();
+  double clbs_longitude = lonStr.toDouble();
+  
+  Serial.printf("   clbs_latitude = %.8f\n", clbs_latitude);
+  Serial.printf("   clbs_longitude = %.8f\n", clbs_longitude);
+  
+  if (clbs_latitude == 0.0 || clbs_longitude == 0.0) {
     Serial.println("✗ Invalid coordinates (0,0)");
     return false;
   }
   
-  currentData.latitude = lat;
-  currentData.longitude = lon;
+  // Assign to struct fields in correct order
+  currentData.latitude = clbs_latitude;    // Latitude (e.g., 14.60)
+  currentData.longitude = clbs_longitude;  // Longitude (e.g., 120.98)
+  
+  Serial.printf("   After assignment:\n");
+  Serial.printf("   currentData.latitude = %.8f (should be ~14.60)\n", currentData.latitude);
+  Serial.printf("   currentData.longitude = %.8f (should be ~120.98)\n", currentData.longitude);
   currentData.altitude = 0;
   currentData.gpsFixValid = false;   // not a GNSS fix
   currentData.coarseFix = true;
   
   if (accStr.length() > 0) {
-    Serial.printf("✓ CLBS coarse fix: %.5f, %.5f (accuracy: %sm)\n", lat, lon, accStr.c_str());
+    Serial.printf("✓ CLBS coarse fix: lat=%.5f, lon=%.5f (accuracy: %sm)\n", clbs_latitude, clbs_longitude, accStr.c_str());
   } else {
-    Serial.printf("✓ CLBS coarse fix: %.5f, %.5f\n", lat, lon);
+    Serial.printf("✓ CLBS coarse fix: lat=%.5f, lon=%.5f\n", clbs_latitude, clbs_longitude);
   }
   
   return true;
@@ -1262,22 +1271,14 @@ void updateDisplay() {
   double safeLat = 0.0, safeLon = 0.0;
   bool hasSafeZone = parseCoordPair(currentData.deviceSetLocation, safeLat, safeLon);
   
-  // Show current GPS location with simplified formatting (3 decimal places)
-  char latDir = currentData.latitude >= 0 ? 'N' : 'S';
-  char lonDir = currentData.longitude >= 0 ? 'E' : 'W';
-  snprintf(buf, sizeof(buf), "GPS: %.3f%c %.3f%c", 
-           fabs(currentData.latitude), latDir, 
-           fabs(currentData.longitude), lonDir);
+  // Show current GPS location - simple format
+  snprintf(buf, sizeof(buf), "GPS: %.3f, %.3f", currentData.latitude, currentData.longitude);
   Paint_DrawString_EN(rightColumnX, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   
-  // Show safe zone location if available (on next line)
+  // Show safe zone location if available
   if (hasSafeZone && safeLat != 0.0 && safeLon != 0.0) {
-    y += 15;
-    char safeLatDir = safeLat >= 0 ? 'N' : 'S';
-    char safeLonDir = safeLon >= 0 ? 'E' : 'W';
-    snprintf(buf, sizeof(buf), "SAFE:%.3f%c %.3f%c",
-             fabs(safeLat), safeLatDir,
-             fabs(safeLon), safeLonDir);
+    y += 20;
+    snprintf(buf, sizeof(buf), "SAFE: %.3f, %.3f", safeLat, safeLon);
     Paint_DrawString_EN(rightColumnX, y, buf, &Font12, EPD_7IN3F_WHITE, EPD_7IN3F_BLACK);
   }
 
@@ -2033,60 +2034,6 @@ String generateDeviceIDFromMAC() {
   return deviceID;
 }
 
-// Validate and get a unique device ID
-String validateAndGetUniqueDeviceID() {
-  Serial.println("\n🔍 Starting Device ID validation...");
-  Serial.println("MAC Address: " + deviceMacAddress);
-  
-  // First, try the preferred device ID (box_001)
-  String testID = DEVICE_ID;
-  Serial.println("Testing preferred ID: " + testID);
-  
-  if (!checkDeviceIDExists(testID)) {
-    Serial.println("✅ Preferred ID is available: " + testID);
-    return testID;
-  }
-  
-  Serial.println("❌ Preferred ID already exists: " + testID);
-  
-  // Generate MAC-based ID
-  String macBasedID = generateDeviceIDFromMAC();
-  Serial.println("Generated MAC-based ID: " + macBasedID);
-  
-  // Test the MAC-based ID
-  if (!checkDeviceIDExists(macBasedID)) {
-    Serial.println("✅ MAC-based ID is available: " + macBasedID);
-    return macBasedID;
-  }
-  
-  // If MAC-based ID also exists, increment sequentially
-  Serial.println("❌ MAC-based ID already exists: " + macBasedID);
-  testID = macBasedID;
-  int attempts = 0;
-  const int MAX_ATTEMPTS = 100;
-  
-  while (attempts < MAX_ATTEMPTS) {
-    testID = generateNextDeviceID(testID);
-    Serial.println("Testing ID: " + testID);
-    
-    if (!checkDeviceIDExists(testID)) {
-      Serial.println("✅ ID is available: " + testID);
-      return testID;
-    }
-    
-    Serial.println("❌ ID already exists: " + testID);
-    attempts++;
-    delay(500);
-  }
-  
-  // Ultimate fallback: use full MAC suffix
-  String macSuffix = deviceMacAddress.substring(9);
-  macSuffix.replace(":", "");
-  String fallbackID = "box_" + macSuffix;
-  Serial.println("⚠️ Max attempts reached, using MAC fallback ID: " + fallbackID);
-  return fallbackID;
-}
-
 // =====================================================================
 // OPTIMIZED LOCK BREACH HANDLING FUNCTIONS
 // =====================================================================
@@ -2133,10 +2080,10 @@ void handleLockBreachEarly() {
   bool buzzerActivated = false;
   bool solenoidActivated = false;
   
-  if (hasValidSafeZone && currentData.gpsFixValid) {
-    // Calculate distance from safe zone using Haversine formula
-    float distance = calculateDistance(safeLat, safeLon, 
-                                      currentData.latitude, currentData.longitude);
+  if (hasValidSafeZone && (currentData.gpsFixValid || currentData.coarseFix)) {
+    // Calculate distance from safe zone using Haversine formula (works with GPS or CLBS)
+    double distance = calculateDistance(safeLat, safeLon, 
+                                       currentData.latitude, currentData.longitude);
     
     Serial.println("\n📊 DISTANCE CALCULATION DEBUG:");
     Serial.printf("   Safe zone coords: %.8f, %.8f\n", safeLat, safeLon);
@@ -2145,9 +2092,9 @@ void handleLockBreachEarly() {
     Serial.printf("   Lon difference:   %.8f degrees\n", currentData.longitude - safeLon);
     
     // Manual quick approximation for verification (at equator: 1 degree ≈ 111km)
-    float approxLatDist = abs(currentData.latitude - safeLat) * 111000.0; // meters
-    float approxLonDist = abs(currentData.longitude - safeLon) * 111000.0 * cos(safeLat * PI / 180.0);
-    float approxDist = sqrt(approxLatDist * approxLatDist + approxLonDist * approxLonDist);
+    double approxLatDist = abs(currentData.latitude - safeLat) * 111000.0; // meters
+    double approxLonDist = abs(currentData.longitude - safeLon) * 111000.0 * cos(safeLat * PI / 180.0);
+    double approxDist = sqrt(approxLatDist * approxLatDist + approxLonDist * approxLonDist);
     
     Serial.printf("   Haversine distance: %.2f meters\n", distance);
     Serial.printf("   Approximate distance: %.2f meters (quick check)\n", approxDist);
@@ -2189,8 +2136,8 @@ void handleLockBreachEarly() {
     Serial.println("\n⏱️ Starting buzzer activation sequence...");
     handleBuzzerActivation(15000);
     buzzerActivated = true;
-  } else if (!currentData.gpsFixValid) {
-    Serial.println("⚠️ No GPS fix available - defaulting to critical breach alert");
+  } else if (!currentData.gpsFixValid && !currentData.coarseFix) {
+    Serial.println("⚠️ No location fix available (GPS or CLBS) - defaulting to critical breach alert");
     // 1. Send alert first
     sendLockBreachAlert();
     // 2. Activate buzzer
@@ -2214,11 +2161,9 @@ void handleLockBreachEarly() {
   showOfflineQRCode();
   Serial.println("✅ E-ink display update completed");
   
-  // Enter deep sleep
-  Serial.println("\n💤 Entering deep sleep after lock breach handling");
-  Serial.printf("   Total process time: %lu ms\n", millis());
-  prepareForDeepSleep();
-  esp_deep_sleep_start();
+  // Return to normal cycle - will fetch Firebase details and complete properly
+  Serial.println("\n✅ Lock breach handling complete - returning to normal cycle");
+  Serial.printf("   Lock breach process time: %lu ms\n", millis());
 }
 
 // Send delivery notification to Firebase

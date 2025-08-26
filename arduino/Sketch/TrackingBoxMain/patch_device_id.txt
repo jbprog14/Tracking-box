@@ -1,0 +1,43 @@
+INSTRUCTIONS TO APPLY MANUALLY:
+
+1. Remove line 94:
+   const String DEVICE_ID = "box_001";  // Base/preferred device ID
+
+2. Change line 96-97 from:
+   // Device ID validation - auto-generates unique ID based on MAC if base ID exists
+   String actualDeviceID = "";  // Runtime device ID (either original or MAC-based)
+   
+   To:
+   // Device ID validation - auto-generates unique ID based on MAC address
+   String actualDeviceID = "";  // Runtime device ID (MAC-based)
+
+3. Remove line 334:
+   String validateAndGetUniqueDeviceID();
+
+4. Replace line 420:
+   actualDeviceID = validateAndGetUniqueDeviceID();
+   
+   With:
+   actualDeviceID = generateDeviceIDFromMAC();
+
+5. Remove lines 429-434 (the if-else block checking DEVICE_ID):
+   if (actualDeviceID != DEVICE_ID) {
+     Serial.println("⚠️ Original ID '" + DEVICE_ID + "' was already taken");
+     Serial.println("✅ Assigned new unique ID: " + actualDeviceID);
+   } else {
+     Serial.println("✅ Using original ID: " + actualDeviceID);
+   }
+   
+   Replace with:
+   Serial.println("✅ Generated MAC-based ID: " + actualDeviceID);
+
+6. Delete the entire validateAndGetUniqueDeviceID() function (lines 2030-2081):
+   Starting from:
+   // Validate and get a unique device ID
+   String validateAndGetUniqueDeviceID() {
+   
+   Ending with:
+   return fallbackID;
+   }
+
+This will make all devices use MAC-based IDs exclusively, removing the "box_001" preference that was causing conflicts in Firebase.
