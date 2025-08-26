@@ -2154,14 +2154,8 @@ void handleLockBreachEarly() {
   if (solenoidActivated) {
     Serial.println("   - Solenoid sequence completed");
   }
-  Serial.printf("   Process time before display: %lu ms\n", millis());
   
-  // NOW update display (LAST operation, after all blocking operations)
-  Serial.println("\n📱 Starting e-ink display update (may take several seconds)...");
-  showOfflineQRCode();
-  Serial.println("✅ E-ink display update completed");
-  
-  // Return to normal cycle - will fetch Firebase details and complete properly
+  // Return to normal cycle - display will be updated in the main cycle with proper data
   Serial.println("\n✅ Lock breach handling complete - returning to normal cycle");
   Serial.printf("   Lock breach process time: %lu ms\n", millis());
 }
