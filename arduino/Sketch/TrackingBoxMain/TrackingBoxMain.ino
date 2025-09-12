@@ -1,181 +1,113 @@
 /*
- * =====================================================================
  * TRACKING BOX DEVICE - DUAL-MODE FIREBASE FIRMWARE
- * =====================================================================
- * 
- * This sketch implements a streamlined, single-cycle operation for the
- * tracking device using dual-mode Firebase communication (WiFi + Cellular).
- * 
- * On every wake-up, it performs the following:
- * 1. Initialize all hardware.
- * 2. Attempt WiFi connection (with WiFiManager portal support).
- * 3. Fall back to cellular if WiFi unavailable.
- * 4. Gather a full set of sensor readings.
- * 5. Send sensor data to Firebase via WiFi or cellular.
- * 6. Check for control commands from Firebase.
- * 7. Update the E-Ink display with all data.
- * 8. Enter deep sleep until next wake trigger.
- * 
- * COMMUNICATION MODES:
- * - PRIMARY: WiFi connection for cost-effective data transmission
- * - FALLBACK: Cellular data (SIM7600) when WiFi is unavailable
- * - WiFiManager portal for easy field configuration
- * 
- * CELLULAR LOCATION SERVICES:
- * SIM7600 cellular module is used for GNSS/GPS tracking and CLBS (Cell Location
- * Based Services) as a fallback when GPS signal is unavailable.
- * 
- * The device wakes from deep sleep based on three triggers:
- * - A 15-minute timer.
- * - The box lid being opened (limit switch).
- * - A significant shock or movement detected by the LSM6DSL accelerometer.
- * 
- * =====================================================================
+ * ESP32 with WiFi/Cellular data transmission, GPS tracking, and E-ink display
+ * Wake triggers: 15-min timer, lid open (limit switch), motion (LSM6DSL)
  */
 
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
 #include <Adafruit_LSM6DSL.h>
-#include <Preferences.h>  // For permanent storage
+#include <Preferences.h>
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "DEV_Config.h"
 #include "EPD.h"
 #include "GUI_Paint.h"
-#include "qrcode.h"   // QR code generator for display
-// Direct AT commands are used for GNSS/GPS and CLBS location services
+#include "qrcode.h"
 #include <time.h>
 #include <Adafruit_SHT31.h>
-// WiFi and WiFiManager includes
 #include <WiFi.h>
-#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
-#include <HTTPClient.h>   // For WiFi-based HTTP requests
-#define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
-#define ENABLE_SHT30_SENSOR 1  // Set to 1 to enable SHT30 temperature/humidity sensor
+#include <WiFiManager.h>
+#include <HTTPClient.h>
 
-// =====================================================================
+#define DEBUG_GNSS 1
+#define ENABLE_SHT30_SENSOR 1
+
 // PIN DEFINITIONS
-// =====================================================================
 #define BATTERY_ADC_PIN     36
 #define SHT30_SDA_PIN       21
 #define SHT30_SCL_PIN       22
 #define LSM6DSL_SDA_PIN     21
 #define LSM6DSL_SCL_PIN     22
 #define LSM6DSL_INT1_PIN    34
-#define SIM7600_TX_PIN      19  // Verified working with UART2
-#define SIM7600_RX_PIN      18  // Verified working with UART2
+#define SIM7600_TX_PIN      19
+#define SIM7600_RX_PIN      18
 #define LIMIT_SWITCH_PIN    33
 #define BUZZER_PIN          32
-#define SOLENOID_PIN        2   // GPIO2 – electronic lock/solenoid signal
-#define LED_INDICATOR_PIN   4   // GPIO4 – LED indicator for wake/sleep status
+#define SOLENOID_PIN        2
+#define LED_INDICATOR_PIN   4
 
-// =====================================================================
-// LSM6DSL CONSTANTS
-// =====================================================================
-// LSM6DSL Registers
+// LSM6DSL REGISTERS
 #define LSM6DSL_CTRL1_XL         0x10
 #define LSM6DSL_CTRL3_C          0x12
 #define LSM6DSL_TAP_CFG          0x58
-#define LSM6DSL_WAKE_UP_THS      0x5B // Wake-up threshold register
-#define LSM6DSL_WAKE_UP_DUR      0x5C // Wake-up duration register
-#define LSM6DSL_MD1_CFG          0x5E // Interrupt 1 routing register
+#define LSM6DSL_WAKE_UP_THS      0x5B
+#define LSM6DSL_WAKE_UP_DUR      0x5C
+#define LSM6DSL_MD1_CFG          0x5E
+#define LSM6DSL_ADDR1            0x6A
+#define LSM6DSL_ADDR2            0x6B
 
-// LSM6DSL I2C Addresses
-#define LSM6DSL_ADDR1            0x6A // SDO/SA0 is low
-#define LSM6DSL_ADDR2            0x6B // SDO/SA0 is high
-
-// =====================================================================
 // SYSTEM CONFIGURATION
-// =====================================================================
 #define SLEEP_MINUTES       15
 #define uS_TO_S_FACTOR      1000000ULL
 #define SLEEP_TIME_US       (SLEEP_MINUTES * 60 * uS_TO_S_FACTOR)
-// New tilt / free-fall thresholds using accel-gyro technique
-#define TILT_THRESHOLD_Z_AXIS       0.0  // g – if Z-axis accel < this → tilted 90°
-#define FALL_THRESHOLD_MAGNITUDE    1.1  // g – CHANGE in accel magnitude to trigger a shock event
+#define TILT_THRESHOLD_Z_AXIS       0.0
+#define FALL_THRESHOLD_MAGNITUDE    1.1
 
-// =====================================================================
 // DEVICE & FIREBASE CONFIGURATION
-// =====================================================================
+String actualDeviceID = "";
+RTC_DATA_ATTR char rtcActualDeviceID[32] = "";
+RTC_DATA_ATTR bool rtcDeviceIDValidated = false;
+String deviceMacAddress = "";
 
-// Device ID validation - auto-generates unique ID based on MAC address
-String actualDeviceID = "";  // Runtime device ID (MAC-based)
-RTC_DATA_ATTR char rtcActualDeviceID[32] = "";  // Persist across deep sleep
-RTC_DATA_ATTR bool rtcDeviceIDValidated = false;  // Flag to track if ID was validated
-String deviceMacAddress = "";  // Store the device's MAC address
-
-// FIREBASE CONFIGURATION
 const char* FIREBASE_URL = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* APN = "internet";  // Change to your carrier's APN
+const char* APN = "internet";
 
 // WIFI CONFIGURATION
 WiFiManager wifiManager;
 bool wifiConnected = false;
-RTC_DATA_ATTR int wifiFailCount = 0;  // Persist across deep sleep
-RTC_DATA_ATTR bool useWiFiFirst = true;  // Connection preference
+RTC_DATA_ATTR int wifiFailCount = 0;
+RTC_DATA_ATTR bool useWiFiFirst = true;
 const int MAX_WIFI_FAILURES = 5;
-const int WIFI_CONNECT_TIMEOUT = 10;  // 10 seconds
-const int PORTAL_TIMEOUT = 180;  // 3 minutes
+const int WIFI_CONNECT_TIMEOUT = 10;
+const int PORTAL_TIMEOUT = 180;
 
-// =====================================================================
 // GLOBAL OBJECTS & VARIABLES
-// =====================================================================
-volatile bool limitSwitchTriggered = false;  // Flag for limit switch interrupt
-volatile bool motionDetected = false;  // Flag for motion interrupt
+volatile bool limitSwitchTriggered = false;
+volatile bool motionDetected = false;
 #if ENABLE_SHT30_SENSOR
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
 #endif
 Adafruit_LSM6DSL lsm6ds = Adafruit_LSM6DSL();
-HardwareSerial sim7600(2);  // Using UART2 - verified working with SIM7600G-H
-Preferences preferences;  // For permanent storage
-// SIM7600 module is used for both GNSS/GPS location services and cellular data for Firebase
+HardwareSerial sim7600(2);
+Preferences preferences;
 uint8_t lsm6dsl_address = 0x6A;
-// Flags indicating whether each sensor initialised correctly (ported from sht-gyro example)
-bool sht30_ok   = false;
+bool sht30_ok = false;
 bool lsm6dsl_ok = false;
-// RTC memory to store last accelerometer reading across deep sleep cycles
+
+// RTC memory variables
 RTC_DATA_ATTR float rtcLastAccelX = 0.0;
 RTC_DATA_ATTR float rtcLastAccelY = 0.0;
 RTC_DATA_ATTR float rtcLastAccelZ = 0.0;
 RTC_DATA_ATTR bool rtcBaselineSet = false;
-RTC_DATA_ATTR bool rtcLastTiltState = false; // To track tilt state changes, like in the test sketch
-RTC_DATA_ATTR uint32_t rtcBootCount = 0;     // persists across deep-sleep cycles
-
-// RTC memory to store device details
+RTC_DATA_ATTR bool rtcLastTiltState = false;
+RTC_DATA_ATTR uint32_t rtcBootCount = 0;
 RTC_DATA_ATTR char rtcDeviceSetLocation[64] = "Unknown";
 RTC_DATA_ATTR char rtcDeviceName[64] = "Unknown";
 RTC_DATA_ATTR bool rtcDeviceDetailsValid = false;
-
-// RTC memory for automated buzzer/solenoid tracking
-RTC_DATA_ATTR bool rtcBuzzerActive = false;  // Track if buzzer was activated by lock breach
-RTC_DATA_ATTR bool rtcSolenoidActive = false;  // Track if solenoid was activated for delivery
-RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;  // Track solenoid activation time
-
-
-// RTC memory for unique reference code
-RTC_DATA_ATTR char rtcReferenceCode[11] = ""; // 10 chars + null terminator
+RTC_DATA_ATTR bool rtcBuzzerActive = false;
+RTC_DATA_ATTR bool rtcSolenoidActive = false;
+RTC_DATA_ATTR unsigned long rtcSolenoidStartTime = 0;
+RTC_DATA_ATTR char rtcReferenceCode[11] = "";
 RTC_DATA_ATTR bool rtcReferenceCodeGenerated = false;
-
-// RTC memory for last Firebase update time
 RTC_DATA_ATTR unsigned long rtcLastFirebaseUpdate = 0;
 
-// --------------------------------------------------------------
 // GEO HELPERS
-// --------------------------------------------------------------
-
-// --------------------------------------------------------------
-// Parse coordinate string that may be in:
-//   1) Decimal "lat, lon"       e.g. 14.5620,121.1121
-//   2) Decimal with spaces       e.g. "14.5620, 121.1121"
-//   3) Simple DMS string         e.g. "14°33'43.1\"N 121°06'43.3\"E"
-// Only two components (lat,lon) are supported; altitude ignored.
-// --------------------------------------------------------------
 bool parseCoordPair(const String &raw, double &lat, double &lon) {
   String str = raw;
   str.trim();
 
-  // --- Case 1: decimal with comma ---
   int comma = str.indexOf(',');
   if (comma != -1) {
     lat = str.substring(0, comma).toFloat();
@@ -183,18 +115,14 @@ bool parseCoordPair(const String &raw, double &lat, double &lon) {
     if (!isnan(lat) && !isnan(lon) && lat != 0.0) return true;
   }
 
-  // --- Case 2: DMS pattern (very lightweight parser) ---
-  // Expect four numbers: deg min sec for lat + dir, then same for lon
+  // DMS pattern parser
   double deg[2] = {0, 0}, min[2] = {0, 0}, sec[2] = {0, 0};
   char dir[2] = {'N', 'E'};
 
-  // Replace degree, quote symbols with spaces for easier splitting
   String cleaned = str;
   cleaned.replace("°", " ");
   cleaned.replace("'", " ");
   cleaned.replace("\"", " ");
-
-  // Split by space
   double nums[6];
   int numIdx = 0;
   int start = 0;
@@ -212,13 +140,8 @@ bool parseCoordPair(const String &raw, double &lat, double &lon) {
   if (numIdx == 6) {
     deg[0] = nums[0]; min[0] = nums[1]; sec[0] = nums[2];
     deg[1] = nums[3]; min[1] = nums[4]; sec[1] = nums[5];
-    // Find N/S and E/W letters
-    int nPos = str.indexOf('N');
-    int sPos = str.indexOf('S');
-    int ePos = str.indexOf('E');
-    int wPos = str.indexOf('W');
-    if (sPos != -1) dir[0] = 'S';
-    if (wPos != -1) dir[1] = 'W';
+    if (str.indexOf('S') != -1) dir[0] = 'S';
+    if (str.indexOf('W') != -1) dir[1] = 'W';
 
     auto dmsToDec = [](double d, double m, double s, char c) {
       double dec = d + m / 60.0 + s / 3600.0;
@@ -231,13 +154,11 @@ bool parseCoordPair(const String &raw, double &lat, double &lon) {
     return true;
   }
 
-  return false; // unsupported format
+  return false;
 }
 
-// Calculate distance between two GPS coordinates using Haversine formula
-// Returns distance in meters
 double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371000.0; // Earth radius in meters
+  const double R = 6371000.0;
   const double phi1 = lat1 * PI / 180.0;
   const double phi2 = lat2 * PI / 180.0;
   const double deltaPhi = (lat2 - lat1) * PI / 180.0;
@@ -248,38 +169,33 @@ double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
                   sin(deltaLambda / 2) * sin(deltaLambda / 2);
   const double c = 2 * atan2(sqrt(a), sqrt(1 - a));
 
-  return R * c; // Distance in meters
+  return R * c;
 }
 
-// This structure holds all data, both from sensors and fetched from Firebase.
 struct TrackerData {
-  // Sensor-derived data
   float temperature = 0.0;
   float humidity = 0.0;
   double latitude = 0.0;
   double longitude = 0.0;
   float altitude = 0.0;
   bool tiltDetected = false;
-  bool fallDetected = false;   // new free-fall / shock flag
+  bool fallDetected = false;
   float batteryVoltage = 0.0;
   bool gpsFixValid = false;
-  bool usingCGPS = false;  // NEW: indicates CGPSInfo method was used this cycle
+  bool usingCGPS = false;
   bool limitSwitchPressed = false;
   float accelX = 0.0;
   float accelY = 0.0;
   float accelZ = 0.0;
   String currentLocation = "Unknown";
-  // Data fetched from Firebase
   String deviceName = "Unknown";
-  String deviceSetLocation = "Unknown"; // coordinates
-  String deviceSetLabel = "";            // human readable
+  String deviceSetLocation = "Unknown";
+  String deviceSetLabel = "";
   String deviceDescription = "No Description";
   String wakeUpReason = "Power On";
-  uint32_t bootCount = 0;   // number of wake-ups since power-on
-  bool coarseFix = false;   // true if only CLBS/IP based fix available
-  String referenceCode = "";  // Unique 10-character reference code
-  
-  // Shipping label data from Firebase
+  uint32_t bootCount = 0;
+  bool coarseFix = false;
+  String referenceCode = "";
   String senderName = "";
   String senderAddress = "";
   String recipientName = "";
@@ -292,27 +208,17 @@ struct TrackerData {
 };
 
 TrackerData currentData;
-
-// Flag to request a restart after solenoid operation completes
 bool restartAfterSolenoid = false;
-
-// Flag to indicate we need to start a new cycle due to interrupt
 bool startNewCycle = false;
 
-// =====================================================================
 // INTERRUPT HANDLERS
-// =====================================================================
-// Interrupt handler for limit switch
 void IRAM_ATTR limitSwitchISR() {
   limitSwitchTriggered = true;
 }
 
-// Interrupt handler for motion detection
 void IRAM_ATTR motionISR() {
   motionDetected = true;
 }
-
-// Function to check if operation should be interrupted
 bool shouldInterruptOperation() {
   if (limitSwitchTriggered || motionDetected) {
     if (limitSwitchTriggered) {
@@ -331,13 +237,10 @@ void determineWakeUpReason();
 void updateDisplay();
 bool sendSensorDataToFirebase();
 bool initializeCellularData();
-void sendATCommand(const char* cmd, int timeout);
 String sendATCommandResponse(const char* cmd, int timeout);
 void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
-void sendMotionAlert();
-void sendMotionEventAlert(String eventType, String message);
-void sendDeliveryNotification();
+void sendAlert(String alertType, String message, String alertCategory);
 void activateSolenoidForDelivery(unsigned long duration);
 void handleLockBreachEarly();
 void handleBuzzerActivation(unsigned long duration);
@@ -361,9 +264,7 @@ String readFirebaseData(String path);
 bool initializeCellularGPSOnly();
 void logConnectionStatus();
 
-// =====================================================================
-// MAIN SETUP (single cycle) – call new E-ink init just before display
-// =====================================================================
+// MAIN SETUP
 void setup() {
   Serial.begin(115200);
   
@@ -540,7 +441,7 @@ void setup() {
   
   // Send motion alert if device woke from motion detection
   if (currentData.wakeUpReason == "MOTION DETECTED" && rtcBootCount > 1) {
-    sendMotionAlert();
+    sendAlert("motion", "Motion detected", "motion");
   }
   
   // Control commands removed - buzzer/solenoid handled automatically by location detection
@@ -569,10 +470,10 @@ void setup() {
   
   // Send alerts for special motion events (shock, tilt) if detected
   if (currentData.fallDetected && rtcBootCount > 1) {
-    sendMotionEventAlert("shock", "Shock/impact detected");
+    sendAlert("shock", "Shock/impact detected", "motion");
   }
   if (currentData.tiltDetected && rtcBootCount > 1) {
-    sendMotionEventAlert("tilt", "Device tilted");
+    sendAlert("tilt", "Device tilted", "motion");
   }
   
   // Fetch latest shipping label data from Firebase before display update
@@ -621,9 +522,7 @@ void loop() {
 // Direct Firebase communication implemented
 // Buzzer and solenoid control handled automatically by location detection
 
-// =====================================================================
 // SENSOR READING FUNCTIONS
-// =====================================================================
 void collectSensorReading() {
   readTemperatureHumidity();
   readAccelerometerData();
@@ -952,9 +851,7 @@ bool readCellLocation() {
   return true;
 }
 
-// =====================================================================
 // HARDWARE INITIALIZATION
-// =====================================================================
 bool initializeAllHardware() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW); // Buzzer off by default
@@ -1050,9 +947,7 @@ void writeLSM6DSLRegister(uint8_t reg, uint8_t value) {
   Wire.endTransmission();
 }
 
-// =====================================================================
-// FIREBASE COMMUNICATION via cellular data
-// =====================================================================
+// FIREBASE COMMUNICATION
 
 // ---------------------------------------------------------------------------
 void determineWakeUpReason() {
@@ -1075,9 +970,7 @@ void determineWakeUpReason() {
   Serial.println(currentData.wakeUpReason);
 }
 
-// =====================================================================
 // SIM7600 & GPS HELPERS
-// =====================================================================
 void flushSIM7600Buffer() {
   while (sim7600.available()) {
     sim7600.read();
@@ -1170,9 +1063,7 @@ double convertToDecimalDegrees(String coordinate, String direction) {
   return dec_deg;
 }
 
-// =====================================================================
 // DEEP SLEEP CONFIGURATION
-// =====================================================================
 void prepareForDeepSleep() {
   Serial.println("Configuring deep sleep triggers...");
 
@@ -1231,9 +1122,7 @@ void drawBarcode(int xPos, int yPos, int width, int height) {
     }
 }
 
-// =====================================================================
-// E-PAPER DISPLAY – Shipping Label Format with Real Data
-// =====================================================================
+// E-PAPER DISPLAY
 void updateDisplay() {
   Serial.println("Updating E-Ink display with shipping label format...");
 
@@ -1396,32 +1285,18 @@ void updateDisplay() {
   Serial.println("✓ Display updated with combined layout");
 }
 
-// ---------------------------------------------------------------------------
-// OFFLINE PAGE – Shows QR code when offline
-// ---------------------------------------------------------------------------
+// Offline QR code display
 void showOfflineQRCode() {
   // Show the display with QR code for offline access
   updateDisplay();
 }
 
-// =====================================================================
-// END OF TRACKING BOX MAIN FIRMWARE
-// ===================================================================== 
 
 // Direct Firebase communication implemented
 
-// ---------------------------------------------------------------------------
 // CELLULAR LOCATION SERVICES (CLBS) - GPS FALLBACK
-// ---------------------------------------------------------------------------
-// Note: Using cellular data transmission functions for Firebase communication
-// Cellular location services (CLBS) retained for GPS fallback functionality
 
-// =====================================================================
 // FIREBASE COMMUNICATION FUNCTIONS
-// =====================================================================
-// These functions implement direct Firebase communication via cellular data.
-// The device sends sensor data directly to Firebase Realtime Database.
-// =====================================================================
 
 // Initialize cellular data connection
 bool initializeCellularData() {
@@ -1790,29 +1665,8 @@ String readFirebaseHTTP(String path) {
   return response;
 }
 
-// Send AT command with response
-void sendATCommand(const char* cmd, int timeout) {
-  Serial.println("Sending: " + String(cmd));
-  flushSIM7600Buffer();
-  sim7600.println(cmd);
-  
-  String response = "";
-  unsigned long startTime = millis();
-  
-  while (millis() - startTime < timeout) {
-    if (sim7600.available()) {
-      response += sim7600.readString();
-    }
-    delay(10);
-  }
-  
-  if (response.length() > 0) {
-    Serial.print("Response: " + response);
-  }
-}
-
 String sendATCommandResponse(const char* cmd, int timeout) {
-  Serial.println("Sending: " + String(cmd));
+  Serial.println("AT: " + String(cmd));
   flushSIM7600Buffer();
   sim7600.println(cmd);
   
@@ -1824,20 +1678,18 @@ String sendATCommandResponse(const char* cmd, int timeout) {
       response += sim7600.readString();
     }
     delay(10);
-  }
-  
-  if (response.length() > 0) {
-    Serial.print("Response: " + response);
   }
   
   return response;
 }
 
+// Simple wrapper for commands that don't need response
+void sendATCommand(const char* cmd, int timeout) {
+  sendATCommandResponse(cmd, timeout);
+}
 
-// =====================================================================
+
 // FIREBASE DETAILS FUNCTIONS
-// =====================================================================
-// Control functions removed - buzzer/solenoid handled automatically by location detection
 
 void parseFirebaseDetails(String jsonData) {
   // Parse device details from Firebase
@@ -1968,59 +1820,22 @@ void parseFirebaseDetails(String jsonData) {
   }
 }
 
-// =====================================================================
 // UTILITY FUNCTIONS
-// =====================================================================
 
-// Send motion detection alert to Firebase
-void sendMotionAlert() {
-  Serial.println("\n🏃 SENDING MOTION ALERT TO FIREBASE...");
+// Unified alert sending function
+void sendAlert(String alertType, String message, String alertCategory) {
+  Serial.println("\n📢 Sending " + alertType + " alert...");
   
-  // Create alert JSON payload with all required fields for MotionAlert interface
-  String alertData = "{";
-  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
-  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
-  alertData += "\"message\":\"Motion detected\",";
-  alertData += "\"timestamp\":" + String(millis()) + ",";
-  alertData += "\"type\":\"motion\"";
-  alertData += "}";
-  
-  // Create unique alert ID using timestamp
-  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
-  
-  // Send alert to Firebase using WiFi if available
-  bool success = false;
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
-    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
-  } else {
-    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
-  }
-  
-  if (success) {
-    Serial.println("✅ Motion alert sent to Firebase successfully!");
-    Serial.println("   Alert will trigger notification on web dashboard");
-  } else {
-    Serial.println("❌ Failed to send motion alert to Firebase");
-  }
-}
-
-// Send specific motion event alerts (shock, tilt, etc.)
-void sendMotionEventAlert(String eventType, String message) {
-  Serial.println("\n⚠️ SENDING " + eventType + " ALERT TO FIREBASE...");
-  
-  // Create alert JSON payload with all required fields for MotionAlert interface
   String alertData = "{";
   alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
   alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
   alertData += "\"message\":\"" + message + "\",";
   alertData += "\"timestamp\":" + String(millis()) + ",";
-  alertData += "\"type\":\"" + eventType + "\"";
+  alertData += "\"type\":\"" + alertType + "\"";
   alertData += "}";
   
-  // Create unique alert ID using timestamp
-  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
+  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/" + alertCategory + "/" + String(millis());
   
-  // Send alert to Firebase using WiFi if available
   bool success = false;
   if (wifiConnected && WiFi.status() == WL_CONNECTED) {
     success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
@@ -2029,9 +1844,9 @@ void sendMotionEventAlert(String eventType, String message) {
   }
   
   if (success) {
-    Serial.println("✅ " + eventType + " alert sent to Firebase successfully!");
+    Serial.println("✅ Alert sent successfully");
   } else {
-    Serial.println("❌ Failed to send " + eventType + " alert to Firebase");
+    Serial.println("❌ Failed to send alert");
   }
 }
 
@@ -2053,9 +1868,7 @@ void generateReferenceCode() {
   Serial.println("✓ Generated unique reference code: " + String(rtcReferenceCode));
 }
 
-// =====================================================================
 // DEVICE ID VALIDATION FUNCTIONS
-// =====================================================================
 
 // Check if a device ID already exists in Firebase
 bool checkDeviceIDExists(String deviceID) {
@@ -2179,9 +1992,7 @@ String generateRandomDeviceID() {
   return String(deviceID);
 }
 
-// =====================================================================
-// OPTIMIZED LOCK BREACH HANDLING FUNCTIONS
-// =====================================================================
+// LOCK BREACH HANDLING FUNCTIONS
 
 // Handle lock breach early in the boot cycle for faster response
 void handleLockBreachEarly() {
@@ -2226,35 +2037,18 @@ void handleLockBreachEarly() {
   bool solenoidActivated = false;
   
   if (hasValidSafeZone && (currentData.gpsFixValid || currentData.coarseFix)) {
-    // Calculate distance from safe zone using Haversine formula (works with GPS or CLBS)
+    // Calculate distance from safe zone using Haversine formula
     double distance = calculateDistance(safeLat, safeLon, 
                                        currentData.latitude, currentData.longitude);
     
-    Serial.println("\n📊 DISTANCE CALCULATION DEBUG:");
-    Serial.printf("   Safe zone coords: %.8f, %.8f\n", safeLat, safeLon);
-    Serial.printf("   Current coords:   %.8f, %.8f\n", currentData.latitude, currentData.longitude);
-    Serial.printf("   Lat difference:   %.8f degrees\n", currentData.latitude - safeLat);
-    Serial.printf("   Lon difference:   %.8f degrees\n", currentData.longitude - safeLon);
-    
-    // Manual quick approximation for verification (at equator: 1 degree ≈ 111km)
-    double approxLatDist = abs(currentData.latitude - safeLat) * 111000.0; // meters
-    double approxLonDist = abs(currentData.longitude - safeLon) * 111000.0 * cos(safeLat * PI / 180.0);
-    double approxDist = sqrt(approxLatDist * approxLatDist + approxLonDist * approxLonDist);
-    
-    Serial.printf("   Haversine distance: %.2f meters\n", distance);
-    Serial.printf("   Approximate distance: %.2f meters (quick check)\n", approxDist);
-    Serial.printf("   Threshold: 100 meters\n");
-    Serial.printf("   Decision: %s (distance %.2f %s 100m)\n", 
-                  distance < 100.0 ? "SAFE ZONE - SOLENOID" : "CRITICAL - BUZZER",
-                  distance,
-                  distance < 100.0 ? "<" : ">=");
+    Serial.printf("📏 Distance from safe zone: %.2f meters (threshold: 100m)\n", distance);
     
     if (distance < 100.0) {
       // Within safe zone - delivery scenario
       Serial.println("✅ Device within safe zone - Package delivery detected");
       
       // 1. Send delivery notification first (quick, non-blocking)
-      sendDeliveryNotification();
+      sendAlert("delivery", "📦 Package delivered - Security lock activated", "safe");
       
       // 2. Activate solenoid for 20 seconds (blocking operation)
       Serial.println("\n⏱️ Starting solenoid activation sequence...");
@@ -2266,7 +2060,7 @@ void handleLockBreachEarly() {
       Serial.println("⚠️ DEVICE OUTSIDE SAFE ZONE - CRITICAL BREACH!");
       
       // 1. Send critical alert to Firebase first (quick, non-blocking)
-      sendLockBreachAlert();
+      sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected - device outside safe zone", "critical");
       
       // 2. Activate buzzer for 15 seconds (blocking operation)
       Serial.println("\n⏱️ Starting buzzer activation sequence...");
@@ -2276,7 +2070,7 @@ void handleLockBreachEarly() {
   } else if (!hasValidSafeZone) {
     Serial.println("⚠️ No valid safe zone coordinates - treating as critical breach");
     // 1. Send alert first
-    sendLockBreachAlert();
+    sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected", "critical");
     // 2. Activate buzzer
     Serial.println("\n⏱️ Starting buzzer activation sequence...");
     handleBuzzerActivation(15000);
@@ -2284,7 +2078,7 @@ void handleLockBreachEarly() {
   } else if (!currentData.gpsFixValid && !currentData.coarseFix) {
     Serial.println("⚠️ No location fix available (GPS or CLBS) - defaulting to critical breach alert");
     // 1. Send alert first
-    sendLockBreachAlert();
+    sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected", "critical");
     // 2. Activate buzzer
     Serial.println("\n⏱️ Starting buzzer activation sequence...");
     handleBuzzerActivation(15000);
@@ -2305,37 +2099,6 @@ void handleLockBreachEarly() {
   Serial.printf("   Lock breach process time: %lu ms\n", millis());
 }
 
-// Send delivery notification to Firebase
-void sendDeliveryNotification() {
-  Serial.println("\n📦 SENDING DELIVERY NOTIFICATION...");
-  
-  // Create alert JSON payload with all required fields for MotionAlert interface
-  String alertData = "{";
-  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
-  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
-  alertData += "\"message\":\"📦 Package delivered - Security lock activated\",";
-  alertData += "\"timestamp\":" + String(millis()) + ",";
-  alertData += "\"type\":\"delivery\"";
-  alertData += "}";
-  
-  // Send to safe alerts path (will show as toast notification)
-  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/safe/" + String(millis());
-  
-  // Send alert to Firebase using WiFi if available
-  bool success = false;
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
-    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
-  } else {
-    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
-  }
-  
-  if (success) {
-    Serial.println("✅ Delivery notification sent to Firebase!");
-    Serial.println("   Package delivery will be notified on web dashboard");
-  } else {
-    Serial.println("❌ Failed to send delivery notification");
-  }
-}
 
 // Activate solenoid for delivery with specified duration
 void activateSolenoidForDelivery(unsigned long duration) {
@@ -2421,41 +2184,8 @@ void handleBuzzerActivation(unsigned long duration) {
   Serial.printf("   End time: %lu ms\n", millis());
 }
 
-// Send critical lock breach alert to Firebase
-void sendLockBreachAlert() {
-  Serial.println("\n🚨 SENDING CRITICAL LOCK BREACH ALERT TO FIREBASE...");
-  
-  // Create alert JSON payload with all required fields for MotionAlert interface
-  String alertData = "{";
-  alertData += "\"deviceId\":\"" + actualDeviceID + "\",";
-  alertData += "\"location\":\"" + String(currentData.latitude, 6) + ", " + String(currentData.longitude, 6) + "\",";
-  alertData += "\"message\":\"⚠️ CRITICAL: Lock breach detected - device outside safe zone\",";
-  alertData += "\"timestamp\":" + String(millis()) + ",";
-  alertData += "\"type\":\"lock_breach\"";
-  alertData += "}";
-  
-  // Send to critical alerts path
-  String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/critical/" + String(millis());
-  
-  // Send alert to Firebase using WiFi if available
-  bool success = false;
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
-    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
-  } else {
-    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
-  }
-  
-  if (success) {
-    Serial.println("✅ Critical lock breach alert sent to Firebase!");
-    Serial.println("   Alert will trigger notification on web dashboard");
-  } else {
-    Serial.println("❌ Failed to send critical lock breach alert to Firebase");
-  }
-}
 
-// =====================================================================
 // WIFI MANAGER FUNCTIONS
-// =====================================================================
 
 // Initialize WiFi connection with WiFiManager
 bool initializeWiFi() {
@@ -2587,9 +2317,7 @@ String readFirebaseHTTP_WiFi(String path) {
   return response;
 }
 
-// =====================================================================
 // UNIFIED FIREBASE FUNCTIONS
-// =====================================================================
 
 // Unified Firebase read function - automatically uses WiFi if available
 String readFirebaseData(String path) {

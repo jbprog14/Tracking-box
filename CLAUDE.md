@@ -22,17 +22,20 @@ npm run dev
 # Build for production
 npm run build
 
-# Run linting
-npm run lint
-
-# Type checking
-npx tsc --noEmit
+# Build for Cloudflare Pages deployment
+npm run pages:build
 
 # Preview Cloudflare Pages build locally
 npm run preview
 
 # Deploy to Cloudflare Pages
 npm run deploy
+
+# Run linting
+npm run lint
+
+# Type checking
+npx tsc --noEmit
 ```
 
 ### Arduino Development
@@ -48,6 +51,7 @@ Main firmware file:
 
 ### Test Sketches
 - `TrackingBoxDisplayTest/`: E-ink display testing
+- `TrackingBoxMain_SMS_BACKUP.ino`: Legacy SMS-based version (preserved for fallback)
 - `accel-gyro/accel-gyro/`: LSM6DSL accelerometer testing for tilt/fall detection  
 - `gps-gnss-ip/`: SIM7600 GPS module testing
 - `sht-gyro/`: Combined SHT31 and LSM6DSL sensor testing
@@ -57,6 +61,7 @@ Main firmware file:
 - `dfr_firebase/`: Direct Firebase connectivity testing via cellular
 - `dfr_firebase_connect/`: Firebase connection testing
 - `ShippingLabelDisplay/`: QR code generation for shipping labels
+- `MasterSMSToFirebase/`: Master device SMS relay testing
 
 ## Architecture
 
@@ -170,13 +175,16 @@ All alerts:
 ## Key Development Patterns
 
 ### React/Next.js
-- Uses TypeScript with strict mode
-- Tailwind CSS for styling with custom theme
+- Uses TypeScript with strict mode and path aliases (`@/*` maps to `./src/*`)
+- Tailwind CSS for styling with custom theme and animations (`tailwindcss-animate`)
+- Shadcn/UI component library with "new-york" style and Lucide React icons
 - Firebase Realtime Database for live updates
 - Radix UI components for accessible UI elements
 - React Leaflet for map visualization
-- Recharts for data visualization
+- Recharts for data visualization with 5 predefined chart colors
 - React Hot Toast for notifications
+- React QR Code for QR code generation
+- Class Variance Authority for component styling utilities
 
 ### Arduino/ESP32
 - Power optimization through deep sleep
@@ -234,6 +242,9 @@ For continuous testing without deep sleep:
 - Firebase is pre-configured in `src/app/firebase.ts`
 - Admin login: Username: `Admin123`, Password: `123123123a`
 - Tailwind config includes custom CSS variables for theming
+- Cloudflare Pages deployment configured in `wrangler.toml`
+- Build output for Cloudflare: `.vercel/output/static`
+- Components configured via `components.json` for Shadcn/UI
 
 ### Arduino Firmware
 - WiFi credentials must be set in firmware before upload (when using WiFi mode)
@@ -243,6 +254,8 @@ For continuous testing without deep sleep:
 - Battery voltage calibration may be needed based on voltage divider
 - Device ID auto-generation system prevents duplicates
 - MAC address-based unique ID generation when preferred ID taken
+- Buffer size configured at 2048 bytes for Firebase JSON responses
+- UART2 (GPIO 18/19) verified as working configuration for SIM7600
 
 ## Recent Architecture Changes
 
