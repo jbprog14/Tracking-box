@@ -600,6 +600,26 @@ export default function Home() {
     setIsViewModalOpen(true);
   };
 
+  const handleActivateLock = async (boxId: string) => {
+    const confirmActivate = confirm("Activate lock for 20 seconds? This will unlock the device remotely.");
+    if (confirmActivate) {
+      try {
+        const controlRef = ref(db, `tracking_box/${boxId}/controlFlags`);
+        await update(controlRef, {
+          solenoid: true,
+          timestamp: Date.now()
+        });
+        toast.success("Lock activation command sent! The device will unlock for 20 seconds.", {
+          duration: 5000,
+          icon: '🔓'
+        });
+      } catch (error) {
+        toast.error("Failed to send lock activation command");
+        console.error("Error activating lock:", error);
+      }
+    }
+  };
+
   const handleCloseViewModal = () => {
     setIsViewModalOpen(false);
     setSelectedViewBoxId(null);
@@ -777,13 +797,17 @@ export default function Home() {
                     scope="col"
                     className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border border-gray-300"
                   ></th>
+                  <th
+                    scope="col"
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border border-gray-300"
+                  ></th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {isLoading ? (
                   <tr>
                     <td
-                      colSpan={5}
+                      colSpan={6}
                       className="px-6 py-10 text-center text-sm text-gray-500"
                     >
                       <div className="flex items-center justify-center gap-2">
@@ -825,7 +849,7 @@ export default function Home() {
                 ) : Object.keys(trackingData).length === 0 ? (
                   <tr>
                     <td
-                      colSpan={5}
+                      colSpan={6}
                       className="px-6 py-10 text-center text-sm text-gray-500"
                     >
                       <div className="flex flex-col items-center gap-2">
@@ -888,6 +912,14 @@ export default function Home() {
                             className="bg-green-600 hover:bg-green-700 text-white font-bold py-1 px-3 rounded-md border-2 border-green-700 transition duration-300 text-sm"
                           >
                             Edit Info
+                          </button>
+                        </td>
+                        <td className="px-6 py-2 text-sm text-gray-500">
+                          <button
+                            onClick={() => handleActivateLock(boxId)}
+                            className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-1 px-3 rounded-md border-2 border-amber-700 transition duration-300 text-sm"
+                          >
+                            Activate Lock
                           </button>
                         </td>
                       </tr>

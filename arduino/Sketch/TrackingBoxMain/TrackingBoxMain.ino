@@ -241,6 +241,7 @@ String sendATCommandResponse(const char* cmd, int timeout);
 void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
 void sendAlert(String alertType, String message, String alertCategory);
+bool checkSolenoidControl();
 void activateSolenoidForDelivery(unsigned long duration);
 void handleLockBreachEarly();
 void handleBuzzerActivation(unsigned long duration);
@@ -377,6 +378,15 @@ void setup() {
     handleLockBreachEarly();
     // handleLockBreachEarly() handles buzzer/solenoid based on location
     // Normal cycle continues after to fetch details and update display
+  } else {
+    // Check for remote activation command on normal wake
+    Serial.println("\n🔍 Checking for remote activation commands...");
+    if (checkSolenoidControl()) {
+      Serial.println("🔓 Remote activation command detected on wake!");
+      sendAlert("safe", "📦 Lock remotely activated via dashboard", "safe");
+      Serial.println("⏱️ Activating solenoid for 20 seconds...");
+      activateSolenoidForDelivery(20000);
+    }
   }
   
   // Validate Device ID uniqueness only if we don't have a saved ID
@@ -1822,6 +1832,38 @@ void parseFirebaseDetails(String jsonData) {
 
 // UTILITY FUNCTIONS
 
+// Check Firebase for remote solenoid control command
+bool checkSolenoidControl() {
+  String controlPath = "/tracking_box/" + actualDeviceID + "/controlFlags/solenoid";
+  String response = readFirebaseData(controlPath);
+  
+  Serial.println("🔍 Checking solenoid control flag: " + response);
+  
+  if (response == "true") {
+    Serial.println("🔓 Remote unlock command detected!");
+    
+    // Reset flag immediately to prevent repeated activation
+    String resetPath = "/tracking_box/" + actualDeviceID + "/controlFlags";
+    String resetData = "{\"solenoid\":false,\"timestamp\":" + String(millis()) + "}";
+    
+    bool resetSuccess = false;
+    if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+      resetSuccess = sendFirebaseHTTP_WiFi(resetPath, resetData, "PATCH");
+    } else {
+      resetSuccess = sendFirebaseHTTP(resetPath, resetData, "PATCH");
+    }
+    
+    if (resetSuccess) {
+      Serial.println("✅ Control flag reset successfully");
+    } else {
+      Serial.println("⚠️ Failed to reset control flag");
+    }
+    
+    return true;
+  }
+  return false;
+}
+
 // Unified alert sending function
 void sendAlert(String alertType, String message, String alertCategory) {
   Serial.println("\n📢 Sending " + alertType + " alert...");
@@ -2047,13 +2089,20 @@ void handleLockBreachEarly() {
       // Within safe zone - delivery scenario
       Serial.println("✅ Device within safe zone - Package delivery detected");
       
-      // 1. Send delivery notification first (quick, non-blocking)
-      sendAlert("delivery", "📦 Package delivered - Security lock activated", "safe");
-      
-      // 2. Activate solenoid for 20 seconds (blocking operation)
-      Serial.println("\n⏱️ Starting solenoid activation sequence...");
-      activateSolenoidForDelivery(20000);
-      solenoidActivated = true;
+      // Check for remote activation command
+      if (checkSolenoidControl()) {
+        Serial.println("🔓 Remote activation command detected!");
+        // 1. Send confirmation alert
+        sendAlert("delivery", "📦 Lock remotely activated in safe zone", "safe");
+        // 2. Activate solenoid for 20 seconds
+        Serial.println("\n⏱️ Starting solenoid activation sequence...");
+        activateSolenoidForDelivery(20000);
+        solenoidActivated = true;
+      } else {
+        // No remote command yet - just send notification and wait
+        Serial.println("📱 Waiting for remote activation command...");
+        sendAlert("safe", "📍 Device in safe zone - awaiting lock activation command", "safe");
+      }
       
     } else {
       // Outside safe zone - security breach
@@ -2062,26 +2111,26 @@ void handleLockBreachEarly() {
       // 1. Send critical alert to Firebase first (quick, non-blocking)
       sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected - device outside safe zone", "critical");
       
-      // 2. Activate buzzer for 15 seconds (blocking operation)
-      Serial.println("\n⏱️ Starting buzzer activation sequence...");
-      handleBuzzerActivation(15000);
+      // 2. Activate buzzer with monitoring for override (blocking operation)
+      Serial.println("\n⏱️ Starting monitored buzzer activation sequence...");
+      handleBuzzerWithMonitoring(15000);
       buzzerActivated = true;
     }
   } else if (!hasValidSafeZone) {
     Serial.println("⚠️ No valid safe zone coordinates - treating as critical breach");
     // 1. Send alert first
     sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected", "critical");
-    // 2. Activate buzzer
-    Serial.println("\n⏱️ Starting buzzer activation sequence...");
-    handleBuzzerActivation(15000);
+    // 2. Activate buzzer with monitoring
+    Serial.println("\n⏱️ Starting monitored buzzer activation sequence...");
+    handleBuzzerWithMonitoring(15000);
     buzzerActivated = true;
   } else if (!currentData.gpsFixValid && !currentData.coarseFix) {
     Serial.println("⚠️ No location fix available (GPS or CLBS) - defaulting to critical breach alert");
     // 1. Send alert first
     sendAlert("lock_breach", "⚠️ CRITICAL: Lock breach detected", "critical");
-    // 2. Activate buzzer
-    Serial.println("\n⏱️ Starting buzzer activation sequence...");
-    handleBuzzerActivation(15000);
+    // 2. Activate buzzer with monitoring
+    Serial.println("\n⏱️ Starting monitored buzzer activation sequence...");
+    handleBuzzerWithMonitoring(15000);
     buzzerActivated = true;
   }
   
@@ -2182,6 +2231,64 @@ void handleBuzzerActivation(unsigned long duration) {
   
   Serial.printf("🔇 Buzzer deactivated after %lu ms\n", elapsedTime);
   Serial.printf("   End time: %lu ms\n", millis());
+}
+
+// Handle buzzer with Firebase monitoring for remote override
+void handleBuzzerWithMonitoring(unsigned long duration) {
+  Serial.println("\n🔊 ACTIVATING BUZZER WITH MONITORING");
+  Serial.printf("   Duration: %lu seconds\n", duration / 1000);
+  
+  digitalWrite(BUZZER_PIN, HIGH);
+  
+  unsigned long startTime = millis();
+  unsigned long elapsedTime = 0;
+  unsigned long lastCheckTime = 0;
+  bool overrideDetected = false;
+  
+  while (elapsedTime < duration) {
+    elapsedTime = millis() - startTime;
+    
+    // Check Firebase every second for override command
+    if (elapsedTime - lastCheckTime >= 1000) {
+      Serial.printf("🔊 Buzzer active: %lu/%lu seconds, checking for override...\n", 
+                    elapsedTime / 1000, duration / 1000);
+      
+      if (checkSolenoidControl()) {
+        Serial.println("🔓 REMOTE OVERRIDE DETECTED! Stopping buzzer and activating solenoid.");
+        overrideDetected = true;
+        break;
+      }
+      lastCheckTime = elapsedTime;
+    }
+    
+    if (shouldInterruptOperation()) {
+      Serial.println("⚠️ Buzzer operation interrupted!");
+      break;
+    }
+    
+    delay(50);
+  }
+  
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  if (overrideDetected) {
+    // Activate solenoid for 20 seconds on override
+    Serial.println("🔓 Activating solenoid for 20 seconds...");
+    digitalWrite(SOLENOID_PIN, HIGH);
+    rtcSolenoidActive = true;
+    rtcSolenoidStartTime = millis();
+    delay(20000);
+    digitalWrite(SOLENOID_PIN, LOW);
+    rtcSolenoidActive = false;
+    rtcSolenoidStartTime = 0;
+    sendAlert("safe", "Lock remotely deactivated via dashboard", "safe");
+  } else if (elapsedTime >= duration) {
+    // Buzzer completed without override
+    Serial.println("⚠️ Buzzer completed without remote override");
+    sendAlert("critical", "Security breach unresolved - buzzer timeout", "critical");
+  }
+  
+  Serial.printf("🔇 Buzzer monitoring complete after %lu ms\n", elapsedTime);
 }
 
 
