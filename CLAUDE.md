@@ -43,20 +43,19 @@ Use Arduino IDE with the following libraries installed:
 - SparkFun_LSM6DSL
 - TinyGSM (for SIM7600 cellular connectivity)
 
-Main firmware files:
+Main firmware file:
 - Tracking Device: `arduino/Sketch/TrackingBoxMain/TrackingBoxMain.ino`
-- Master Device: `arduino/Sketch/MasterDevice/MasterDevice.ino`
 
 ### Test Sketches
 - `TrackingBoxDisplayTest/`: E-ink display testing
-- `accel-gyro/`: LSM6DSL accelerometer testing for tilt/fall detection
+- `accel-gyro/accel-gyro/`: LSM6DSL accelerometer testing for tilt/fall detection  
 - `gps-gnss-ip/`: SIM7600 GPS module testing
 - `sht-gyro/`: Combined SHT31 and LSM6DSL sensor testing
 - `epd7in3f-demo/`: E-ink display demo
-- `M2S/`: SMS reading functionality
-- `MasterSMSToFirebase/`: SMS receiver and Firebase forwarding
 - `sim7600_at_command_test/`: SIM7600 module AT command testing
+- `sim7600_hardware_serial_diagnostic/`: Hardware serial diagnostic for SIM7600
 - `dfr_firebase/`: Direct Firebase connectivity testing via cellular
+- `dfr_firebase_connect/`: Firebase connection testing
 - `ShippingLabelDisplay/`: QR code generation for shipping labels
 
 ## Architecture

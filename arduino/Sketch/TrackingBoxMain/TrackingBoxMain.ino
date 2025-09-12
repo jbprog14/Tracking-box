@@ -1,22 +1,25 @@
 /*
  * =====================================================================
- * TRACKING BOX DEVICE - DIRECT FIREBASE FIRMWARE
+ * TRACKING BOX DEVICE - DUAL-MODE FIREBASE FIRMWARE
  * =====================================================================
  * 
  * This sketch implements a streamlined, single-cycle operation for the
- * tracking device using direct Firebase communication via cellular data.
+ * tracking device using dual-mode Firebase communication (WiFi + Cellular).
  * 
  * On every wake-up, it performs the following:
  * 1. Initialize all hardware.
- * 2. Gather a full set of sensor readings.
- * 3. Send sensor data directly to Firebase via cellular HTTP.
- * 4. Check for control commands from Firebase.
- * 5. Update the E-Ink display with all data.
- * 6. Enter deep sleep until next wake trigger.
+ * 2. Attempt WiFi connection (with WiFiManager portal support).
+ * 3. Fall back to cellular if WiFi unavailable.
+ * 4. Gather a full set of sensor readings.
+ * 5. Send sensor data to Firebase via WiFi or cellular.
+ * 6. Check for control commands from Firebase.
+ * 7. Update the E-Ink display with all data.
+ * 8. Enter deep sleep until next wake trigger.
  * 
- * FIREBASE COMMUNICATION:
- * The device communicates directly with Firebase Realtime Database
- * using the SIM7600G's cellular data connection via HTTP/HTTPS.
+ * COMMUNICATION MODES:
+ * - PRIMARY: WiFi connection for cost-effective data transmission
+ * - FALLBACK: Cellular data (SIM7600) when WiFi is unavailable
+ * - WiFiManager portal for easy field configuration
  * 
  * CELLULAR LOCATION SERVICES:
  * SIM7600 cellular module is used for GNSS/GPS tracking and CLBS (Cell Location
@@ -44,6 +47,10 @@
 // Direct AT commands are used for GNSS/GPS and CLBS location services
 #include <time.h>
 #include <Adafruit_SHT31.h>
+// WiFi and WiFiManager includes
+#include <WiFi.h>
+#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
+#include <HTTPClient.h>   // For WiFi-based HTTP requests
 #define DEBUG_GNSS 1   // Set to 1 to enable verbose GNSS diagnostics (adds delay)
 #define ENABLE_SHT30_SENSOR 1  // Set to 1 to enable SHT30 temperature/humidity sensor
 
@@ -101,6 +108,15 @@ String deviceMacAddress = "";  // Store the device's MAC address
 // FIREBASE CONFIGURATION
 const char* FIREBASE_URL = "https://tracking-box-e17a1-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* APN = "internet";  // Change to your carrier's APN
+
+// WIFI CONFIGURATION
+WiFiManager wifiManager;
+bool wifiConnected = false;
+RTC_DATA_ATTR int wifiFailCount = 0;  // Persist across deep sleep
+RTC_DATA_ATTR bool useWiFiFirst = true;  // Connection preference
+const int MAX_WIFI_FAILURES = 5;
+const int WIFI_CONNECT_TIMEOUT = 10;  // 10 seconds
+const int PORTAL_TIMEOUT = 180;  // 3 minutes
 
 // =====================================================================
 // GLOBAL OBJECTS & VARIABLES
@@ -332,9 +348,18 @@ bool checkDeviceIDExists(String deviceID);
 String generateNextDeviceID(String currentID);
 String getDeviceMacAddress();
 String generateDeviceIDFromMAC();
+String generateRandomDeviceID();
 void flushSIM7600Buffer();
 void sendAT(const char *cmd, uint16_t delayMs);
 void showOfflineQRCode();
+// WiFi function declarations
+bool initializeWiFi();
+bool sendFirebaseHTTP_WiFi(String path, String jsonData, String method);
+String readFirebaseHTTP_WiFi(String path);
+// Unified Firebase functions
+String readFirebaseData(String path);
+bool initializeCellularGPSOnly();
+void logConnectionStatus();
 
 // =====================================================================
 // MAIN SETUP (single cycle) – call new E-ink init just before display
@@ -396,11 +421,54 @@ void setup() {
   initializeAllHardware();
   Serial.println("✅ Hardware Initialized.");
   
-  // Initialize cellular data connection for Firebase
-  if (initializeCellularData()) {
-    Serial.println("✅ Cellular data initialized for Firebase.");
+  // NEW: Network initialization with proper separation
+  Serial.println("\n=== NETWORK INITIALIZATION ===");
+  
+  // Attempt WiFi connection first
+  bool needsCellularData = false;
+  bool needsCellularGPS = false;
+  
+  if (initializeWiFi()) {
+    Serial.println("✅ WiFi connected!");
+    Serial.println("📶 IP: " + WiFi.localIP().toString());
+    Serial.println("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
+    wifiConnected = true;
+    useWiFiFirst = true;
+    
+    // Log connection mode
+    logConnectionStatus();
+    
+    // Only need cellular for GPS if motion/breach detected
+    if (currentData.wakeUpReason == "LOCK BREACH" || 
+        currentData.wakeUpReason == "MOTION DETECTED") {
+      needsCellularGPS = true;
+      Serial.println("📍 Will initialize cellular for GPS only (WiFi handles data)");
+    }
   } else {
-    Serial.println("❌ Failed to initialize cellular data.");
+    Serial.println("⚠️ WiFi not available, using cellular for everything");
+    wifiConnected = false;
+    useWiFiFirst = false;
+    needsCellularData = true;  // Need cellular for Firebase
+    needsCellularGPS = true;   // And for GPS
+  }
+  
+  // Initialize cellular based on needs
+  if (needsCellularData) {
+    // Full cellular initialization for data + GPS
+    if (initializeCellularData()) {
+      Serial.println("✅ Cellular fully initialized (data + GPS)");
+    } else {
+      Serial.println("❌ Failed to initialize cellular data");
+    }
+  } else if (needsCellularGPS) {
+    // Minimal initialization just for GPS
+    if (initializeCellularGPSOnly()) {
+      Serial.println("✅ Cellular GPS-only mode initialized");
+    } else {
+      Serial.println("⚠️ Failed to initialize GPS");
+    }
+  } else {
+    Serial.println("ℹ️ No cellular needed - WiFi handles everything");
   }
   
   // OPTIMIZED LOCK BREACH HANDLING - Handle immediately after cellular init
@@ -414,29 +482,40 @@ void setup() {
   if (actualDeviceID.length() == 0) {
     // No saved device ID found in permanent storage or RTC memory
     if (!rtcDeviceIDValidated || strlen(rtcActualDeviceID) == 0) {
-      Serial.println("\n🔍 No saved device ID found. Generating MAC-based Device ID...");
+      Serial.println("\n🔍 Generating unique Device ID...");
+      
+      // First try MAC-based ID
       actualDeviceID = generateDeviceIDFromMAC();
-      Serial.println("🔍 Generated ID: " + actualDeviceID);
+      Serial.println("🔍 Trying MAC-based ID: " + actualDeviceID);
       
-      // Check if this ID already exists in Firebase
-      Serial.println("🔍 Checking if ID is available in Firebase...");
-      String testPath = "/tracking_box/" + actualDeviceID + "/sensorData";
-      String response = readFirebaseHTTP(testPath);
+      // Keep trying until we find a unique ID
+      int attempts = 0;
+      const int MAX_ATTEMPTS = 10;
       
-      if (response.indexOf("null") == -1 && response.length() > 0) {
-        // ID already exists - collision detected!
-        Serial.println("⚠️ ID collision! " + actualDeviceID + " already exists in Firebase");
+      while (attempts < MAX_ATTEMPTS) {
+        String testPath = "/tracking_box/" + actualDeviceID + "/sensorData";
+        String response = readFirebaseData(testPath);  // Uses WiFi if available
         
-        // Use first 3 bytes of MAC address as fallback
-        String fullMacID = deviceMacAddress;
-        fullMacID.replace(":", "");  // Remove colons
-        // Take only first 6 characters (first 3 bytes) for shorter ID
-        actualDeviceID = "box_" + fullMacID.substring(0, 6);
-        Serial.println("✅ Using fallback MAC-based ID: " + actualDeviceID);
-      } else {
-        Serial.println("✅ ID is available: " + actualDeviceID);
+        if (response.indexOf("null") != -1 || response.length() == 0) {
+          // ID is available!
+          Serial.println("✅ Unique ID found: " + actualDeviceID);
+          break;
+        }
+        
+        // ID exists, generate a random one
+        Serial.println("⚠️ ID " + actualDeviceID + " already exists in Firebase");
+        actualDeviceID = generateRandomDeviceID();
+        Serial.println("🎲 Trying random ID: " + actualDeviceID);
+        attempts++;
       }
       
+      if (attempts >= MAX_ATTEMPTS) {
+        // Last resort: use timestamp in ID
+        actualDeviceID = "box_" + String(millis() & 0xFFFFFF, HEX);
+        Serial.println("⏰ Using timestamp-based ID: " + actualDeviceID);
+      }
+      
+      // Save the unique ID
       actualDeviceID.toCharArray(rtcActualDeviceID, sizeof(rtcActualDeviceID));
       rtcDeviceIDValidated = true;
       
@@ -446,8 +525,6 @@ void setup() {
       preferences.end();
       
       Serial.println("✅ Device ID registered: " + actualDeviceID);
-      
-      // Device ID is validated - sensor data will be sent in the main flow
       Serial.println("📝 New device ID registered: " + actualDeviceID);
       Serial.println("ℹ️ Device details will be set from web dashboard");
       Serial.println("ℹ️ Sensor data will be sent after collection");
@@ -477,9 +554,9 @@ void setup() {
     Serial.println("  Set location: " + currentData.deviceSetLocation);
   } else {
     Serial.println("⚠️ No device details in RTC memory - fetching from Firebase");
-    // Read device details from Firebase
+    // Read device details from Firebase using WiFi if available
     String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
-    String detailsData = readFirebaseHTTP(detailsPath);
+    String detailsData = readFirebaseData(detailsPath);  // Uses WiFi if available
     
     if (detailsData.length() > 0 && detailsData.indexOf("null") == -1) {
       parseFirebaseDetails(detailsData);
@@ -501,7 +578,7 @@ void setup() {
   // Fetch latest shipping label data from Firebase before display update
   Serial.println("🌐 Fetching shipping label data from Firebase...");
   String detailsPath = "/tracking_box/" + actualDeviceID + "/details";
-  String detailsData = readFirebaseHTTP(detailsPath);
+  String detailsData = readFirebaseData(detailsPath);  // Uses WiFi if available
   if (detailsData.length() > 0 && detailsData.indexOf("null") == -1) {
     parseFirebaseDetails(detailsData);
     Serial.println("✅ Shipping label data updated from Firebase");
@@ -1099,7 +1176,12 @@ double convertToDecimalDegrees(String coordinate, String direction) {
 void prepareForDeepSleep() {
   Serial.println("Configuring deep sleep triggers...");
 
-  // No cleanup needed for Firebase mode
+  // Disconnect WiFi to save power
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("📴 WiFi disconnected for deep sleep");
+  }
 
   // Wake up on timer
   esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
@@ -1465,7 +1547,23 @@ bool sendSensorDataToFirebase() {
   Serial.println("📍 Firebase path: " + path);
   Serial.println("📝 JSON payload: " + jsonData);
   
-  bool success = sendFirebaseHTTP(path, jsonData, "PUT");
+  bool success = false;
+  
+  // Try WiFi first if connected
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    Serial.println("📡 Attempting Firebase via WiFi (primary)...");
+    success = sendFirebaseHTTP_WiFi(path, jsonData, "PUT");
+    
+    if (!success) {
+      Serial.println("⚠️ WiFi attempt failed, falling back to cellular...");
+    }
+  }
+  
+  // Fall back to cellular if WiFi failed or not connected
+  if (!success) {
+    Serial.println("📡 Using cellular for Firebase...");
+    success = sendFirebaseHTTP(path, jsonData, "PUT");  // Existing cellular function
+  }
   
   if (success) {
     Serial.println("✅ Sensor data sent to Firebase successfully");
@@ -1474,7 +1572,7 @@ bool sendSensorDataToFirebase() {
     
     // No need to check control commands - handled automatically by location detection
   } else {
-    Serial.println("❌ Failed to send sensor data to Firebase");
+    Serial.println("❌ Failed to send sensor data to Firebase via both WiFi and cellular");
   }
   
   return success;
@@ -1890,8 +1988,13 @@ void sendMotionAlert() {
   // Create unique alert ID using timestamp
   String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
   
-  // Send alert to Firebase
-  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  // Send alert to Firebase using WiFi if available
+  bool success = false;
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
+  } else {
+    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  }
   
   if (success) {
     Serial.println("✅ Motion alert sent to Firebase successfully!");
@@ -1917,8 +2020,13 @@ void sendMotionEventAlert(String eventType, String message) {
   // Create unique alert ID using timestamp
   String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/motion/" + String(millis());
   
-  // Send alert to Firebase
-  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  // Send alert to Firebase using WiFi if available
+  bool success = false;
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
+  } else {
+    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  }
   
   if (success) {
     Serial.println("✅ " + eventType + " alert sent to Firebase successfully!");
@@ -1955,7 +2063,7 @@ bool checkDeviceIDExists(String deviceID) {
   
   // Check if any data exists under /tracking_box/{deviceID}
   String path = "/tracking_box/" + deviceID;
-  String response = readFirebaseHTTP(path);
+  String response = readFirebaseData(path);  // Uses WiFi if available
   
   Serial.println("Firebase response for " + deviceID + ": " + response);
   
@@ -2054,6 +2162,23 @@ String generateDeviceIDFromMAC() {
   return String(deviceID);
 }
 
+// Generate truly random device ID using hardware RNG
+String generateRandomDeviceID() {
+  // Initialize random seed with hardware random number generator
+  randomSeed(esp_random() + millis());
+  
+  // Generate a random 24-bit value (6 hex characters)
+  uint32_t randomValue = esp_random(); // Hardware RNG
+  
+  // Format as box_XXXXXX using random hex values (uppercase)
+  char deviceID[16];
+  snprintf(deviceID, sizeof(deviceID), "box_%06X", randomValue & 0xFFFFFF);
+  
+  Serial.println("🎲 Generated random ID from value: 0x" + String(randomValue & 0xFFFFFF, HEX));
+  
+  return String(deviceID);
+}
+
 // =====================================================================
 // OPTIMIZED LOCK BREACH HANDLING FUNCTIONS
 // =====================================================================
@@ -2065,7 +2190,7 @@ void handleLockBreachEarly() {
   
   // Fetch ONLY setLocation from Firebase (optimized data usage)
   String setLocationPath = "/tracking_box/" + actualDeviceID + "/details/setLocation";
-  String setLocationData = readFirebaseHTTP(setLocationPath);
+  String setLocationData = readFirebaseData(setLocationPath);  // Automatically uses WiFi if available
   
   // readFirebaseHTTP now handles quote removal, so we get clean data
   Serial.println("📍 Safe zone location retrieved: '" + setLocationData + "'");
@@ -2196,8 +2321,13 @@ void sendDeliveryNotification() {
   // Send to safe alerts path (will show as toast notification)
   String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/safe/" + String(millis());
   
-  // Send alert to Firebase
-  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  // Send alert to Firebase using WiFi if available
+  bool success = false;
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
+  } else {
+    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  }
   
   if (success) {
     Serial.println("✅ Delivery notification sent to Firebase!");
@@ -2307,8 +2437,13 @@ void sendLockBreachAlert() {
   // Send to critical alerts path
   String alertPath = "/tracking_box/" + actualDeviceID + "/alerts/critical/" + String(millis());
   
-  // Send alert to Firebase
-  bool success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  // Send alert to Firebase using WiFi if available
+  bool success = false;
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    success = sendFirebaseHTTP_WiFi(alertPath, alertData, "PUT");
+  } else {
+    success = sendFirebaseHTTP(alertPath, alertData, "PUT");
+  }
   
   if (success) {
     Serial.println("✅ Critical lock breach alert sent to Firebase!");
@@ -2316,4 +2451,220 @@ void sendLockBreachAlert() {
   } else {
     Serial.println("❌ Failed to send critical lock breach alert to Firebase");
   }
+}
+
+// =====================================================================
+// WIFI MANAGER FUNCTIONS
+// =====================================================================
+
+// Initialize WiFi connection with WiFiManager
+bool initializeWiFi() {
+  Serial.println("\n📶 INITIALIZING WIFI...");
+  
+  // Set WiFi mode to station
+  WiFi.mode(WIFI_STA);
+  
+  // Create AP name with device reference code
+  String apName = "TrackingBox_" + String(rtcReferenceCode);
+  
+  // Configure WiFiManager with proper timeouts
+  wifiManager.setConfigPortalTimeout(PORTAL_TIMEOUT);
+  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT);
+  
+  // Set callback for when entering config mode
+  wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
+    Serial.println("\n=====================================");
+    Serial.println("📱 Configuration Portal Active");
+    Serial.println("SSID: " + myWiFiManager->getConfigPortalSSID());
+    Serial.println("IP: 192.168.4.1");
+    Serial.println("Timeout: " + String(PORTAL_TIMEOUT) + " seconds");
+    Serial.println("=====================================\n");
+  });
+  
+  // autoConnect will:
+  // 1. Try to connect with saved credentials
+  // 2. If no saved credentials or connection fails, start portal automatically
+  Serial.println("🔍 Attempting WiFi connection...");
+  
+  if (wifiManager.autoConnect(apName.c_str())) {
+    Serial.println("✅ Connected to WiFi!");
+    Serial.println("📶 SSID: " + WiFi.SSID());
+    Serial.println("📶 IP: " + WiFi.localIP().toString());
+    Serial.println("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
+    wifiConnected = true;
+    wifiFailCount = 0;  // Reset fail counter
+    return true;
+  }
+  
+  // If we get here, either portal timed out or user cancelled
+  Serial.println("⚠️ WiFi connection failed or portal timed out");
+  Serial.println("   Continuing with cellular connection...");
+  wifiConnected = false;
+  
+  return false;
+}
+
+// REMOVED: isPortalRequested() and startConfigPortal() functions
+// WiFiManager's autoConnect handles everything automatically now
+
+// Send data to Firebase via WiFi
+bool sendFirebaseHTTP_WiFi(String path, String jsonData, String method) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected, cannot send via WiFi");
+    return false;
+  }
+  
+  Serial.println("\n=== SENDING TO FIREBASE VIA WIFI ===");
+  Serial.println("Path: " + path);
+  Serial.println("Method: " + method);
+  
+  HTTPClient http;
+  String url = String(FIREBASE_URL) + path + ".json";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000); // 10 second timeout
+  
+  int httpCode;
+  if (method == "PUT") {
+    httpCode = http.PUT(jsonData);
+  } else if (method == "POST") {
+    httpCode = http.POST(jsonData);
+  } else if (method == "PATCH") {
+    httpCode = http.PATCH(jsonData);
+  } else { // GET
+    httpCode = http.GET();
+  }
+  
+  bool success = (httpCode == 200 || httpCode == 204);
+  
+  if (success) {
+    Serial.println("✅ Firebase request via WiFi successful (code: " + String(httpCode) + ")");
+  } else {
+    Serial.println("❌ WiFi Firebase request failed (code: " + String(httpCode) + ")");
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.println("Error response: " + payload);
+    }
+  }
+  
+  http.end();
+  return success;
+}
+
+// Read data from Firebase via WiFi
+String readFirebaseHTTP_WiFi(String path) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected, cannot read via WiFi");
+    return "";
+  }
+  
+  Serial.println("\n=== READING FROM FIREBASE VIA WIFI ===");
+  Serial.println("Path: " + path);
+  
+  HTTPClient http;
+  String url = String(FIREBASE_URL) + path + ".json";
+  
+  http.begin(url);
+  http.setTimeout(10000); // 10 second timeout
+  
+  int httpCode = http.GET();
+  String response = "";
+  
+  if (httpCode == 200) {
+    response = http.getString();
+    Serial.println("✅ Firebase read via WiFi successful");
+    
+    // Clean up response - remove quotes if it's a simple string value
+    if (response.startsWith("\"") && response.endsWith("\"")) {
+      response = response.substring(1, response.length() - 1);
+    }
+  } else {
+    Serial.println("❌ WiFi Firebase read failed (code: " + String(httpCode) + ")");
+  }
+  
+  http.end();
+  return response;
+}
+
+// =====================================================================
+// UNIFIED FIREBASE FUNCTIONS
+// =====================================================================
+
+// Unified Firebase read function - automatically uses WiFi if available
+String readFirebaseData(String path) {
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    Serial.println("📶 Using WiFi for Firebase read");
+    return readFirebaseHTTP_WiFi(path);
+  } else {
+    Serial.println("📡 Using cellular for Firebase read");
+    return readFirebaseHTTP(path);
+  }
+}
+
+// Minimal cellular initialization for GPS only (no data connection)
+bool initializeCellularGPSOnly() {
+  Serial.println("\n=== INITIALIZING CELLULAR (GPS ONLY) ===");
+  Serial.println("ℹ️ Minimal init - No data connection, just GPS");
+  
+  // Test basic communication
+  String response = sendATCommandResponse("AT", 2000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("❌ SIM7600 not responding");
+    return false;
+  }
+  Serial.println("✅ SIM7600 responding");
+  
+  // Set full functionality (needed for GPS)
+  response = sendATCommandResponse("AT+CFUN=1", 5000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("⚠️ Failed to set full functionality");
+  }
+  
+  // Check SIM status (for GPS network time sync)
+  response = sendATCommandResponse("AT+CPIN?", 2000);
+  if (response.indexOf("READY") != -1) {
+    Serial.println("✅ SIM card ready (for GPS time sync)");
+  } else {
+    Serial.println("⚠️ SIM not ready - GPS may take longer");
+  }
+  
+  // Enable GPS power
+  response = sendATCommandResponse("AT+CGPS=1,1", 3000);
+  if (response.indexOf("OK") != -1) {
+    Serial.println("✅ GPS power enabled");
+  } else {
+    Serial.println("⚠️ GPS power command failed");
+  }
+  
+  // Configure GNSS for all systems
+  sendATCommand("AT+CGNSSMODE=15,1", 2000);
+  Serial.println("✅ GNSS configured for all satellite systems");
+  
+  // Skip all data-related initialization:
+  // - No CGATT (GPRS attach)
+  // - No CGDCONT (PDP context)
+  // - No CGACT (PDP activation)
+  // - No SSL configuration
+  // - No HTTP initialization
+  
+  Serial.println("✅ GPS-only initialization complete!");
+  Serial.println("ℹ️ Data connection NOT configured (using WiFi)");
+  return true;
+}
+
+// Log current connection status
+void logConnectionStatus() {
+  Serial.println("\n=== CONNECTION STATUS ===");
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    Serial.println("📶 Mode: WiFi-Only Operation");
+    Serial.println("   SSID: " + WiFi.SSID());
+    Serial.println("   IP: " + WiFi.localIP().toString());
+    Serial.println("   RSSI: " + String(WiFi.RSSI()) + " dBm");
+    Serial.println("   Status: All Firebase operations via WiFi");
+  } else {
+    Serial.println("📡 Mode: Cellular Operation");
+    Serial.println("   Status: All operations via cellular");
+  }
+  Serial.println("==========================\n");
 }

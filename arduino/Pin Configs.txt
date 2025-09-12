@@ -19,8 +19,8 @@ E-ink Waveshare 3.7 Inch Display
 	BUSY - 	GPIO25
 
 SIM7600G-H
-	RX - 	GPIO16
-	TX - 	GPIO17
+	RX - 	GPIO18
+	TX - 	GPIO19
 
 BUZZER
 		GPIO32
