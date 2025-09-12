@@ -71,7 +71,7 @@ RTC_DATA_ATTR int wifiFailCount = 0;
 RTC_DATA_ATTR bool useWiFiFirst = true;
 const int MAX_WIFI_FAILURES = 5;
 const int WIFI_CONNECT_TIMEOUT = 10;
-const int PORTAL_TIMEOUT = 180;
+const int PORTAL_TIMEOUT = 30;
 
 // GLOBAL OBJECTS & VARIABLES
 volatile bool limitSwitchTriggered = false;
@@ -242,7 +242,9 @@ void parseFirebaseDetails(String jsonData);
 void generateReferenceCode();
 void sendAlert(String alertType, String message, String alertCategory);
 bool checkSolenoidControl();
+bool resetSolenoidFlag();
 void activateSolenoidForDelivery(unsigned long duration);
+void activateSolenoidWithReset(unsigned long duration);
 void handleLockBreachEarly();
 void handleBuzzerActivation(unsigned long duration);
 double calculateDistance(double lat1, double lon1, double lat2, double lon2);
@@ -384,8 +386,8 @@ void setup() {
     if (checkSolenoidControl()) {
       Serial.println("🔓 Remote activation command detected on wake!");
       sendAlert("safe", "📦 Lock remotely activated via dashboard", "safe");
-      Serial.println("⏱️ Activating solenoid for 20 seconds...");
-      activateSolenoidForDelivery(20000);
+      Serial.println("⏱️ Activating solenoid for 60 seconds (1 minute)...");
+      activateSolenoidWithReset(60000);
     }
   }
   
@@ -1841,27 +1843,66 @@ bool checkSolenoidControl() {
   
   if (response == "true") {
     Serial.println("🔓 Remote unlock command detected!");
-    
-    // Reset flag immediately to prevent repeated activation
-    String resetPath = "/tracking_box/" + actualDeviceID + "/controlFlags";
-    String resetData = "{\"solenoid\":false,\"timestamp\":" + String(millis()) + "}";
-    
-    bool resetSuccess = false;
-    if (wifiConnected && WiFi.status() == WL_CONNECTED) {
-      resetSuccess = sendFirebaseHTTP_WiFi(resetPath, resetData, "PATCH");
-    } else {
-      resetSuccess = sendFirebaseHTTP(resetPath, resetData, "PATCH");
-    }
-    
-    if (resetSuccess) {
-      Serial.println("✅ Control flag reset successfully");
-    } else {
-      Serial.println("⚠️ Failed to reset control flag");
-    }
-    
+    // Note: Flag will be reset AFTER solenoid activation completes
     return true;
   }
   return false;
+}
+
+// Reset solenoid flag in Firebase with retry logic
+bool resetSolenoidFlag() {
+  Serial.println("\n🔄 Resetting solenoid control flag in Firebase...");
+  
+  String resetPath = "/tracking_box/" + actualDeviceID + "/controlFlags";
+  String resetData = "{\"solenoid\":false,\"buzzer\":false,\"timestamp\":" + String(millis()) + "}";
+  
+  const int MAX_RETRIES = 3;
+  int retryDelay = 1000; // Start with 1 second delay
+  
+  for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    Serial.printf("📤 Attempt %d/%d to reset solenoid flag...\n", attempt, MAX_RETRIES);
+    
+    bool resetSuccess = false;
+    
+    // Try WiFi first if available
+    if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+      Serial.println("   Using WiFi connection...");
+      resetSuccess = sendFirebaseHTTP_WiFi(resetPath, resetData, "PUT");
+    } else {
+      Serial.println("   Using cellular connection...");
+      resetSuccess = sendFirebaseHTTP(resetPath, resetData, "PUT");
+    }
+    
+    if (resetSuccess) {
+      Serial.println("✅ Solenoid flag reset successfully!");
+      return true;
+    }
+    
+    Serial.printf("⚠️ Reset attempt %d failed\n", attempt);
+    
+    if (attempt < MAX_RETRIES) {
+      Serial.printf("⏳ Waiting %d ms before retry...\n", retryDelay);
+      delay(retryDelay);
+      retryDelay *= 2; // Exponential backoff
+    }
+  }
+  
+  Serial.println("❌ Failed to reset solenoid flag after all retries!");
+  return false;
+}
+
+// Activate solenoid with automatic Firebase reset
+void activateSolenoidWithReset(unsigned long duration) {
+  // First activate the solenoid for the specified duration
+  activateSolenoidForDelivery(duration);
+  
+  // Then reset the flag in Firebase
+  Serial.println("\n📝 Updating Firebase after solenoid operation...");
+  if (resetSolenoidFlag()) {
+    Serial.println("✅ Firebase state synchronized successfully");
+  } else {
+    Serial.println("⚠️ Firebase state may be out of sync - manual reset may be needed");
+  }
 }
 
 // Unified alert sending function
@@ -2094,9 +2135,9 @@ void handleLockBreachEarly() {
         Serial.println("🔓 Remote activation command detected!");
         // 1. Send confirmation alert
         sendAlert("delivery", "📦 Lock remotely activated in safe zone", "safe");
-        // 2. Activate solenoid for 20 seconds
-        Serial.println("\n⏱️ Starting solenoid activation sequence...");
-        activateSolenoidForDelivery(20000);
+        // 2. Activate solenoid for 60 seconds (1 minute)
+        Serial.println("\n⏱️ Starting solenoid activation sequence (60 seconds)...");
+        activateSolenoidWithReset(60000);
         solenoidActivated = true;
       } else {
         // No remote command yet - just send notification and wait
@@ -2272,15 +2313,9 @@ void handleBuzzerWithMonitoring(unsigned long duration) {
   digitalWrite(BUZZER_PIN, LOW);
   
   if (overrideDetected) {
-    // Activate solenoid for 20 seconds on override
-    Serial.println("🔓 Activating solenoid for 20 seconds...");
-    digitalWrite(SOLENOID_PIN, HIGH);
-    rtcSolenoidActive = true;
-    rtcSolenoidStartTime = millis();
-    delay(20000);
-    digitalWrite(SOLENOID_PIN, LOW);
-    rtcSolenoidActive = false;
-    rtcSolenoidStartTime = 0;
+    // Activate solenoid for 60 seconds (1 minute) on override and reset flag
+    Serial.println("🔓 Activating solenoid for 60 seconds (1 minute)...");
+    activateSolenoidWithReset(60000);
     sendAlert("safe", "Lock remotely deactivated via dashboard", "safe");
   } else if (elapsedTime >= duration) {
     // Buzzer completed without override

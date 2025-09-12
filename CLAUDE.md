@@ -4,9 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is an IoT tracking device system with three main components:
-- **Tracking Device Firmware** (ESP32-based devices with multiple sensors and cellular connectivity)
-- **Master Device Firmware** (ESP32 with SIM7600 for SMS-to-Firebase relay - legacy/fallback)
+This is an IoT tracking device system with two main components:
+- **Tracking Device Firmware** (ESP32-based devices with multiple sensors and WiFi/cellular connectivity)
 - **Web Dashboard** (Next.js/React application for real-time monitoring)
 
 ## Commands
@@ -41,17 +40,16 @@ npx tsc --noEmit
 ### Arduino Development
 Use Arduino IDE with the following libraries installed:
 - ArduinoJson
-- GxEPD2
-- Adafruit_SHT31
-- SparkFun_LSM6DSL
-- TinyGSM (for SIM7600 cellular connectivity)
+- GxEPD2 (E-ink display)
+- Adafruit_SHT31 (Temperature/humidity sensor)
+- Adafruit_LSM6DSL (Accelerometer/gyroscope)
+- WiFiManager (WiFi configuration)
 
 Main firmware file:
 - Tracking Device: `arduino/Sketch/TrackingBoxMain/TrackingBoxMain.ino`
 
 ### Test Sketches
 - `TrackingBoxDisplayTest/`: E-ink display testing
-- `TrackingBoxMain_SMS_BACKUP.ino`: Legacy SMS-based version (preserved for fallback)
 - `accel-gyro/accel-gyro/`: LSM6DSL accelerometer testing for tilt/fall detection  
 - `gps-gnss-ip/`: SIM7600 GPS module testing
 - `sht-gyro/`: Combined SHT31 and LSM6DSL sensor testing
@@ -61,7 +59,6 @@ Main firmware file:
 - `dfr_firebase/`: Direct Firebase connectivity testing via cellular
 - `dfr_firebase_connect/`: Firebase connection testing
 - `ShippingLabelDisplay/`: QR code generation for shipping labels
-- `MasterSMSToFirebase/`: Master device SMS relay testing
 
 ## Architecture
 
@@ -79,50 +76,37 @@ Main firmware file:
 
 ### Arduino Firmware Architecture
 
-#### Tracking Device (Slave) Operation
+#### Tracking Device Operation
 The ESP32 tracking devices operate in cycles:
 1. Deep sleep (15 minutes default)
-2. Wake on timer or motion interrupt
+2. Wake on timer, motion interrupt, or limit switch
 3. Read sensors (temperature, humidity, GPS, accelerometer)
-4. Send data directly to Firebase via cellular data (SIM7600)
-5. If cellular fails, fallback to SMS mode (legacy)
-6. Update e-ink display (LAST STEP - refresh takes significant time)
-7. Return to sleep
+4. Connect to WiFi (uses WiFiManager for configuration)
+5. Send data directly to Firebase via HTTPS
+6. If WiFi fails, fallback to cellular data (SIM7600)
+7. Retrieve control flags (buzzer, solenoid) from Firebase
+8. Update e-ink display (LAST STEP - refresh takes significant time)
+9. Return to sleep
 
 **Important**: E-ink display update is performed last because the refresh system is time-consuming and would interrupt critical data transmission processes.
 
-#### Master Device Operation
-A dedicated ESP32 with SIM7600 that:
-1. Receives SMS messages from tracking devices
-2. Parses sensor data from SMS format
-3. Forwards data to Firebase via WiFi
-4. Retrieves control states from Firebase (buzzer, solenoid, etc.)
-5. Sends control commands back to Slave devices via SMS
-6. Acts as a bidirectional relay for areas with poor connectivity
-
-#### Communication Flow
-```
-1. Current Operation (Direct Cellular):
-   Tracking Device <---> Firebase (via SIM7600 cellular data)
-
-2. Legacy SMS Fallback Mode (preserved for compatibility):
-   Slave Device --SMS--> Master Device --WiFi--> Firebase
-   Slave Device <--SMS-- Master Device <--WiFi-- Firebase
-```
-
-**Important**: When Slave devices cannot connect to WiFi, they rely on the Master device for both sending sensor data AND receiving control commands (buzzer activation, solenoid control, etc.)
+#### Dual-Mode Connectivity
+The system prioritizes WiFi connection for data transmission:
+1. **Primary**: WiFi connection to Firebase (preferred for cost/speed)
+2. **Fallback**: Cellular data via SIM7600 when WiFi unavailable
+3. **Configuration**: WiFiManager provides AP mode for initial WiFi setup
 
 #### Pin Configurations
-**Source**: `arduino/Pin Configs.txt` and verified working configuration
+**Source**: `arduino/Pin Configs.txt` - Verified working configuration
 - SHT30: SDA=21, SCL=22
-- LSM6DSL: SDA=21, SCL=22, INT1=34
-- SIM7600: RX=18, TX=19 (UART2 - verified working)
+- LSM6DSL: SDA=21, SCL=22, INT1=34  
+- SIM7600: RX=18, TX=19 (Hardware Serial UART2)
 - E-ink: DIN=14, SCLK=13, CS=15, DC=27, RST=26, BUSY=25
 - Battery ADC: Pin 36
 - Buzzer: Pin 32
-- Limit Switch: Pin 33
+- Limit Switch: Pin 33 (wake interrupt)
 - Solenoid: Pin 2
-- LED: Pin 4
+- LED Indicator: Pin 4
 
 ### Firebase Data Structure
 ```
@@ -190,38 +174,17 @@ All alerts:
 - Power optimization through deep sleep
 - Interrupt-based wake system
 - Modular sensor handling
-- SMS fallback for connectivity issues
+- WiFiManager for user-friendly WiFi configuration
+- Cellular fallback for connectivity issues
 - Battery voltage monitoring with ADC
-- Master-slave architecture for reliable data transmission
 - E-ink display updates performed last due to time constraints
 - RTC memory persistence across deep sleep cycles
 
-## SMS Communication Protocol
-
-### Slave-to-Master Message Format
-```
-DEVICE_ID,timestamp,temp,humidity,lat,lng,alt,tilt,fall,limitSwitch,solenoid,buzzer,coarseFix,usingCGPS,accelX,accelY,accelZ,batteryVoltage,wakeUpReason
-```
-
-### Example Slave-to-Master SMS
-```
-box_001,1703123456789,25.5,60.0,14.562000,121.112100,15.0,0,0,1,0,0,0,0,0.020,-0.010,0.980,3.85,TIMER DUE (15mns.)
-```
-
-### Master-to-Slave Control Message Format
-The Master device sends control commands back to Slave devices after checking Firebase:
-```
-CMD,buzzerState,solenoidState,additionalFlags
-```
-
-### Example Master-to-Slave SMS
-```
-CMD,1,0,0
-```
-Where:
-- buzzerState: 0=off, 1=on
-- solenoidState: 0=closed, 1=open
-- additionalFlags: Reserved for future use
+## Location Services
+- **Primary**: GNSS/GPS via SIM7600G module
+- **Fallback**: CLBS (Cell Location Based Services) when GPS unavailable
+- **Coordinate Parsing**: Supports both decimal degrees and DMS formats
+- **Reverse Geocoding**: OpenStreetMap Nominatim API for location names
 
 ## Development Mode
 
@@ -233,7 +196,6 @@ For continuous testing without deep sleep:
 ### Testing Approach
 - Individual component tests in `arduino/Sketch/` subdirectories
 - Each sensor has dedicated test sketch for isolated debugging
-- Master device can be tested with `MasterSMSToFirebase` sketch
 - Web dashboard development server supports hot reload
 
 ## Important Configuration
@@ -247,28 +209,26 @@ For continuous testing without deep sleep:
 - Components configured via `components.json` for Shadcn/UI
 
 ### Arduino Firmware
-- WiFi credentials must be set in firmware before upload (when using WiFi mode)
-- SIM7600 APN configuration required for cellular connectivity
-- Device ID and owner info configured in main sketch
-- Development mode available (disables deep sleep)
-- Battery voltage calibration may be needed based on voltage divider
-- Device ID auto-generation system prevents duplicates
-- MAC address-based unique ID generation when preferred ID taken
-- Buffer size configured at 2048 bytes for Firebase JSON responses
-- UART2 (GPIO 18/19) verified as working configuration for SIM7600
+- WiFi credentials configured via WiFiManager AP mode (no hardcoding needed)
+- SIM7600 APN configuration: "internet" (modify for your carrier)
+- Device ID auto-generation with MAC address fallback for uniqueness
+- Development mode available (disables deep sleep for testing)
+- Battery voltage monitoring with ADC calibration
+- RTC memory persistence for data across deep sleep cycles
+- Buffer size: 2048 bytes for Firebase JSON responses
+- Wake interrupt sources: Timer (15 min), Motion (LSM6DSL), Limit switch
 
 ## Recent Architecture Changes
 
-### Direct Firebase Connection (Current)
-The system has been migrated from SMS-based communication to direct Firebase connection via cellular data:
-- Each tracking device now uses SIM7600 for direct Firebase updates
-- SMS functionality preserved as fallback/legacy mode
-- Master device role reduced but maintained for backward compatibility
-- Device ID validation and auto-generation for duplicate prevention
-- Runtime ID persistence across deep sleep cycles using RTC memory
+### WiFi-First Connectivity Strategy
+The system prioritizes WiFi over cellular for cost optimization:
+- WiFiManager provides user-friendly WiFi configuration via AP mode
+- Automatic fallback to cellular (SIM7600) when WiFi unavailable
+- Connection retry logic with exponential backoff
+- RTC memory stores WiFi failure count to optimize reconnection attempts
 
-### Location Services
-- Primary: GNSS/GPS via SIM7600G module
-- Fallback: CLBS (Cell Location Based Services) when GPS unavailable
-- Coordinate parsing supports both decimal and DMS formats
-- Reverse geocoding via OpenStreetMap Nominatim API
+### Enhanced Wake System
+- **Timer Wake**: 15-minute intervals for regular updates
+- **Motion Wake**: LSM6DSL interrupt on movement/tilt detection
+- **Limit Switch Wake**: Immediate wake on box opening/closing
+- Wake reason tracked and reported to Firebase for analytics
